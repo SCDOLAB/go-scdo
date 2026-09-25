@@ -47,6 +47,15 @@ func run(evm *EVM, contract *Contract, input []byte, readOnly bool) ([]byte, err
 		if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
 			precompiles = PrecompiledContractsByzantium
 		}
+		// Pectra: BLS12-381 (0x09-0x0e) and EIP-2935 history (0x0f)
+		if evm.BlockNumber.Cmp(big.NewInt(int64(common.PectraForkHeight))) >= 0 {
+			// EIP-2935: history block hash precompile needs GetHash context
+			if *contract.CodeAddr == historyStorageAddress {
+				p := &historyStorage{getHash: evm.GetHash}
+				return RunPrecompiledContract(p, input, contract)
+			}
+			precompiles = PrecompiledContractsPectra
+		}
 		if p := precompiles[*contract.CodeAddr]; p != nil {
 			return RunPrecompiledContract(p, input, contract)
 		}
@@ -204,6 +213,9 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 		precompiles := PrecompiledContractsHomestead
 		if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
 			precompiles = PrecompiledContractsByzantium
+		}
+		if evm.BlockNumber.Cmp(big.NewInt(int64(common.PectraForkHeight))) >= 0 {
+			precompiles = PrecompiledContractsPectra
 		}
 		if precompiles[addr] == nil && evm.ChainConfig().IsEIP158(evm.BlockNumber) && value.Sign() == 0 {
 			// Calling a non existing account, don't do anything, but ping the tracer
