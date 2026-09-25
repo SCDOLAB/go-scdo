@@ -382,6 +382,12 @@ func (c *codeAndHash) Hash() common.Hash {
 
 // create creates a new contract using code as deployment code.
 func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64, value *big.Int, address common.Address) ([]byte, common.Address, uint64, error) {
+	// EIP-3860: limit initcode size starting from Pectra fork
+	isPectra := evm.BlockNumber.Cmp(big.NewInt(int64(common.PectraForkHeight))) >= 0
+	if isPectra && len(codeAndHash.code) > 2*params.MaxCodeSize {
+		return nil, common.Address{}, gas, errMaxInitCodeSizeExceeded
+	}
+
 	// Depth check execution. Fail if we're trying to execute above the
 	// limit.
 	if evm.depth > int(params.CallCreateDepth) {
@@ -425,6 +431,10 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 
 	// check whether the max code size has been exceeded
 	maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) && len(ret) > params.MaxCodeSize
+	// EIP-3541: reject contracts starting with 0xef
+	if isPectra && len(ret) > 0 && ret[0] == 0xef {
+		err = errInvalidCodePrefix
+	}
 	// if the contract creation ran successfully and no errors were returned
 	// calculate the gas required to store the code. If the code could not
 	// be stored due to not enough gas set an error and let it be handled
