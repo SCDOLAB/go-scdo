@@ -35,6 +35,8 @@ var (
 	errReturnDataOutOfBounds = errors.New("evm: return data out of bounds")
 	ErrExecutionReverted     = errors.New("evm: execution reverted")
 	errMaxCodeSizeExceeded   = errors.New("evm: max code size exceeded")
+	errInvalidCodePrefix     = errors.New("evm: invalid code prefix (0xef)")
+	errMaxInitCodeSizeExceeded = errors.New("evm: max initcode size exceeded")
 )
 
 func opAdd(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
