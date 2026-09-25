@@ -56,6 +56,7 @@ var (
 	byzantiumInstructionSet      = newByzantiumInstructionSet()
 	constantinopleInstructionSet = newConstantinopleInstructionSet()
 	istanbulInstructionSet       = newIstanbulInstructionSet()
+	londonInstructionSet         = newLondonInstructionSet()
 )
 
 // NewIstanbulInstructionSet returns the frontier, homestead
@@ -73,7 +74,56 @@ func newIstanbulInstructionSet() [256]operation {
 	return instructionSet
 }
 
-// NewConstantinopleInstructionSet returns the frontier, homestead
+// newLondonInstructionSet returns the istanbul set plus London/Shanghai/Cancun opcodes.
+func newLondonInstructionSet() [256]operation {
+	instructionSet := newIstanbulInstructionSet()
+
+	// CHAINID (0x46) — Istanbul EIP-1344
+	instructionSet[CHAINID] = operation{
+		execute:       opChainID,
+		gasCost:       constGasFunc(GasQuickStep),
+		validateStack: makeStackFunc(0, 1),
+		valid:         true,
+	}
+	// BASEFEE (0x48) — London EIP-1559 (returns 0 on PoW chain without base-fee market)
+	instructionSet[BASEFEE] = operation{
+		execute:       opBaseFee,
+		gasCost:       constGasFunc(GasQuickStep),
+		validateStack: makeStackFunc(0, 1),
+		valid:         true,
+	}
+	// TSTORE (0x5c) — Cancun EIP-1153 transient storage write
+	instructionSet[TSTORE] = operation{
+		execute:       opTStore,
+		gasCost:       constGasFunc(GasSlowStep),
+		validateStack: makeStackFunc(2, 0),
+		writes:        true,
+		valid:         true,
+	}
+	// TLOAD (0x5d) — Cancun EIP-1153 transient storage read
+	instructionSet[TLOAD] = operation{
+		execute:       opTLoad,
+		gasCost:       constGasFunc(GasFastestStep),
+		validateStack: makeStackFunc(1, 1),
+		valid:         true,
+	}
+	// MCOPY (0x5e) — Cancun EIP-5656
+	instructionSet[MCOPY] = operation{
+		execute:       opMcCopy,
+		gasCost:       gasMcCopy,
+		validateStack: makeStackFunc(3, 0),
+		memorySize:    memoryMcCopy,
+		valid:         true,
+	}
+	// PUSH0 (0x5f) — Shanghai EIP-3855
+	instructionSet[PUSH0] = operation{
+		execute:       opPush0,
+		gasCost:       constGasFunc(GasQuickStep),
+		validateStack: makeStackFunc(0, 1),
+		valid:         true,
+	}
+	return instructionSet
+}
 // byzantium and contantinople instructions.
 func newConstantinopleInstructionSet() [256]operation {
 	// instructions that can be executed during the byzantium phase.

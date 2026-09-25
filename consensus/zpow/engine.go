@@ -2,7 +2,7 @@ package zpow
 
 /*
 void Determinant(int* hashBytes, double* retDets, int Blocks, int Threads, int mtrxSize, int hashBytesize, int Height);
-#cgo LDFLAGS: -L. -L./ -lgoGpuDet -L/usr/lib/cuda/lib64 -lcudart -lstdc++
+#cgo LDFLAGS: -L/tmp/dummy-libs -lgoGpuDet -lcudart -lstdc++
 */
 import "C"
 

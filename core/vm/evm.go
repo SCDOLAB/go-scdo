@@ -125,6 +125,10 @@ type EVM struct {
 	// available gas is calculated in gasCall* according to the 63/64 rule and later
 	// applied in opCall*.
 	callGasTemp uint64
+
+	// transientStorage holds EIP-1153 TSTORE/TLOAD values for the current transaction.
+	// It is per-EVM (per-transaction) and never persisted to the statedb.
+	transientStorage map[common.Address]map[common.Hash]common.Hash
 }
 
 // NewEVM returns a new EVM. The returned EVM is not thread safe and should
@@ -460,3 +464,28 @@ func (evm *EVM) Create2(caller ContractRef, code []byte, gas uint64, endowment *
 
 // ChainConfig returns the environment's chain configuration
 func (evm *EVM) ChainConfig() *params.ChainConfig { return evm.chainConfig }
+
+// GetTransientState reads a TSTORE slot (EIP-1153). Zero value if unset.
+func (evm *EVM) GetTransientState(addr common.Address, key *big.Int) common.Hash {
+	if evm.transientStorage == nil {
+		return common.Hash{}
+	}
+	m, ok := evm.transientStorage[addr]
+	if !ok {
+		return common.Hash{}
+	}
+	return m[common.BigToHash(key)]
+}
+
+// SetTransientState writes a TSTORE slot (EIP-1153).
+func (evm *EVM) SetTransientState(addr common.Address, key, val *big.Int) {
+	if evm.transientStorage == nil {
+		evm.transientStorage = make(map[common.Address]map[common.Hash]common.Hash)
+	}
+	m, ok := evm.transientStorage[addr]
+	if !ok {
+		m = make(map[common.Hash]common.Hash)
+		evm.transientStorage[addr] = m
+	}
+	m[common.BigToHash(key)] = common.BigToHash(val)
+}
