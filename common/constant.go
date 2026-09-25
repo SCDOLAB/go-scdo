@@ -58,6 +58,9 @@ const (
 	// SmartContractNonceFixHeight fix smart contract nonce bug when user use setNonce
 	SmartContractNonceFixHeight = ScdoForkHeight
 
+	// PectraForkHeight: London/Shanghai/Cancun EVM opcodes (PUSH0, BASEFEE, TLOAD/TSTORE, MCOPY)
+	PectraForkHeight = 9500000
+
 	// LightChainDir lightchain data directory based on config.DataRoot
 	LightChainDir = "/db/lightchain"
 

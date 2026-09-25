@@ -961,3 +961,58 @@ func makeSwap(size int64) executionFunc {
 		return nil, nil
 	}
 }
+
+// --- London/Shanghai/Cancun opcodes ---
+
+func opChainID(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
+	stack.push(interpreter.evm.ChainConfig().ChainID)
+	return nil, nil
+}
+
+func opBaseFee(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
+	// PoW chain has no EIP-1559 base fee; return 0.
+	stack.push(interpreter.intPool.get())
+	return nil, nil
+}
+
+func opPush0(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
+	stack.push(interpreter.intPool.get())
+	return nil, nil
+}
+
+func opMcCopy(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
+	dst := stack.pop()
+	src := stack.pop()
+	l := stack.pop()
+	length := l.Uint64()
+	if length > 0 {
+		srcOff := src.Int64()
+		dstOff := dst.Int64()
+		// Resize memory to cover the destination range.
+		memory.Resize(uint64(dstOff) + length)
+		memory.Resize(uint64(srcOff) + length)
+		data := memory.Get(srcOff, int64(length))
+		memory.Set(uint64(dstOff), length, data)
+	}
+	interpreter.intPool.put(dst, src, l)
+	return nil, nil
+}
+
+func opTLoad(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
+	key := stack.pop()
+	h := interpreter.evm.GetTransientState(contract.Address(), key)
+	stack.push(interpreter.intPool.get().SetBytes(h.Bytes()))
+	interpreter.intPool.put(key)
+	return nil, nil
+}
+
+func opTStore(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
+	if interpreter.readOnly {
+		return nil, errWriteProtection
+	}
+	key := stack.pop()
+	val := stack.pop()
+	interpreter.evm.SetTransientState(contract.Address(), key, val)
+	interpreter.intPool.put(key, val)
+	return nil, nil
+}

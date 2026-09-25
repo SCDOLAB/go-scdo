@@ -17,6 +17,8 @@
 package vm
 
 import (
+	"math/big"
+
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/scdoproject/go-scdo/common"
@@ -530,4 +532,39 @@ func gasSwap(gt params.GasTable, evm *EVM, contract *Contract, stack *Stack, mem
 
 func gasDup(gt params.GasTable, evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySize uint64) (uint64, error) {
 	return GasFastestStep, nil
+}
+
+// gasMcCopy computes the gas cost for MCOPY (EIP-5656).
+func gasMcCopy(gt params.GasTable, evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySize uint64) (uint64, error) {
+	gas, err := memoryGasCost(mem, memorySize)
+	if err != nil {
+		return 0, err
+	}
+	var overflow bool
+	if gas, overflow = math.SafeAdd(gas, GasFastestStep); overflow {
+		return 0, errGasUintOverflow
+	}
+	words, overflow := bigUint64(stack.Back(2))
+	if overflow {
+		return 0, errGasUintOverflow
+	}
+	if words, overflow = math.SafeMul(toWordSize(words), params.CopyGas); overflow {
+		return 0, errGasUintOverflow
+	}
+	if gas, overflow = math.SafeAdd(gas, words); overflow {
+		return 0, errGasUintOverflow
+	}
+	return gas, nil
+}
+
+// memoryMcCopy returns the memory size needed for MCOPY (max of dst+len, src+len).
+func memoryMcCopy(stack *Stack) *big.Int {
+	dst := stack.Back(0)
+	src := stack.Back(1)
+	l := stack.Back(2)
+	max := new(big.Int).Set(dst)
+	if src.Cmp(max) > 0 {
+		max.Set(src)
+	}
+	return max.Add(max, l)
 }

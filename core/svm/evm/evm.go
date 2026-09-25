@@ -30,6 +30,9 @@ func NewEVMByDefaultConfig(tx *types.Transaction, statedb *StateDB, blockHeader 
 		ByzantiumBlock:      big.NewInt(0),
 		ConstantinopleBlock: big.NewInt(int64(common.EmeryForkHeight)),
 		IstanbulBlock:       big.NewInt(int64(common.EmeryForkHeight)),
+		LondonBlock:         big.NewInt(int64(common.PectraForkHeight)),
+		ShanghaiBlock:       big.NewInt(int64(common.PectraForkHeight)),
+		CancunBlock:         big.NewInt(int64(common.PectraForkHeight)),
 		Ethash:              new(params.EthashConfig),
 	}
 	vmConfig := &vm.Config{}
