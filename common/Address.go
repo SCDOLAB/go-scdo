@@ -95,6 +95,10 @@ func ValidShard(shard uint) bool {
 
 // ValidAccountHex returns true if it is a valid account string
 func ValidAccountHex(account string) bool {
+	// Accept standard Ethereum keccak addresses: 0x + 40 hex chars
+	if match, _ := regexp.MatchString("^0x[a-fA-F0-9]{40}$", account); match {
+		return true
+	}
 	if match, _ := regexp.MatchString("^((1s01|2s02|3s03|4s04|1S01|2S02|3S03|4S04)[a-fA-F0-9]{37}[1-2])|0[sSx]0{40}|0x0[1-4][a-fA-F0-9]{37}[1-2]$", account); !match {
 		return false
 	}
@@ -152,8 +156,12 @@ func (id *Address) Type() AddressType {
 	if id.IsReserved() {
 		return AddressTypeReserved
 	}
-
-	return AddressType(id[AddressLen-1] & 0x0F)
+	t := AddressType(id[AddressLen-1] & 0x0F)
+	// For keccak-style addresses, default to External if type bits are not 1 or 2
+	if t < AddressTypeExternal || t > AddressTypeContract {
+		return AddressTypeExternal
+	}
+	return t
 }
 
 // IsReserved returns true if the address is reserved
@@ -290,6 +298,15 @@ func (id *Address) Shard() uint {
 		return uint(0)
 	}
 	shard, _ := binary.Uvarint(id[:ShardByte])
+	// For keccak-style addresses where byte[0] is not a valid shard (1-4),
+	// derive shard deterministically from the byte sum.
+	if shard < 1 || shard > ShardCount {
+		var sum byte
+		for _, b := range id[:] {
+			sum += b
+		}
+		return uint(sum%byte(ShardCount)) + 1
+	}
 	return uint(shard)
 }
 
