@@ -58,7 +58,7 @@ The sample configs in `cmd/node/config/node1-4.json` list the public P2P nodes
 
 | Shard | P2P port | Hosts |
 |---|---|---|
-| 1 | 8057 | 74.208.207.184, 82.223.19.88, 74.208.136.152 |
+| 1 | 8057 | 74.208.207.184, 82.223.19.88, 74.208.136.152, 217.160.65.210 |
 | 2 | 8058 | same hosts |
 | 3 | 8059 | same hosts |
 | 4 | 8056 | same hosts |

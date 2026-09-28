@@ -15,7 +15,7 @@ BASE_URL="https://scdoscan.io/downloads"
 DIR="${SCDO_DIR:-$HOME/scdo-miner}"
 THREADS="${THREADS:-$(nproc)}"
 # Public P2P nodes (TCP+UDP). Port per shard: 1=8057, 2=8058, 3=8059, 4=8056.
-HOSTS="74.208.207.184 82.223.19.88 74.208.136.152"
+HOSTS="74.208.207.184 82.223.19.88 74.208.136.152 217.160.65.210"
 
 echo "========================================="
 echo "  SCDO solo mining / SCDO 单机挖矿"
