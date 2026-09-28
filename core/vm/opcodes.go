@@ -101,9 +101,7 @@ const (
 	NUMBER
 	DIFFICULTY
 	GASLIMIT
-	CHAINID     OpCode = 0x46
 	SELFBALANCE OpCode = 0x47
-	BASEFEE     OpCode = 0x48
 )
 
 // 0x50 range - 'storage' and execution.
@@ -120,10 +118,6 @@ const (
 	MSIZE
 	GAS
 	JUMPDEST
-	TSTORE OpCode = 0x5c
-	TLOAD  OpCode = 0x5d
-	MCOPY  OpCode = 0x5e
-	PUSH0  OpCode = 0x5f
 )
 
 // 0x60 range.
