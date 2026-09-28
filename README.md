@@ -20,13 +20,52 @@ The official Golang implementation of SCDO. SCDO is an open source blockchain pr
 The current mainnet release: SCDO mainchain is powered by a new anti-ASIC consensus PoW algorithm, which requires scientific calculation related to randomized matrix. The mainchain has four shards. Users can perform transactions within a shard or across shards. However, currently smart contracts can only be executed within the same shard. SCDO subchains are under development. 
 
 # Download (without building)
-If you want to run the node directly and use client without setting up the compiling enviroment and building the executable files, you can choose the right version to download and run:
 
-| Operation System |      Download Link     |
-|---------|----------------------------------------------------------|
-| Linux   | [https://github.com/scdoproject/go-scdo/releases]|
-| MacOs   | [https://github.com/scdoproject/go-scdo/releases]|
-| Windows | [https://github.com/scdoproject/go-scdo/releases]|
+Prebuilt binaries for running a node without a Go toolchain:
+
+| Operating system | Download |
+|---|---|
+| Linux x86_64 | <https://scdoscan.io/downloads/>: [`scdo-node-linux-amd64`](https://scdoscan.io/downloads/scdo-node-linux-amd64), [`scdo-client-linux-amd64`](https://scdoscan.io/downloads/scdo-client-linux-amd64), [`SHA256SUMS`](https://scdoscan.io/downloads/SHA256SUMS) |
+| Linux / macOS / Windows (older releases) | <https://github.com/scdoproject/go-scdo/releases> |
+
+Verify what you download before running it:
+
+```bash
+curl -fsSLO https://scdoscan.io/downloads/SHA256SUMS
+curl -fLO https://scdoscan.io/downloads/scdo-node-linux-amd64
+curl -fLO https://scdoscan.io/downloads/scdo-client-linux-amd64
+sha256sum -c SHA256SUMS
+```
+
+The directory has no browsable index: use the file links above.
+
+## Solo mining (no pool)
+
+There is no SCDO mining pool. To mine, run your own full node for your shard; block rewards
+(currently 3 SCDO per block) go directly to your address. One command on Linux x86_64:
+
+```bash
+curl -fsSL https://scdoscan.io/mine.sh -o mine.sh && bash mine.sh
+```
+
+The same script is in [`scripts/mine.sh`](scripts/mine.sh). Step-by-step guide:
+[`docs/quickstart.md`](docs/quickstart.md) (live version: <https://scdoscan.io/quickstart.html>).
+
+## Public seed nodes
+
+The sample configs in `cmd/node/config/node1-4.json` list the public P2P nodes
+(TCP + UDP). One port per shard:
+
+| Shard | P2P port | Hosts |
+|---|---|---|
+| 1 | 8057 | 74.208.207.184, 82.223.19.88, 74.208.136.152 |
+| 2 | 8058 | same hosts |
+| 3 | 8059 | same hosts |
+| 4 | 8056 | same hosts |
+
+Before starting a node with one of these configs, replace `P2P_PRIVATE_KEY` with a fresh
+node key from `client key --shard N` (a node-only key, not your wallet key) and set
+`coinbase` to your own address.
 
 # Or Download & Build the source
 
