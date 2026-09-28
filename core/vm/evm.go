@@ -47,15 +47,6 @@ func run(evm *EVM, contract *Contract, input []byte, readOnly bool) ([]byte, err
 		if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
 			precompiles = PrecompiledContractsByzantium
 		}
-		// Pectra: BLS12-381 (0x09-0x0e) and EIP-2935 history (0x0f)
-		if evm.BlockNumber.Cmp(big.NewInt(int64(common.PectraForkHeight))) >= 0 {
-			// EIP-2935: history block hash precompile needs GetHash context
-			if *contract.CodeAddr == historyStorageAddress {
-				p := &historyStorage{getHash: evm.GetHash}
-				return RunPrecompiledContract(p, input, contract)
-			}
-			precompiles = PrecompiledContractsPectra
-		}
 		if p := precompiles[*contract.CodeAddr]; p != nil {
 			return RunPrecompiledContract(p, input, contract)
 		}
@@ -134,10 +125,6 @@ type EVM struct {
 	// available gas is calculated in gasCall* according to the 63/64 rule and later
 	// applied in opCall*.
 	callGasTemp uint64
-
-	// transientStorage holds EIP-1153 TSTORE/TLOAD values for the current transaction.
-	// It is per-EVM (per-transaction) and never persisted to the statedb.
-	transientStorage map[common.Address]map[common.Hash]common.Hash
 }
 
 // NewEVM returns a new EVM. The returned EVM is not thread safe and should
@@ -213,9 +200,6 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 		precompiles := PrecompiledContractsHomestead
 		if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
 			precompiles = PrecompiledContractsByzantium
-		}
-		if evm.BlockNumber.Cmp(big.NewInt(int64(common.PectraForkHeight))) >= 0 {
-			precompiles = PrecompiledContractsPectra
 		}
 		if precompiles[addr] == nil && evm.ChainConfig().IsEIP158(evm.BlockNumber) && value.Sign() == 0 {
 			// Calling a non existing account, don't do anything, but ping the tracer
@@ -382,12 +366,6 @@ func (c *codeAndHash) Hash() common.Hash {
 
 // create creates a new contract using code as deployment code.
 func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64, value *big.Int, address common.Address) ([]byte, common.Address, uint64, error) {
-	// EIP-3860: limit initcode size starting from Pectra fork
-	isPectra := evm.BlockNumber.Cmp(big.NewInt(int64(common.PectraForkHeight))) >= 0
-	if isPectra && len(codeAndHash.code) > 2*params.MaxCodeSize {
-		return nil, common.Address{}, gas, errMaxInitCodeSizeExceeded
-	}
-
 	// Depth check execution. Fail if we're trying to execute above the
 	// limit.
 	if evm.depth > int(params.CallCreateDepth) {
@@ -431,10 +409,6 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 
 	// check whether the max code size has been exceeded
 	maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) && len(ret) > params.MaxCodeSize
-	// EIP-3541: reject contracts starting with 0xef
-	if isPectra && len(ret) > 0 && ret[0] == 0xef {
-		err = errInvalidCodePrefix
-	}
 	// if the contract creation ran successfully and no errors were returned
 	// calculate the gas required to store the code. If the code could not
 	// be stored due to not enough gas set an error and let it be handled
@@ -486,28 +460,3 @@ func (evm *EVM) Create2(caller ContractRef, code []byte, gas uint64, endowment *
 
 // ChainConfig returns the environment's chain configuration
 func (evm *EVM) ChainConfig() *params.ChainConfig { return evm.chainConfig }
-
-// GetTransientState reads a TSTORE slot (EIP-1153). Zero value if unset.
-func (evm *EVM) GetTransientState(addr common.Address, key *big.Int) common.Hash {
-	if evm.transientStorage == nil {
-		return common.Hash{}
-	}
-	m, ok := evm.transientStorage[addr]
-	if !ok {
-		return common.Hash{}
-	}
-	return m[common.BigToHash(key)]
-}
-
-// SetTransientState writes a TSTORE slot (EIP-1153).
-func (evm *EVM) SetTransientState(addr common.Address, key, val *big.Int) {
-	if evm.transientStorage == nil {
-		evm.transientStorage = make(map[common.Address]map[common.Hash]common.Hash)
-	}
-	m, ok := evm.transientStorage[addr]
-	if !ok {
-		m = make(map[common.Hash]common.Hash)
-		evm.transientStorage[addr] = m
-	}
-	m[common.BigToHash(key)] = common.BigToHash(val)
-}
