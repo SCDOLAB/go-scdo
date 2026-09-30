@@ -1,7 +1,7 @@
 # SCDO Mining - Quick Start
 
 > Source: the live page <https://scdoscan.io/quickstart.html> (converted to Markdown, 2026-09-28).
-> Solo mining with the go-scdo node (ZPoW, CPU), shards 1-4.
+> Solo mining with the go-scdo node (ZPoW, CPU), on SCDO Shard1 (Classic), SCDO Shard2 (Classic), SCDO Shard3 (Classic) and SCDO Shard4 (Classic).
 
 | Block reward | Pool |
 |---|---|

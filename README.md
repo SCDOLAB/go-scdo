@@ -17,7 +17,7 @@
 
 The official Golang implementation of SCDO. SCDO is an open source blockchain project which consists of advanced sharding technology, innovative ZPoW consensus algorithm and scalable subchain protocol. [https://scdoscan.io](https://scdoscan.io)
 
-The current mainnet release: SCDO mainchain is powered by a new anti-ASIC consensus PoW algorithm, which requires scientific calculation related to randomized matrix. The mainchain has four shards, named SCDO Shard1 (Classic) to SCDO Shard4 (Classic), and they are producing blocks. Users can perform transactions within a shard or across shards. However, currently smart contracts can only be executed within the same shard. Shard 0 is the SCDO EVM chain (chain ID 5680, RPC https://scdoscan.io/rpc/0), see [SCDOLAB/scdo-shard0](https://github.com/SCDOLAB/scdo-shard0). 
+The current mainnet release: SCDO mainchain is powered by a new anti-ASIC consensus PoW algorithm, which requires scientific calculation related to randomized matrix. The mainchain has four shards, named SCDO Shard1 (Classic), SCDO Shard2 (Classic), SCDO Shard3 (Classic) and SCDO Shard4 (Classic), and they are producing blocks. Users can perform transactions within a shard or across shards. However, currently smart contracts can only be executed within the same shard. Shard 0 is the SCDO EVM chain (chain ID 5680, RPC https://scdoscan.io/rpc/0), see [SCDOLAB/scdo-shard0](https://github.com/SCDOLAB/scdo-shard0). 
 
 # Download (without building)
 
