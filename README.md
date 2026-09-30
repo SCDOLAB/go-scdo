@@ -15,9 +15,9 @@
 | **Block**              | 100 KB block size, 20 seconds block time, ~6000 transactions per block                         |
 
 
-The official Golang implementation of SCDO. SCDO is an open source blockchain project which consists of advanced sharding technology, innovative ZPoW consensus algorithm and scalable subchain protocol. [https://scdo.pro](https://scdo.pro)
+The official Golang implementation of SCDO. SCDO is an open source blockchain project which consists of advanced sharding technology, innovative ZPoW consensus algorithm and scalable subchain protocol. [https://scdoscan.io](https://scdoscan.io)
 
-The current mainnet release: SCDO mainchain is powered by a new anti-ASIC consensus PoW algorithm, which requires scientific calculation related to randomized matrix. The mainchain has four shards. Users can perform transactions within a shard or across shards. However, currently smart contracts can only be executed within the same shard. SCDO subchains are under development. 
+The current mainnet release: SCDO mainchain is powered by a new anti-ASIC consensus PoW algorithm, which requires scientific calculation related to randomized matrix. The mainchain has four shards, named SCDO Shard1 (Classic) to SCDO Shard4 (Classic), and they are producing blocks. Users can perform transactions within a shard or across shards. However, currently smart contracts can only be executed within the same shard. Shard 0 is the SCDO EVM chain (chain ID 5680, RPC https://scdoscan.io/rpc/0), see [SCDOLAB/scdo-shard0](https://github.com/SCDOLAB/scdo-shard0). 
 
 # Download (without building)
 
@@ -113,9 +113,9 @@ Here are some guidelines before you start:
 
 # Resources
 
-* [SCDO Website](https://scdo.pro/)
+* [SCDO Website](https://scdoscan.io/)
 * [Telegram Group](https://t.me/scdogroup)
-* [Roadmap](https://scdo.pro/)
+* [Explorer and downloads](https://scdoscan.io/)
 * [SCDO Wiki](https://scdo-project.gitbook.io/scdo-wiki/)
 * [scdo-sdk-javascript](https://www.npmjs.com/package/scdo-sdk-javascript)
 * [Twitter](https://twitter.com/OfficialScdo?s=20)

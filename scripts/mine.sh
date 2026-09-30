@@ -58,7 +58,6 @@ else
   SEEDS=""
   for port in 8057 8058 8059 8056; do
     for h in $HOSTS; do SEEDS="$SEEDS\"$h:$port\", "; done
-    [ "$port" = 8057 ] && SEEDS="$SEEDS\"104.254.244.44:18058\", "
   done
   SEEDS="${SEEDS%, }"
   [ -f node.json ] && cp node.json "node.json.bak.$(date +%s)"
