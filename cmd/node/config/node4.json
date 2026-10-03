@@ -4,7 +4,7 @@
         "version": "1.0.0",
         "dataDir": "Snode4",
         "address": "0.0.0.0:8026",
-        "coinbase": "4S04294bf46c535bd0ddb0cdcbe70b0f2a92a32a71",
+        "coinbase": "",
         "algorithm": "zpow"
     },
     "p2p": {
