@@ -8,16 +8,16 @@
 | **Smart Contracts**    | smart contracts are supported within the same shard                                          |
 | **SCDO Wallet**       | easy-to-use wallet                                                                             |
 | **High TPS**           | same shard TPS: 250/shard, cross shard TPS: 6/shard                                           |
-| **Auditable Supply**   | total supply: 300,000,000 Scdos, all from mining                              |
+| **Auditable Supply**   | total supply: 300,000,000 SCDO, all from mining                              |
 | **Consensus Algorithm**| ZPOW algorithm                                                |
-| **Mining Reward**      | 3150000 blocks/era and block reward at each era follows [6, 4, 3, 2.5, 2, 2, 1.5, 1.5] order until reaches the last reward of 1.5 Scdos |
+| **Mining Reward**      | 3150000 blocks/era and block reward at each era follows [6, 4, 3, 2.5, 2, 2, 1.5, 1.5] order until it reaches the last reward of 1.5 SCDO |
 | **Transaction Fee**    | self-customized transaction fee, higher fee for cross-shard transaction                        |
 | **Block**              | 100 KB block size, 20 seconds block time, ~6000 transactions per block                         |
 
 
 The official Golang implementation of SCDO. SCDO is an open source blockchain project which consists of advanced sharding technology, innovative ZPoW consensus algorithm and scalable subchain protocol. [https://scdoscan.io](https://scdoscan.io)
 
-The current mainnet release: SCDO mainchain is powered by a new anti-ASIC consensus PoW algorithm, which requires scientific calculation related to randomized matrix. The mainchain has four shards, named SCDO Shard1 (Classic), SCDO Shard2 (Classic), SCDO Shard3 (Classic) and SCDO Shard4 (Classic), and they are producing blocks. Users can perform transactions within a shard or across shards. However, currently smart contracts can only be executed within the same shard. Shard 0 is the SCDO EVM chain (chain ID 5680, RPC https://scdoscan.io/rpc/0), see [SCDOLAB/scdo-shard0](https://github.com/SCDOLAB/scdo-shard0). 
+The current release: SCDO Classic (the original non-EVM sharded chain, with addresses such as `1S01…`) is powered by a new anti-ASIC consensus PoW algorithm, which requires scientific calculation related to randomized matrix. SCDO Classic has four shards, named SCDO Shard1 (Classic), SCDO Shard2 (Classic), SCDO Shard3 (Classic) and SCDO Shard4 (Classic), and they are producing blocks. Users can perform transactions within a shard or across shards. However, currently smart contracts can only be executed within the same shard. SCDO Shard0 (EVM) is the separate EVM network (chain ID 5680, RPC https://scdoscan.io/rpc/0), see [SCDOLAB/scdo-shard0](https://github.com/SCDOLAB/scdo-shard0).
 
 # Download (without building)
 
@@ -41,7 +41,7 @@ The directory has no browsable index: use the file links above.
 
 ## Solo mining (no pool)
 
-There is no SCDO mining pool. To mine, run your own full node for your shard; block rewards
+There is no mining pool for SCDO Classic (the project-run PPLNS pool at <https://scdoscan.io/pool/> is for SCDO Shard0 (EVM) only). To mine, run your own full node for your shard; block rewards
 (currently 3 SCDO per block) go directly to your address. One command on Linux x86_64:
 
 ```bash
@@ -69,7 +69,7 @@ node key from `client key --shard N` (a node-only key, not your wallet key) and 
 
 # Or Download & Build the source
 
-- Building the SCDO project requires both a Go (version 1.12.7 ONLY at this moment) compiler, Git, and a C compiler.
+- Building the SCDO project requires a Go compiler (version 1.12.7 ONLY at this moment), Git and a C compiler.
 
 - Clone the go-scdo repository to the GOPATH directory:
 
@@ -96,7 +96,7 @@ buildall.bat
 ```
 
 # Run SCDO
-A simple version SCDO mining tutorial: English-[SCDO MiningTutorial](https://scdo-project.gitbook.io/scdo-wiki/en/mining), 中文-[SCDO 挖矿教程中文简版](https://scdo-project.gitbook.io/scdo-wiki/zhong-wen/wa-kuang).
+A simple version SCDO mining tutorial: [SCDO Mining Tutorial (English)](https://scdo-project.gitbook.io/scdo-wiki/en/mining), [SCDO Mining Tutorial (Chinese)](https://scdo-project.gitbook.io/scdo-wiki/zhong-wen/wa-kuang).
 
 For running a node, please refer to [Get Started](https://scdo-project.gitbook.io/scdo-wiki/developer/go-scdo/gettingstarted).
 For more usage details and deeper explanations, please consult the [SCDO Wiki](https://scdo-project.gitbook.io/scdo-wiki/).
