@@ -60,13 +60,16 @@ type taskMgr struct {
 	peersHeaderMap   map[string]*peerHeadInfo // peer's header information
 	downloadInfoList []*downloadInfo          // download process info
 
-	masterPeer string
-	masterConn *peerConn
-	lock       sync.RWMutex
-	quitCh     chan struct{}
-	wg         sync.WaitGroup
-	log        *log.ScdoLog
-	startTime  time.Time
+	masterPeer   string
+	masterConn   *peerConn
+	lock         sync.RWMutex
+	quitCh       chan struct{}
+	wg           sync.WaitGroup
+	log          *log.ScdoLog
+	startTime    time.Time
+	procCh       chan struct{}
+	lastProgress time.Time
+	lastWaitLog  time.Time
 }
 
 func newTaskMgr(d *Downloader, masterPeer string, conn *peerConn, from uint64, to uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block) *taskMgr {
@@ -86,6 +89,7 @@ func newTaskMgr(d *Downloader, masterPeer string, conn *peerConn, from uint64, t
 		peersHeaderMap:   make(map[string]*peerHeadInfo),
 		downloadInfoList: make([]*downloadInfo, 0, to-from+1),
 		quitCh:           make(chan struct{}),
+		procCh:           make(chan struct{}, 1),
 	}
 	t.wg.Add(1)
 	go t.run()
@@ -98,13 +102,79 @@ func (t *taskMgr) run() {
 loopOut:
 	for {
 		results := t.getWaitProcessingBlocks()
-		t.downloader.processBlocks(results, t.fromNo-1, t.recoverHeight, t.recoverTD, t.recoverBlocks, t.masterConn)
+		waiting := t.downloader.processBlocks(results, t.fromNo-1, t.recoverHeight, t.recoverTD, t.recoverBlocks, t.masterConn)
+		if waiting {
+			t.rewindUnprocessed()
+			if time.Since(t.lastWaitLog) > 10*time.Second {
+				t.log.Info("source shard header is not synced yet; leaving blocks queued and retrying")
+				t.lastWaitLog = time.Now()
+			}
+			select {
+			case <-time.After(2 * time.Second):
+			case <-t.quitCh:
+				break loopOut
+			}
+			continue
+		}
+		t.logProgress()
 
 		select {
-		case <-time.After(time.Second):
+		case <-t.procCh:
+		case <-time.After(200 * time.Millisecond):
 		case <-t.quitCh:
 			break loopOut
 		}
+	}
+}
+
+// rewindUnprocessed moves curNo back to the first block that is not written yet.
+// getWaitProcessingBlocks advances curNo before the write, so a deferred debt
+// validation must not skip those blocks.
+func (t *taskMgr) rewindUnprocessed() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	for i, info := range t.downloadInfoList {
+		if info.status != taskStatusProcessed {
+			t.curNo = t.fromNo + uint64(i)
+			return
+		}
+	}
+	t.curNo = t.fromNo + uint64(len(t.downloadInfoList))
+}
+
+func (t *taskMgr) logProgress() {
+	if time.Since(t.lastProgress) < 15*time.Second {
+		return
+	}
+	t.lock.RLock()
+	cur := t.curNo
+	to := t.toNo
+	from := t.fromNo
+	downloaded := t.downloadedNum
+	start := t.startTime
+	t.lock.RUnlock()
+	if cur <= from {
+		return
+	}
+	t.lastProgress = time.Now()
+	written := cur - 1
+	elapsedMin := time.Since(start).Minutes()
+	bpm := 0.0
+	if elapsedMin > 0 {
+		bpm = float64(downloaded) / elapsedMin
+	}
+	eta := "unknown"
+	if bpm > 0 && to >= written {
+		mins := float64(to-written) / bpm
+		eta = (time.Duration(mins * float64(time.Minute))).Truncate(time.Second).String()
+	}
+	t.log.Info("sync progress: height %d / %d, %.1f blocks/min, ETA %s", written, to, bpm, eta)
+}
+
+func (t *taskMgr) notify() {
+	select {
+	case t.procCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -303,11 +373,8 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 	defer t.lock.Unlock()
 
 	if len(blocks) == 0 {
-		if peerID == t.masterPeer {
-			t.downloader.Cancel()
-			return
-		}
-
+		// An empty batch is not fatal. Return those heights to the idle queue
+		// so another peer can serve them instead of aborting the sync.
 		for _, headInfo := range t.downloadInfoList {
 			if headInfo.peerID != peerID {
 				continue
@@ -315,6 +382,7 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 
 			if headInfo.status == taskStatusDownloading {
 				headInfo.status = taskStatusIdle
+				headInfo.peerID = ""
 			}
 		}
 		return
@@ -323,7 +391,12 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 	toHeight := uint64(0)
 
 	for _, b := range blocks {
-		headInfo := t.downloadInfoList[int(b.Header.Height-t.fromNo)]
+		idx := int(b.Header.Height - t.fromNo)
+		if idx < 0 || idx >= len(t.downloadInfoList) {
+			t.log.Warn("discard block height %d outside download range starting at %d (len %d)", b.Header.Height, t.fromNo, len(t.downloadInfoList))
+			continue
+		}
+		headInfo := t.downloadInfoList[idx]
 		if headInfo.peerID != peerID {
 			t.log.Info("Received block from different peer, discard this block. headInfo.peerID=%s, peerID=%s", headInfo.peerID, peerID)
 			continue
@@ -336,6 +409,7 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 	}
 
 	if toHeight == t.toNo {
+		t.notify()
 		return
 	}
 
@@ -353,4 +427,5 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 
 		headInfo.status = taskStatusIdle
 	}
+	t.notify()
 }

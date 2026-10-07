@@ -7,6 +7,7 @@ package common
 
 import (
 	"math/big"
+	"os"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -22,7 +23,7 @@ const (
 	ScdoVersion uint = 1
 
 	// ScdoNodeVersion for simpler display
-	ScdoNodeVersion string = "Scdo_V1.0.0"
+	ScdoNodeVersion string = "Scdo_V2.0.0"
 
 	// ShardCount represents the total number of shards.
 	ShardCount = 4
@@ -110,35 +111,69 @@ var (
 	Big257 = big.NewInt(257)
 )
 
-// init initialize the paths to store data
-func init() {
+// HomeDir returns the user's home directory.
+// $HOME (and %USERPROFILE% on Windows) wins over the passwd entry so a
+// process started with HOME set elsewhere does not open /home/<user>/.scdo.
+func HomeDir() string {
+	if runtime.GOOS == "windows" {
+		if p := os.Getenv("USERPROFILE"); p != "" {
+			return p
+		}
+	}
+	if h := os.Getenv("HOME"); h != "" {
+		return h
+	}
 	usr, err := user.Current()
 	if err != nil {
 		panic(err)
 	}
+	return usr.HomeDir
+}
 
-	tempFolder = filepath.Join(usr.HomeDir, "scdoTemp")
+// init initialize the paths to store data
+func init() {
+	refreshDefaultPaths()
+}
 
-	defaultDataFolder = filepath.Join(usr.HomeDir, ".scdo")
+func refreshDefaultPaths() {
+	home := HomeDir()
+	tempFolder = filepath.Join(home, "scdoTemp")
+	defaultDataFolder = filepath.Join(home, ".scdo")
 
 	if runtime.GOOS == "windows" {
-		defaultIPCPath = WindowsPipeDir + defaultPipeFile
+		defaultIPCPath = WindowsPipeDir + "scdo.ipc"
 	} else {
-		defaultIPCPath = filepath.Join(defaultDataFolder, defaultPipeFile)
+		defaultIPCPath = filepath.Join(defaultDataFolder, "scdo.ipc")
 	}
 }
 
 // GetTempFolder gets the temp folder
 func GetTempFolder() string {
+	refreshDefaultPaths()
 	return tempFolder
 }
 
 // GetDefaultDataFolder gets the default data Folder
 func GetDefaultDataFolder() string {
+	refreshDefaultPaths()
 	return defaultDataFolder
 }
 
 // GetDefaultIPCPath gets the default IPC path
 func GetDefaultIPCPath() string {
+	refreshDefaultPaths()
 	return defaultIPCPath
+}
+
+// ResolveDataDir returns an absolute data directory.
+// An absolute path is used as-is. A relative path is placed under $HOME/.scdo.
+// An empty path is $HOME/.scdo.
+func ResolveDataDir(dataDir string) string {
+	if dataDir == "" {
+		return GetDefaultDataFolder()
+	}
+	if filepath.IsAbs(dataDir) {
+		return dataDir
+	}
+	return filepath.Join(GetDefaultDataFolder(), dataDir)
 }

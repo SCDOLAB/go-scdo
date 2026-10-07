@@ -56,12 +56,14 @@ func ToECDSAPub(pub []byte) *ecdsa.PublicKey {
 	return &ecdsa.PublicKey{Curve: S256(), X: x, Y: y}
 }
 
-// PubkeyToString returns the string of the given public key, with prefix 0x
-// func PubkeyToString(pub *ecdsa.PublicKey) string {
-// 	shard := randomshard()
-// 	addr, err := GetAddress(pub, shard)
-// 	return addr.
-// }
+// PubkeyToString returns the hex address of the given public key on shard 1, with prefix 0x.
+func PubkeyToString(pub *ecdsa.PublicKey) string {
+	addr, err := GetAddress(pub, 1)
+	if err != nil || addr == nil {
+		return ""
+	}
+	return addr.Hex()
+}
 
 // Keccak512 calculates and returns the Keccak512 hash of the input data.
 func Keccak512(data ...[]byte) []byte {

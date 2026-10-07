@@ -53,7 +53,7 @@ else
   fi
   echo "[2/4] Writing node.json for shard $SHARD ..."
   # Node (P2P) key for this shard - separate from your wallet key.
-  P2PKEY="$(./scdo-client-linux-amd64 key --shard "$SHARD" | awk '/^Private key/{print $3}')"
+  P2PKEY="$(./scdo-client-linux-amd64 key --shard "$SHARD" | awk 'tolower($1) ~ /^private/ {print $3}')"
   [[ "$P2PKEY" =~ ^0x[0-9a-f]{64}$ ]] || { echo "Failed to generate node key"; exit 1; }
   SEEDS=""
   for port in 8057 8058 8059 8056; do
@@ -108,7 +108,7 @@ curl -s -m 5 http://127.0.0.1:8037 -X POST -H "Content-Type: application/json" \
 echo
 echo "========================================="
 echo "  Node started. The first sync downloads the whole shard history"
-echo "  (millions of blocks, ~25 GB under ~/.scdo) and takes many hours;"
+echo "  SCDO Classic starts at fork genesis height 2979594, then downloads later blocks (~25 GB under $HOME/.scdo) and takes many hours;"
 echo "  mining only pays off once CurrentBlockHeight matches https://scdoscan.io"
 echo "  首次同步需要下载整个分片历史（约25GB，耗时较长），同步完成后挖矿才有收益。"
 echo "  Log / 日志:  tail -f $DIR/scdo.log"

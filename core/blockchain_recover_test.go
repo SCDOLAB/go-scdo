@@ -111,7 +111,7 @@ func Test_RecoveryPoint_PutBlockCorrupted(t *testing.T) {
 	// and the inserted block exists in DB
 	bc := newTestRecoverableBlockchain(bcStore, db, rpFile)
 	newBlock := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
-	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock), store.ErrDBCorrupt))
+	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock, nil), store.ErrDBCorrupt))
 
 	// the inserted block exists in DB after corruption
 	_, err := bcStore.GetBlock(newBlock.HeaderHash)

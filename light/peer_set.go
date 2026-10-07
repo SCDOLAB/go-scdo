@@ -6,7 +6,6 @@
 package light
 
 import (
-
 	"math/big"
 	"math/rand"
 	"sync"
@@ -79,7 +78,7 @@ func (p *peerSet) bestPeers() []*peer {
 
 	peersMap := make(map[common.Address]bool)
 	// the number of best peers
-	NumOfBestPeers := 3
+	NumOfBestPeers := 8
 	if len(v) < NumOfBestPeers {
 		NumOfBestPeers = len(v)
 	}
@@ -133,7 +132,7 @@ func (p *peerSet) Find(address common.Address) *peer {
 	return p.peerMap[address]
 }
 
-//choosePeers choose peer based on filter blockhash, if filter is nil, then run like withouth filter
+// choosePeers choose peer based on filter blockhash, if filter is nil, then run like withouth filter
 func (p *peerSet) choosePeers(filter peerFilter) (choosePeers []*peer) {
 	p.lock.Lock()
 	defer p.lock.Unlock()

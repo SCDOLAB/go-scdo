@@ -152,6 +152,7 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 		return nil, errors.NewStackedErrorf(err, "failed to get HEAD block by hash %v", currentHeaderHash)
 	}
 	bc.currentBlock.Store(currentBlock)
+	bc.log.Info("SCDO Classic chain starts at fork genesis height %d (full history after the fork, not a snapshot). current head height %d", genesisBlockHeight, currentBlock.Header.Height)
 
 	// recover height-to-block mapping
 	bc.recoverHeightIndices()
@@ -376,18 +377,25 @@ func (bc *Blockchain) doWriteBlock(block *types.Block, pool *Pool) error {
 		return errors.NewStackedErrorf(err, "failed to set recovery point before put block into store, isNewHead = %v", isHead)
 	}
 
-	if err = bc.bcStore.PutReceipts(block.HeaderHash, receipts); err != nil {
-		return errors.NewStackedErrorf(err, "failed to save receipts into store, blockHash = %v, receipts count = %v", block.HeaderHash, len(receipts))
-	}
+	dirtyAccounts := blockStatedb.GetDirtyAccounts()
+	if bundle, ok := bc.bcStore.(blockBundleWriter); ok {
+		if err = bundle.PutBlockBundle(block, currentTd, isHead, receipts, dirtyAccounts); err != nil {
+			return errors.NewStackedErrorf(err, "failed to save block bundle into store, blockHash = %v, newTD = %v, isNewHead = %v", block.HeaderHash, currentTd, isHead)
+		}
+	} else {
+		if err = bc.bcStore.PutReceipts(block.HeaderHash, receipts); err != nil {
+			return errors.NewStackedErrorf(err, "failed to save receipts into store, blockHash = %v, receipts count = %v", block.HeaderHash, len(receipts))
+		}
 
-	if err = bc.bcStore.PutBlock(block, currentTd, isHead); err != nil {
-		return errors.NewStackedErrorf(err, "failed to save block into store, blockHash = %v, newTD = %v, isNewHead = %v", block.HeaderHash, currentTd, isHead)
+		if err = bc.bcStore.PutBlock(block, currentTd, isHead); err != nil {
+			return errors.NewStackedErrorf(err, "failed to save block into store, blockHash = %v, newTD = %v, isNewHead = %v", block.HeaderHash, currentTd, isHead)
+		}
+
+		if err = bc.bcStore.PutDirtyAccounts(block.HeaderHash, dirtyAccounts); err != nil {
+			return errors.NewStackedErrorf(err, "failed to save dirty accounts into store, blockHash = %v, dirty accounts count = %v", block.HeaderHash, len(dirtyAccounts))
+		}
 	}
 	auditor.Audit("succeed to save block into store, newHead = %v", isHead)
-
-	if err = bc.bcStore.PutDirtyAccounts(block.HeaderHash, blockStatedb.GetDirtyAccounts()); err != nil {
-		return errors.NewStackedErrorf(err, "failed to save dirty accounts into store, blockHash = %v, dirty accounts count = %v", block.HeaderHash, len(blockStatedb.GetDirtyAccounts()))
-	}
 	bc.rp.onPutBlockEnd()
 
 	// If the new block has larger TD, the canonical chain will be changed.
@@ -720,23 +728,45 @@ func deleteCanonicalBlock(bcStore store.BlockchainStore, height uint64) (bool, e
 	return deleted, nil
 }
 
+// blockBundleWriter writes receipts, the block and dirty accounts in one chain-db commit.
+type blockBundleWriter interface {
+	PutBlockBundle(block *types.Block, td *big.Int, isHead bool, receipts []*types.Receipt, accounts []common.Address) error
+}
+
 // OverwriteStaleBlocks overwrites the stale canonical height-to-hash mappings.
 func OverwriteStaleBlocks(bcStore store.BlockchainStore, staleHash common.Hash, rp *recoveryPoint) error {
 	var overwritten bool
 	var err error
 
-	// When recover the blockchain, the stale block hash my be already overwritten before program crash.
+	// The pre-fork Seele parent is not stored. A walk that reaches it (including a
+	// recovery file written before this fix) stops successfully.
+	if staleHash.IsEmpty() || isPreForkParent(bcStore, staleHash) {
+		if rp != nil {
+			rp.onOverwriteStaleBlocks(common.EmptyHash)
+		}
+		return nil
+	}
+
+	// When recover the blockchain, the stale block hash may be already overwritten before program crash.
+	// The first result is still followed one step so a partially recovered walk can continue.
+	// A canonical fork-genesis block returns an empty previous hash so the walk does not
+	// request the unstored Seele parent.
+	input := staleHash
 	if _, staleHash, err = overwriteSingleStaleBlock(bcStore, staleHash); err != nil {
-		return errors.NewStackedErrorf(err, "failed to overwrite single stale block, hash = %v", staleHash)
+		return errors.NewStackedErrorf(err, "failed to overwrite single stale block, hash = %v", input)
 	}
 
 	for !staleHash.Equal(common.EmptyHash) {
+		if isPreForkParent(bcStore, staleHash) {
+			break
+		}
 		if rp != nil {
 			rp.onOverwriteStaleBlocks(staleHash)
 		}
 
+		input = staleHash
 		if overwritten, staleHash, err = overwriteSingleStaleBlock(bcStore, staleHash); err != nil {
-			return errors.NewStackedErrorf(err, "failed to overwrite single stale block, hash = %v", staleHash)
+			return errors.NewStackedErrorf(err, "failed to overwrite single stale block, hash = %v", input)
 		}
 
 		if !overwritten {
@@ -751,6 +781,22 @@ func OverwriteStaleBlocks(bcStore store.BlockchainStore, staleHash common.Hash, 
 	return nil
 }
 
+// isPreForkParent reports whether hash is the unstored Seele parent of the fork genesis block.
+func isPreForkParent(bcStore store.BlockchainStore, hash common.Hash) bool {
+	if hash.IsEmpty() {
+		return false
+	}
+	genesisHash, err := bcStore.GetBlockHash(genesisBlockHeight)
+	if err != nil {
+		return false
+	}
+	header, err := bcStore.GetBlockHeader(genesisHash)
+	if err != nil || header.PreviousBlockHash.IsEmpty() {
+		return false
+	}
+	return hash.Equal(header.PreviousBlockHash)
+}
+
 // overwriteSingleStaleBlock overwrites a single stale canonical height-to-hash mapping.
 func overwriteSingleStaleBlock(bcStore store.BlockchainStore, hash common.Hash) (overwritten bool, preBlockHash common.Hash, err error) {
 	header, err := bcStore.GetBlockHeader(hash)
@@ -761,6 +807,12 @@ func overwriteSingleStaleBlock(bcStore store.BlockchainStore, hash common.Hash) 
 	canonicalHash, err := bcStore.GetBlockHash(header.Height)
 	if err == nil {
 		if hash.Equal(canonicalHash) {
+			// The fork genesis previous hash is a Seele block that is not in this
+			// chain. Stop the walk here instead of looking it up and reporting
+			// the empty hash that GetBlockHeader failure used to return.
+			if header.Height <= genesisBlockHeight {
+				return false, common.EmptyHash, nil
+			}
 			return false, header.PreviousBlockHash, nil
 		}
 

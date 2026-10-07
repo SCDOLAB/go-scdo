@@ -1,0 +1,52 @@
+module github.com/scdoproject/go-scdo
+
+go 1.22
+
+require (
+	github.com/Jeffail/tunny v0.0.0-20180304204616-59cfa8fcb19f
+	github.com/StackExchange/wmi v0.0.0-20180412205111-cdffdb33acae
+	github.com/aristanetworks/goarista v0.0.0-20180124011310-bdff49616af2
+	github.com/davecgh/go-spew v0.0.0-20180202153543-be8372ae8ec5
+	github.com/edsrzf/mmap-go v0.0.0-20170318155857-0bce6a688712
+	github.com/ethereum/go-ethereum v0.0.0-20181106230418-79c7a69ac806
+	github.com/fsnotify/fsnotify v0.0.0-20180110053347-c2828203cd70
+	github.com/go-ole/go-ole v0.0.0-20180625085808-7a0fa49edf48
+	github.com/golang/snappy v0.0.0-20170215233205-553a64147049
+	github.com/hashicorp/golang-lru v0.0.0-20180201235237-0fb14efe8c47
+	github.com/hashicorp/hcl v0.0.0-20171017181929-23c074d0eceb
+	github.com/howeyc/gopass v0.0.0-20170109162249-bf9dde6d0d2c
+	github.com/inconshreveable/mousetrap v0.0.0-20141017200713-76626ae9c91c
+	github.com/influxdata/influxdb v0.0.0-20180522020047-e62b1a02fb8e
+	github.com/lestrrat-go/file-rotatelogs v0.0.0-20180607094457-00616292e771
+	github.com/lestrrat-go/strftime v0.0.0-20180414112801-59966ecb6d84
+	github.com/magiconair/properties v0.0.0-20171031210536-49d762b9817b
+	github.com/mitchellh/go-homedir v0.0.0-20161203194507-b8bc1bf76747
+	github.com/mitchellh/mapstructure v0.0.0-20180203102830-a4e142e9c047
+	github.com/orcaman/concurrent-map v0.0.0-20180319144342-a05df785d2dc
+	github.com/pelletier/go-toml v0.0.0-20180118225455-acdc4509485b
+	github.com/pkg/errors v0.0.0-20180311214515-816c9085562c
+	github.com/pmezard/go-difflib v0.0.0-20180202153543-be8372ae8ec5
+	github.com/rcrowley/go-metrics v0.0.0-20180503174638-e2704e165165
+	github.com/rs/cors v0.0.0-20180417225204-12972ae4e777
+	github.com/shirou/gopsutil v0.0.0-20180625081143-4a180b209f5f
+	github.com/shirou/w32 v0.0.0-20160930032740-bb4de0191aa4
+	github.com/sirupsen/logrus v0.0.0-20180129181852-768a92a02685
+	github.com/spf13/afero v0.0.0-20180115192720-bb8f1927f2a9
+	github.com/spf13/cast v0.0.0-20170413085028-acbeb36b902d
+	github.com/spf13/cobra v0.0.0-20180204165853-eb589833591a
+	github.com/spf13/jwalterweatherman v0.0.0-20180109135506-7c0cea34c8ec
+	github.com/spf13/pflag v0.0.0-20171106142849-4c012f6dcd95
+	github.com/spf13/viper v0.0.0-20171129095106-aafc9e6bc7b7
+	github.com/stretchr/testify v0.0.0-20181009184315-04af85275a5c
+	github.com/syndtr/goleveldb v0.0.0-20180128140416-211f78098806
+	github.com/urfave/cli v0.0.0-20180226030253-8e01ec4cd3e2
+	golang.org/x/crypto v0.0.0-20180425145548-b49d69b5da94
+	golang.org/x/net v0.0.0-20180417175837-d41e8174641f
+	golang.org/x/sys v0.0.0-20181107124552-66b7b1311ac8
+	golang.org/x/text v0.0.0-20171224203128-e19ae1496984
+	gonum.org/v1/gonum v0.0.0-19700101000000-000000000000
+	gopkg.in/fatih/set.v0 v0.0.0-20180131062733-168a5d71ba06
+	gopkg.in/karalabe/cookiejar.v2 v2.0.0-20150724131613-8dcd6a7f4951
+	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce
+	gopkg.in/yaml.v2 v2.0.0-20180109114331-d670f9405373
+)

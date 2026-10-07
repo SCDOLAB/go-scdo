@@ -131,7 +131,7 @@ func Test_Blockchain_WriteBlock_HeaderHashChanged(t *testing.T) {
 
 	newBlock := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
 	newBlock.HeaderHash = common.EmptyHash
-	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock), types.ErrBlockHashMismatch))
+	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock, nil), types.ErrBlockHashMismatch))
 }
 
 func Test_Blockchain_WriteBlock_TxRootHashChanged(t *testing.T) {
@@ -141,7 +141,7 @@ func Test_Blockchain_WriteBlock_TxRootHashChanged(t *testing.T) {
 	newBlock.Header.TxHash = common.EmptyHash
 	newBlock.HeaderHash = newBlock.Header.Hash()
 
-	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock), types.ErrBlockTxsHashMismatch))
+	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock, nil), types.ErrBlockTxsHashMismatch))
 }
 
 func Test_Blockchain_WriteBlock_InvalidHeight(t *testing.T) {
@@ -151,7 +151,7 @@ func Test_Blockchain_WriteBlock_InvalidHeight(t *testing.T) {
 	newBlock.Header.Height = 10
 	newBlock.HeaderHash = newBlock.Header.Hash()
 
-	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock), consensus.ErrBlockInvalidHeight))
+	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock, nil), consensus.ErrBlockInvalidHeight))
 }
 
 func Test_Blockchain_WriteBlock_InvalidExtraData(t *testing.T) {
@@ -161,7 +161,7 @@ func Test_Blockchain_WriteBlock_InvalidExtraData(t *testing.T) {
 	newBlock.Header.ExtraData = []byte("test extra data")
 	newBlock.HeaderHash = newBlock.Header.Hash()
 
-	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock), ErrBlockExtraDataNotEmpty))
+	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock, nil), ErrBlockExtraDataNotEmpty))
 }
 
 func Test_Blockchain_WriteBlock_EmptyTxs(t *testing.T) {
@@ -172,14 +172,14 @@ func Test_Blockchain_WriteBlock_EmptyTxs(t *testing.T) {
 	newBlock.Header.TxHash = types.MerkleRootHash(nil)
 	newBlock.HeaderHash = newBlock.Header.Hash()
 
-	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock), ErrBlockEmptyTxs))
+	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock, nil), ErrBlockEmptyTxs))
 }
 
 func Test_Blockchain_WriteBlock_ValidBlock(t *testing.T) {
 	bc := NewTestBlockchain()
 
 	newBlock := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
-	assert.Equal(t, bc.WriteBlock(newBlock), error(nil))
+	assert.Equal(t, bc.WriteBlock(newBlock, nil), error(nil))
 
 	currentBlock := bc.CurrentBlock()
 	assert.Equal(t, currentBlock, newBlock)
@@ -197,13 +197,13 @@ func Test_Blockchain_WriteBlock_DupBlocks(t *testing.T) {
 
 	newBlock := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
 
-	err := bc.WriteBlock(newBlock)
+	err := bc.WriteBlock(newBlock, nil)
 	assert.Equal(t, err, error(nil))
 
 	currentBlock := bc.CurrentBlock()
 	assert.Equal(t, currentBlock, newBlock)
 
-	err = bc.WriteBlock(newBlock)
+	err = bc.WriteBlock(newBlock, nil)
 	assert.True(t, errors.IsOrContains(err, ErrBlockAlreadyExists))
 }
 
@@ -211,14 +211,14 @@ func Test_Blockchain_WriteBlock_InsertTwoBlocks(t *testing.T) {
 	bc := NewTestBlockchain()
 
 	block1 := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
-	err := bc.WriteBlock(block1)
+	err := bc.WriteBlock(block1, nil)
 	assert.Equal(t, err, error(nil))
 
 	currentBlock := bc.CurrentBlock()
 	assert.Equal(t, currentBlock, block1)
 
 	block2 := newTestBlock(bc, block1.HeaderHash, 2, 3, 3)
-	err = bc.WriteBlock(block2)
+	err = bc.WriteBlock(block2, nil)
 	assert.Equal(t, err, error(nil))
 
 	currentBlock = bc.CurrentBlock()
@@ -229,7 +229,7 @@ func Test_Blockchain_BlockFork(t *testing.T) {
 	bc := NewTestBlockchain()
 
 	block1 := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
-	err := bc.WriteBlock(block1)
+	err := bc.WriteBlock(block1, nil)
 	assert.Equal(t, err, error(nil))
 
 	currentBlock := bc.CurrentBlock()
@@ -237,7 +237,7 @@ func Test_Blockchain_BlockFork(t *testing.T) {
 	assert.Equal(t, bc.blockLeaves.Count(), 1)
 
 	block2 := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
-	err = bc.WriteBlock(block2)
+	err = bc.WriteBlock(block2, nil)
 	assert.Equal(t, err, error(nil))
 
 	assert.Equal(t, bc.blockLeaves.Count(), 2)
@@ -247,14 +247,14 @@ func Test_BlockChain_InvalidParent(t *testing.T) {
 	bc := NewTestBlockchain()
 
 	block := newTestBlockWithApply(bc, common.EmptyHash, 1, 3, 0, false)
-	assert.True(t, errors.IsOrContains(bc.WriteBlock(block), consensus.ErrBlockInvalidParentHash))
+	assert.True(t, errors.IsOrContains(bc.WriteBlock(block, nil), consensus.ErrBlockInvalidParentHash))
 }
 
 func Test_Blockchain_InvalidHeight(t *testing.T) {
 	bc := NewTestBlockchain()
 
 	block := newTestBlock(bc, bc.genesisBlock.HeaderHash, 0, 3, 0)
-	assert.True(t, errors.IsOrContains(bc.WriteBlock(block), consensus.ErrBlockInvalidHeight))
+	assert.True(t, errors.IsOrContains(bc.WriteBlock(block, nil), consensus.ErrBlockInvalidHeight))
 }
 
 func Test_Blockchain_UpdateCanocialHash(t *testing.T) {
@@ -263,20 +263,20 @@ func Test_Blockchain_UpdateCanocialHash(t *testing.T) {
 
 	// genesis <- block11
 	block11 := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
-	assert.Equal(t, bc.WriteBlock(block11), error(nil))
+	assert.Equal(t, bc.WriteBlock(block11, nil), error(nil))
 	assertCanonicalHash(t, bc, 1, block11.HeaderHash)
 	assertTxDebtIndex(t, bc, true, block11)
 
 	// genesis <- block11 <- block12
 	block12 := newTestBlock(bc, block11.HeaderHash, 2, 3, 3)
-	assert.Equal(t, bc.WriteBlock(block12), error(nil))
+	assert.Equal(t, bc.WriteBlock(block12, nil), error(nil))
 	assertCanonicalHash(t, bc, 2, block12.HeaderHash)
 	assertTxDebtIndex(t, bc, true, block11, block12)
 
 	// genesis <- block11 <- block12 (canonical)
 	//         <- block21
 	block21 := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
-	assert.Equal(t, bc.WriteBlock(block21), error(nil))
+	assert.Equal(t, bc.WriteBlock(block21, nil), error(nil))
 	assertCanonicalHash(t, bc, 1, block11.HeaderHash)
 	assertCanonicalHash(t, bc, 2, block12.HeaderHash)
 	assertTxDebtIndex(t, bc, true, block11, block12)
@@ -285,7 +285,7 @@ func Test_Blockchain_UpdateCanocialHash(t *testing.T) {
 	// genesis <- block11 <- block12 (canonical)
 	//         <- block21 <- block22
 	block22 := newTestBlock(bc, block21.HeaderHash, 2, 3, 3)
-	assert.Equal(t, bc.WriteBlock(block22), error(nil))
+	assert.Equal(t, bc.WriteBlock(block22, nil), error(nil))
 	assertCanonicalHash(t, bc, 1, block11.HeaderHash)
 	assertCanonicalHash(t, bc, 2, block12.HeaderHash)
 	assertTxDebtIndex(t, bc, true, block11, block12)
@@ -294,7 +294,7 @@ func Test_Blockchain_UpdateCanocialHash(t *testing.T) {
 	// genesis <- block11 <- block12
 	//         <- block21 <- block22 <- block23 (canonical)
 	block23 := newTestBlock(bc, block22.HeaderHash, 3, 3, 6)
-	assert.Equal(t, bc.WriteBlock(block23), error(nil))
+	assert.Equal(t, bc.WriteBlock(block23, nil), error(nil))
 	assertCanonicalHash(t, bc, 1, block21.HeaderHash)
 	assertCanonicalHash(t, bc, 2, block22.HeaderHash)
 	assertCanonicalHash(t, bc, 3, block23.HeaderHash)
@@ -452,7 +452,7 @@ func Benchmark_Blockchain_WriteBlock(b *testing.B) {
 
 		block := newTestBlock(bc, preBlock.HeaderHash, preBlock.Header.Height+1, state.GetNonce(types.TestGenesisAccount.Addr), BlockByteLimit)
 		b.StartTimer()
-		if err := bc.WriteBlock(block); err != nil {
+		if err := bc.WriteBlock(block, nil); err != nil {
 			b.Fatalf("failed to write block, %v", err.Error())
 		}
 		preBlock = block

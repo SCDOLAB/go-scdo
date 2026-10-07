@@ -54,6 +54,9 @@ var (
 
 	maxConns       = int(0)
 	maxActiveConns = int(0)
+
+	// dataDirFlag overrides basic.dataDir. Absolute paths are used as-is.
+	dataDirFlag string
 )
 
 // startCmd represents the start command
@@ -72,6 +75,11 @@ var startCmd = &cobra.Command{
 			return
 		}
 		Cast(nCfg)
+		if len(nCfg.BasicConfig.Coinbase) == 0 {
+			fmt.Println("No coinbase is set. Create a wallet key first, then put the address in basic.coinbase:")
+			fmt.Println("  node key --shard N")
+			fmt.Println("N is 1, 2, 3 or 4. Keep the private key safe. Mining rewards go to that address.")
+		}
 		if !comm.LogConfiguration.PrintLog {
 			fmt.Printf("log folder: %s\n", filepath.Join(log.LogFolder, comm.LogConfiguration.DataDir))
 		}
@@ -193,7 +201,7 @@ var startCmd = &cobra.Command{
 					fmt.Println("failed to start the miner : ", err)
 					return
 				}
-			} else if minerInfo == "stop" {
+			} else if minerInfo == "" || minerInfo == "stop" {
 				scdoService.Miner().SetStopper(1)
 				scdoService.Miner().Stop()
 			} else {
@@ -224,7 +232,8 @@ func init() {
 	startCmd.Flags().StringVarP(&scdoNodeConfigFile, "config", "c", "", "scdo node config file (required)")
 	startCmd.MustMarkFlagRequired("config")
 
-	startCmd.Flags().StringVarP(&miner, "miner", "m", "start", "miner start or not, [start, stop]")
+	startCmd.Flags().StringVarP(&miner, "miner", "m", "stop", "miner start or not, [start, stop]. Default is stop (sync only)")
+	startCmd.Flags().StringVar(&dataDirFlag, "datadir", "", "data directory. Absolute paths are used as-is; relative paths are placed under $HOME/.scdo. Overrides basic.dataDir")
 	startCmd.Flags().BoolVarP(&metricsEnableFlag, "metrics", "t", false, "start metrics")
 	startCmd.Flags().StringVarP(&accountsConfig, "accounts", "", "", "init accounts info")
 	startCmd.Flags().StringVarP(&poolAccountsConfig, "poolaccounts", "", "", "init pool accounts")
