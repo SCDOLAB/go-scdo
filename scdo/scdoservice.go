@@ -55,6 +55,7 @@ type ScdoService struct {
 	chainHeaderChangeChannel chan common.Hash
 
 	debtVerifier types.DebtVerifier
+	dbCacheMB    int
 }
 
 // ServiceContext is a collection of service configuration inherited from node
@@ -98,6 +99,7 @@ func NewScdoService(ctx context.Context, conf *node.Config, log *log.ScdoLog, en
 		networkID:    conf.P2PConfig.NetworkID,
 		netVersion:   conf.BasicConfig.Version,
 		debtVerifier: verifier,
+		dbCacheMB:    conf.BasicConfig.DbCache,
 	}
 
 	serviceContext := ctx.Value("ServiceContext").(ServiceContext)
@@ -143,7 +145,12 @@ func (s *ScdoService) initBlockchainDB(serviceContext *ServiceContext) (err erro
 	s.chainDBPath = filepath.Join(serviceContext.DataDir, BlockChainDir)
 	s.log.Info("NewScdoService BlockChain datadir is %s", s.chainDBPath)
 
-	if s.chainDB, err = leveldb.NewLevelDB(s.chainDBPath); err != nil {
+	cacheMB := s.dbCacheMB
+	if cacheMB <= 0 {
+		cacheMB = leveldb.AutoCacheMB(s.chainDBPath)
+	}
+	s.log.Info("chain db cache %d MB (larger while the chain directory is still small)", cacheMB)
+	if s.chainDB, err = leveldb.NewLevelDBWithCache(s.chainDBPath, cacheMB); err != nil {
 		s.log.Error("NewScdoService Create BlockChain err. %s", err)
 		return err
 	}
@@ -155,7 +162,7 @@ func (s *ScdoService) initAccountStateDB(serviceContext *ServiceContext) (err er
 	s.accountStateDBPath = filepath.Join(serviceContext.DataDir, AccountStateDir)
 	s.log.Info("NewScdoService account state datadir is %s", s.accountStateDBPath)
 
-	if s.accountStateDB, err = leveldb.NewLevelDB(s.accountStateDBPath); err != nil {
+	if s.accountStateDB, err = leveldb.NewLevelDBWithCache(s.accountStateDBPath, sideDBCacheMB(s.dbCacheMB)); err != nil {
 		s.Stop()
 		s.log.Error("NewScdoService Create BlockChain err: failed to create account state DB, %s", err)
 		return err
@@ -168,13 +175,24 @@ func (s *ScdoService) initDebtManagerDB(serviceContext *ServiceContext) (err err
 	s.debtManagerDBPath = filepath.Join(serviceContext.DataDir, DebtManagerDir)
 	s.log.Info("NewScdoService debt manager datadir is %s", s.debtManagerDBPath)
 
-	if s.debtManagerDB, err = leveldb.NewLevelDB(s.debtManagerDBPath); err != nil {
+	if s.debtManagerDB, err = leveldb.NewLevelDBWithCache(s.debtManagerDBPath, sideDBCacheMB(s.dbCacheMB)); err != nil {
 		s.Stop()
 		s.log.Error("NewScdoService Create BlockChain err: failed to create debt manager DB, %s", err)
 		return err
 	}
 
 	return nil
+}
+
+func sideDBCacheMB(configured int) int {
+	if configured > 0 {
+		side := configured / 4
+		if side < 32 {
+			return 32
+		}
+		return side
+	}
+	return 64
 }
 
 func (s *ScdoService) initGenesisAndChain(serviceContext *ServiceContext, conf *node.Config, startHeight int) (err error) {

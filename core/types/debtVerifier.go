@@ -5,6 +5,13 @@
 
 package types
 
+// ShardHeight is the header tip of one shard. Mode is decided by the caller:
+// the local chain is a full sync and the other shards are header syncs.
+type ShardHeight struct {
+	Shard  uint
+	Height uint64
+}
+
 // DebtVerifier interface
 type DebtVerifier interface {
 	// ValidateDebt validate debt

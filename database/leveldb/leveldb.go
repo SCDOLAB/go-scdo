@@ -8,10 +8,21 @@ package leveldb
 import (
 	"io/ioutil"
 	"os"
+	"path/filepath"
 
 	"github.com/scdoproject/go-scdo/database"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/syndtr/goleveldb/leveldb/opt"
+)
+
+const (
+	// InitialSyncCacheMB is the chain cache while the database is still small.
+	InitialSyncCacheMB = 512
+	// SteadyCacheMB is the chain cache after the database has grown.
+	SteadyCacheMB = 128
+	// initialSyncBytes treats a chain directory under this size as an initial sync.
+	initialSyncBytes = 64 << 20
 )
 
 var (
@@ -25,12 +36,32 @@ type LevelDB struct {
 	quitChan chan struct{} // used by metrics
 }
 
-// NewLevelDB constructs and returns a LevelDB instance
+// AutoCacheMB returns InitialSyncCacheMB for a new or small database and
+// SteadyCacheMB once the directory has grown past the initial sync.
+func AutoCacheMB(path string) int {
+	if directoryBytes(path) < initialSyncBytes {
+		return InitialSyncCacheMB
+	}
+	return SteadyCacheMB
+}
+
+// NewLevelDB constructs and returns a LevelDB instance with the automatic cache size.
 func NewLevelDB(path string) (database.Database, error) {
-	db, err := leveldb.OpenFile(path, nil)
+	return NewLevelDBWithCache(path, 0)
+}
+
+// NewLevelDBWithCache opens LevelDB with cacheMB megabytes of cache.
+// cacheMB <= 0 uses AutoCacheMB. Block writes already commit as one LevelDB
+// batch per block; the larger write buffer coalesces those batches during sync.
+func NewLevelDBWithCache(path string, cacheMB int) (database.Database, error) {
+	if cacheMB <= 0 {
+		cacheMB = AutoCacheMB(path)
+	}
+	opts := cacheOptions(cacheMB)
+	db, err := leveldb.OpenFile(path, opts)
 
 	if _, corrupted := err.(*errors.ErrCorrupted); corrupted {
-		db, err = leveldb.RecoverFile(path, nil)
+		db, err = leveldb.RecoverFile(path, opts)
 	}
 
 	if err != nil {
@@ -44,6 +75,51 @@ func NewLevelDB(path string) (database.Database, error) {
 
 	return result, nil
 }
+
+func cacheOptions(cacheMB int) *opt.Options {
+	if cacheMB < 16 {
+		cacheMB = 16
+	}
+	bytes := cacheMB * opt.MiB
+	writeBuffer := bytes / 4
+	if writeBuffer < 4*opt.MiB {
+		writeBuffer = 4 * opt.MiB
+	}
+	if writeBuffer > 128*opt.MiB {
+		writeBuffer = 128 * opt.MiB
+	}
+	return &opt.Options{
+		BlockCacheCapacity:  bytes / 2,
+		WriteBuffer:         writeBuffer,
+		CompactionTableSize: 8 * opt.MiB,
+		CompactionL0Trigger: 8,
+	}
+}
+
+func directoryBytes(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return 0
+	}
+	var total int64
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		if total >= initialSyncBytes {
+			return stopWalk
+		}
+		return nil
+	})
+	return total
+}
+
+type stopWalkError struct{}
+
+func (stopWalkError) Error() string { return "stop walk" }
+
+var stopWalk = stopWalkError{}
 
 // Close is used to close the db when not used
 func (db *LevelDB) Close() {

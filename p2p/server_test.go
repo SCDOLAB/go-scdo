@@ -201,7 +201,7 @@ func testPeerInfos() PeerInfos {
 }
 
 func generatePrivKey() *ecdsa.PrivateKey {
-	_, keypair, err := crypto.GenerateKeyPair()
+	_, keypair, err := crypto.GenerateKeyPair(1)
 	if err != nil {
 		panic(err)
 	}

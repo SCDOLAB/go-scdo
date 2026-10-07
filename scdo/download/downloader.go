@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/big"
 	rand2 "math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,10 +55,16 @@ func CodeToStr(code uint16) string {
 }
 
 var (
-	// MaxBlockFetch amount of blocks to be fetched per retrieval request
-	MaxBlockFetch = 32
+	// MaxBlockFetch amount of blocks to be fetched per retrieval request.
+	// The serving peer still cuts the reply at MaxMessageLength.
+	MaxBlockFetch = 64
 	// MaxHeaderFetch amount of block headers to be fetched per retrieval request
-	MaxHeaderFetch = 256
+	MaxHeaderFetch = 512
+	// maxBodyInflight is how many block-body batches one peer may have in flight.
+	// Header fetches run beside these, so download overlaps verify/write.
+	maxBodyInflight = 2
+	// bodyWaitTimeout frees a slow in-flight body request so another peer can take it.
+	bodyWaitTimeout = 8 * time.Second
 
 	// MaxForkAncestry maximum chain reorganisation
 	MaxForkAncestry = 90000
@@ -100,6 +107,14 @@ type Downloader struct {
 	activeWG    *sync.WaitGroup
 	log         *log.ScdoLog
 	lock        sync.RWMutex
+	scores      map[string]*peerStat
+
+	// Cross-shard dependency wait. Alephium keeps a block queued until its
+	// group dependencies exist; QuarkChain will not spend a cross-shard
+	// transfer until the source shard has buried it. Neither case is a bad block.
+	waitReason string
+	waitNeed   uint64
+	waitHave   uint64
 }
 
 // BlockHeadersMsgBody represents a message struct for BlockHeadersMsg
@@ -128,6 +143,7 @@ func NewDownloader(chain *core.Blockchain, scdo ScdoBackend) *Downloader {
 		scdo:       scdo,
 		chain:      chain,
 		syncStatus: statusNone,
+		scores:     make(map[string]*peerStat),
 	}
 
 	d.log = log.GetLogger("download")
@@ -162,6 +178,84 @@ func (d *Downloader) getReadableStatus() string {
 	}
 
 	return status
+}
+
+// Progress returns the sync snapshot for scdo_syncing.
+// While a session is running, current/highest/blk/s/ETA come from the
+// smoothed writer. Otherwise the local chain height is both ends.
+func (d *Downloader) Progress() SyncProgress {
+	d.lock.RLock()
+	status := d.syncStatus
+	tm := d.tm
+	peers := len(d.peers)
+	chain := d.chain
+	waitReason := d.waitReason
+	waitNeed := d.waitNeed
+	waitHave := d.waitHave
+	d.lock.RUnlock()
+
+	prog := SyncProgress{
+		Peers:             peers,
+		ETA:               "0s",
+		WaitingOn:         waitReason,
+		ConfirmationsNeed: waitNeed,
+		ConfirmationsHave: waitHave,
+	}
+	if status == statusFetching && tm != nil {
+		cur, high, bps, eta := tm.progressSnapshot()
+		prog.Syncing = cur < high
+		prog.Current = cur
+		prog.Highest = high
+		prog.BlocksPerSec = bps
+		if eta != "" {
+			prog.ETA = eta
+		}
+		return prog
+	}
+	if chain != nil && chain.CurrentBlock() != nil {
+		height := chain.CurrentBlock().Header.Height
+		prog.Current = height
+		prog.Highest = height
+	}
+	return prog
+}
+
+func (d *Downloader) recordDelivery(peerID string, blocks int, elapsed time.Duration) {
+	if blocks <= 0 || elapsed <= 0 {
+		return
+	}
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	st := d.score(peerID)
+	st.blocks += uint64(blocks)
+	st.seconds += elapsed.Seconds()
+}
+
+func (d *Downloader) penalize(peerID string, isMaster bool) {
+	d.lock.Lock()
+	st := d.score(peerID)
+	st.strikes++
+	copied := make(map[string]peerStat, len(d.scores))
+	for id, s := range d.scores {
+		copied[id] = *s
+	}
+	peerCount := len(d.peers)
+	conn := d.peers[peerID]
+	drop := dropPeer(peerID, copied, peerCount, isMaster)
+	d.lock.Unlock()
+	if drop && conn != nil {
+		d.log.Info("disconnecting slow peer %s", peerID)
+		conn.peer.DisconnectPeer("slow peer")
+	}
+}
+
+func (d *Downloader) score(peerID string) *peerStat {
+	st := d.scores[peerID]
+	if st == nil {
+		st = &peerStat{}
+		d.scores[peerID] = st
+	}
+	return st
 }
 
 // getSyncInfo gets sync information of the current session.
@@ -473,100 +567,40 @@ func (d *Downloader) Terminate() {
 	// TODO release variables if needed
 }
 
-// peerDownload peer download routine
+// peerDownload runs a header fetcher and a body fetcher for one peer.
+// Headers stay ahead of bodies, and several peers download bodies at once.
+// Body batches stay in flight while earlier blocks are verified and written.
 func (d *Downloader) peerDownload(conn *peerConn, tm *taskMgr, sessionWG *sync.WaitGroup) {
 	defer sessionWG.Done()
 
 	d.log.Debug("Downloader.peerDownload start. peerID=%s masterID=%s", conn.peerID, d.masterPeer)
-	isMaster := (conn.peerID == d.masterPeer)
+	isMaster := conn.peerID == d.masterPeer
 	peerID := conn.peerID
+	conn.bindSession()
 
-outLoop:
-	for !tm.isDone() {
-		hasReqData := false
-		if startNo, amount := tm.getReqHeaderInfo(conn); amount > 0 {
-			d.log.Debug("tm.getReqHeaderInfo. startNo=%d amount=%d", startNo, amount)
-			hasReqData = true
-
-			magic := rand2.Uint32()
-			d.log.Debug("request header by number. start=%d, amount=%d, magic=%d, id=%s", startNo, amount, magic, conn.peerID)
-
-			go conn.peer.RequestHeadersByHashOrNumber(magic, common.Hash{}, startNo, amount, false)
-
-			msg, err := conn.waitMsg(magic, BlockHeadersMsg, d.cancelCh)
-			if err != nil {
-				d.log.Debug("peerDownload waitMsg BlockHeadersMsg err! err=%s, magic=%d, id=%s", err, magic, conn.peerID)
-				break
-			}
-
-			headers := msg.([]*types.BlockHeader)
-			startHeight := uint64(0)
-			endHeight := uint64(0)
-			if len(headers) > 0 {
-				startHeight = headers[0].Height
-				endHeight = headers[len(headers)-1].Height
-			}
-
-			d.log.Debug("got block header msg length= %d. start=%d, end=%d, magic=%d, id=%s", len(headers), startHeight, endHeight, magic, conn.peerID)
-
-			if err = tm.deliverHeaderMsg(peerID, headers); err != nil {
-				d.log.Warn("peerDownload deliverHeaderMsg err! %s", err)
-				break
-			}
-
-			d.log.Debug("get request header info success")
-		}
-
-		if startNo, amount := tm.getReqBlocks(conn); amount > 0 {
-			d.log.Debug("download.peerdown getReqBlocks startNo=%d amount=%d", startNo, amount)
-			hasReqData = true
-
-			magic := rand2.Uint32()
-			d.log.Debug("request block by number. start=%d, amount=%d, magic=%d, id=%s", startNo, amount, magic, conn.peerID)
-
-			go conn.peer.RequestBlocksByHashOrNumber(magic, common.Hash{}, startNo, amount)
-
-			msg, err := conn.waitMsg(magic, BlocksMsg, d.cancelCh)
-			if err != nil {
-				d.log.Debug("peerDownload waitMsg BlocksMsg err! err=%s", err)
-				break
-			}
-
-			blocks := msg.([]*types.Block)
-			startHeight := uint64(0)
-			endHeight := uint64(0)
-			if len(blocks) > 0 {
-				startHeight = blocks[0].Header.Height
-				endHeight = blocks[len(blocks)-1].Header.Height
-			}
-			d.log.Debug("got blocks message length=%d. start=%d, end=%d, magic=%d, id=%s", len(blocks), startHeight, endHeight, magic, conn.peerID)
-
-			tm.deliverBlockMsg(peerID, blocks)
-			d.log.Debug("get request blocks success")
-		}
-
-		if hasReqData {
-			d.log.Debug("got request data, continue to request")
-			continue
-		}
-
-	outFor:
-		for {
-			select {
-			case <-d.cancelCh:
-				// A finished sync cancels helper peers. Do not drop them for that.
-				if !tm.isDone() {
-					conn.peer.DisconnectPeer("peerDownload anormaly")
-				}
-				break outLoop
-			case <-conn.quitCh:
-				break outLoop
-			case <-time.After(peerIdleTime):
-				d.log.Debug("peerDownload peerIdleTime timeout")
-				break outFor
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := d.fetchHeaders(conn, tm); err != nil && !tm.isDone() {
+			d.log.Debug("header fetch stopped peer=%s err=%s", conn.peerID, err)
+			conn.stopSession()
+			if isMaster {
+				d.Cancel()
 			}
 		}
-	}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := d.fetchBodies(conn, tm); err != nil && !tm.isDone() {
+			d.log.Debug("body fetch stopped peer=%s err=%s", conn.peerID, err)
+			conn.stopSession()
+			if isMaster {
+				d.Cancel()
+			}
+		}
+	}()
+	wg.Wait()
 
 	tm.onPeerQuit(peerID)
 	if isMaster || tm.isDone() {
@@ -575,16 +609,138 @@ outLoop:
 	d.log.Debug("Downloader.peerDownload end. peerID=%s masterID=%s", conn.peerID, d.masterPeer)
 }
 
+func (d *Downloader) fetchHeaders(conn *peerConn, tm *taskMgr) error {
+	for !tm.isDone() {
+		if d.sessionStopped(conn) {
+			return errReceivedQuitMsg
+		}
+		startNo, amount := tm.getReqHeaderInfo(conn)
+		if amount <= 0 {
+			if err := d.idlePeer(conn, tm); err != nil {
+				return err
+			}
+			continue
+		}
+		magic := rand2.Uint32()
+		d.log.Debug("request header by number. start=%d, amount=%d, magic=%d, id=%s", startNo, amount, magic, conn.peerID)
+		go conn.peer.RequestHeadersByHashOrNumber(magic, common.Hash{}, startNo, amount, false)
+
+		msg, err := conn.waitMsg(magic, BlockHeadersMsg, d.cancelCh)
+		if err != nil {
+			d.log.Debug("peerDownload waitMsg BlockHeadersMsg err! err=%s, magic=%d, id=%s", err, magic, conn.peerID)
+			d.penalize(conn.peerID, conn.peerID == d.masterPeer)
+			return err
+		}
+		headers := msg.([]*types.BlockHeader)
+		if err = tm.deliverHeaderMsg(conn.peerID, headers); err != nil {
+			d.log.Warn("peerDownload deliverHeaderMsg err! %s", err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *Downloader) fetchBodies(conn *peerConn, tm *taskMgr) error {
+	inflight := make(chan struct{}, maxBodyInflight)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	for !tm.isDone() {
+		if d.sessionStopped(conn) {
+			return errReceivedQuitMsg
+		}
+		for _, id := range tm.drainSlow() {
+			d.penalize(id, id == d.masterPeer)
+		}
+		stop := conn.sessionStopCh()
+		select {
+		case inflight <- struct{}{}:
+		case <-d.cancelCh:
+			return errReceivedQuitMsg
+		case <-conn.quitCh:
+			return errPeerQuit
+		case <-stop:
+			return errReceivedQuitMsg
+		}
+		startNo, amount := tm.getReqBlocks(conn)
+		if amount <= 0 {
+			<-inflight
+			if err := d.idlePeer(conn, tm); err != nil {
+				return err
+			}
+			continue
+		}
+		wg.Add(1)
+		go func(startNo uint64, amount int) {
+			defer wg.Done()
+			defer func() { <-inflight }()
+			d.fetchOneBody(conn, tm, startNo, amount)
+		}(startNo, amount)
+	}
+	return nil
+}
+
+func (d *Downloader) fetchOneBody(conn *peerConn, tm *taskMgr, startNo uint64, amount int) {
+	magic := rand2.Uint32()
+	d.log.Debug("request block by number. start=%d, amount=%d, magic=%d, id=%s", startNo, amount, magic, conn.peerID)
+	started := time.Now()
+	go conn.peer.RequestBlocksByHashOrNumber(magic, common.Hash{}, startNo, amount)
+
+	msg, err := conn.waitMsgTimeout(magic, BlocksMsg, d.cancelCh, bodyWaitTimeout)
+	if err != nil {
+		d.log.Debug("peerDownload waitMsg BlocksMsg err! err=%s", err)
+		if !tm.isDone() {
+			d.penalize(conn.peerID, conn.peerID == d.masterPeer)
+		}
+		return
+	}
+	blocks := msg.([]*types.Block)
+	tm.deliverBlockMsg(conn.peerID, blocks)
+	if len(blocks) > 0 {
+		d.recordDelivery(conn.peerID, len(blocks), time.Since(started))
+	}
+}
+
+func (d *Downloader) sessionStopped(conn *peerConn) bool {
+	stop := conn.sessionStopCh()
+	select {
+	case <-d.cancelCh:
+		return true
+	case <-conn.quitCh:
+		return true
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *Downloader) idlePeer(conn *peerConn, tm *taskMgr) error {
+	stop := conn.sessionStopCh()
+	select {
+	case <-d.cancelCh:
+		if !tm.isDone() {
+			conn.peer.DisconnectPeer("peerDownload anormaly")
+		}
+		return errReceivedQuitMsg
+	case <-conn.quitCh:
+		return errPeerQuit
+	case <-stop:
+		return errReceivedQuitMsg
+	case <-time.After(peerIdleTime):
+		return nil
+	}
+}
+
 // processBlocks writes blocks to the blockchain.
 // waiting is true when a cross-shard debt needs a source-shard header or more
 // confirmations on that shard. The task manager leaves those blocks queued and retries.
 func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block, conn *peerConn) (waiting bool) {
 	if len(headInfos) > 0 {
-		d.log.Info(" [%d] blocks will be processed into local database", len(headInfos))
+		d.log.Debug(" [%d] blocks will be processed into local database", len(headInfos))
 	}
 	for _, h := range headInfos {
-		// add it for all received block messages
-		d.log.Info("got block message and save it. height=%d, hash=%s, time=%d", h.block.Header.Height, h.block.HeaderHash.Hex(), time.Now().UnixNano())
+		d.log.Debug("got block message and save it. height=%d, hash=%s", h.block.Header.Height, h.block.HeaderHash.Hex())
 		// writeblock
 		var txPool *core.Pool
 		if pool := d.scdo.TxPool(); pool != nil {
@@ -594,9 +750,11 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 
 		if err != nil && !errors.IsOrContains(err, core.ErrBlockAlreadyExists) {
 			if isShardDataNotReady(err) {
+				d.noteShardWait(err)
 				d.log.Debug("queue block height=%d until the source shard is ready: %s", h.block.Header.Height, err)
 				return true
 			}
+			d.clearShardWait()
 			d.log.Error("failed to write block err=%s", err)
 			// recover local blocks if localTotalDifficulty is larger than the synchronized total difficulty
 			// if writeblock fails in the middle (the whole process not successfully completed), then we need to consider write back our localblocks
@@ -611,8 +769,62 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 		}
 
 		h.status = taskStatusProcessed
+		d.clearShardWait()
 	}
 	return false
+}
+
+// noteShardWait records why a block is queued. The numbers come from the
+// verifier message "wanted is N, actual is M" and are not a new consensus rule.
+func (d *Downloader) noteShardWait(err error) {
+	reason := "source-shard-header"
+	var need, have uint64
+	if errors.IsOrContains(err, types.ErrNotEnoughConfirmations) {
+		reason = "source-shard-confirmations"
+		need, have = confirmationCounts(err.Error())
+	}
+	d.lock.Lock()
+	d.waitReason = reason
+	d.waitNeed = need
+	d.waitHave = have
+	d.lock.Unlock()
+}
+
+func (d *Downloader) clearShardWait() {
+	d.lock.Lock()
+	d.waitReason = ""
+	d.waitNeed = 0
+	d.waitHave = 0
+	d.lock.Unlock()
+}
+
+// WaitDetail is the operator-facing line for a queued cross-shard dependency.
+func (d *Downloader) WaitDetail() string {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+	switch d.waitReason {
+	case "source-shard-confirmations":
+		if d.waitNeed > 0 {
+			return fmt.Sprintf("source shard has %d/%d confirmations; waiting, not rejecting the block", d.waitHave, d.waitNeed)
+		}
+		return "source shard confirmations are not ready; waiting, not rejecting the block"
+	case "source-shard-header":
+		return "source shard header is not synced yet; waiting, not rejecting the block"
+	default:
+		return ""
+	}
+}
+
+func confirmationCounts(msg string) (need, have uint64) {
+	const wanted = "wanted is "
+	const actual = "actual is "
+	if i := strings.Index(msg, wanted); i >= 0 {
+		fmt.Sscanf(msg[i:], "wanted is %d", &need)
+	}
+	if i := strings.Index(msg, actual); i >= 0 {
+		fmt.Sscanf(msg[i:], "actual is %d", &have)
+	}
+	return need, have
 }
 
 // isShardDataNotReady reports whether a block write failed only because the

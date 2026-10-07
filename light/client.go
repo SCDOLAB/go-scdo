@@ -51,7 +51,12 @@ func NewServiceClient(ctx context.Context, conf *node.Config, log *log.ScdoLog, 
 	// Initialize blockchain DB.
 	chainDBPath := filepath.Join(serviceContext.DataDir, dbFolder)
 	log.Info("NewServiceClient BlockChain datadir is %s", chainDBPath)
-	s.lightDB, err = leveldb.NewLevelDB(chainDBPath)
+	cacheMB := leveldb.AutoCacheMB(chainDBPath)
+	if cacheMB > 128 {
+		cacheMB = 128
+	}
+	log.Info("light chain shard %d db cache %d MB", shard, cacheMB)
+	s.lightDB, err = leveldb.NewLevelDBWithCache(chainDBPath, cacheMB)
 	if err != nil {
 		log.Error("NewServiceClient Create lightDB err. %s", err)
 		return nil, err
@@ -91,6 +96,17 @@ func NewServiceClient(ctx context.Context, conf *node.Config, log *log.ScdoLog, 
 	s.odrBackend.start(s.scdoProtocol.peerSet) // start the odr backend
 	log.Info("light mode started.")
 	return s, nil
+}
+
+// Shard is the shard this light client header-syncs.
+func (s *ServiceClient) Shard() uint { return s.shard }
+
+// CurrentHeight is the latest header height on this shard.
+func (s *ServiceClient) CurrentHeight() uint64 {
+	if s.chain == nil || s.chain.CurrentHeader() == nil {
+		return 0
+	}
+	return s.chain.CurrentHeader().Height
 }
 
 // Protocols implements node.Service, returning all the currently configured

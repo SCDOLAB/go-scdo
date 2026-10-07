@@ -180,6 +180,8 @@ func Test_TaskMgr_DeliverBlockMsg(t *testing.T) {
 	// case 3: ok
 	taskMgr.downloadInfoList[0].block.Header.Height = 0
 	taskMgr.downloadInfoList[1].block.Header.Height = 1
+	taskMgr.downloadInfoList[0].header = taskMgr.downloadInfoList[0].block.Header
+	taskMgr.downloadInfoList[1].header = taskMgr.downloadInfoList[1].block.Header
 	taskMgr.deliverBlockMsg("peerID", []*types.Block{taskMgr.downloadInfoList[0].block, taskMgr.downloadInfoList[1].block})
 	assert.Equal(t, taskMgr.downloadInfoList[0].status, taskStatusWaitProcessing)
 	assert.Equal(t, taskMgr.downloadInfoList[1].status, taskStatusWaitProcessing)

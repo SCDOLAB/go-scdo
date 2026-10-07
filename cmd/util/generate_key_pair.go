@@ -21,22 +21,30 @@ import (
 func GetGenerateKeyPairCmd(name string) (cmds *cobra.Command) {
 	var shard *uint
 	var outPath *string
+	var allShards *bool
 
 	var generateKeyPairCmd = &cobra.Command{
 		Use:   "key",
 		Short: "generate a key pair with specified shard number",
 		Long: "generate a key pair and print them with hex values\n For example:\n" + name + " key --shard 1\n" +
-			name + " key --shard 1 --out wallet.key",
+			name + " key --shard 1 --out wallet.key\n" +
+			name + " key --all-shards\n" +
+			name + " key --all-shards --out wallet",
 		Run: func(cmd *cobra.Command, args []string) {
+			path := ""
+			if outPath != nil {
+				path = *outPath
+			}
+			if allShards != nil && *allShards {
+				if err := writeAllShardKeys(os.Stdout, os.Stderr, path); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+				}
+				return
+			}
 			publicKey, privateKey, err := GenerateKey(*shard)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				return
-			}
-
-			path := ""
-			if outPath != nil {
-				path = *outPath
 			}
 			if err := writeKeyPair(os.Stdout, os.Stderr, publicKey, privateKey, path); err != nil {
 				fmt.Fprintln(os.Stderr, err)
@@ -46,8 +54,39 @@ func GetGenerateKeyPairCmd(name string) (cmds *cobra.Command) {
 
 	shard = generateKeyPairCmd.Flags().UintP("shard", "", 0, "shard number")
 	outPath = generateKeyPairCmd.Flags().String("out", "", "write the private key to this file (mode 0600) instead of printing it")
+	allShards = generateKeyPairCmd.Flags().Bool("all-shards", false, "generate one mining address for each shard (1-4)")
 
 	return generateKeyPairCmd
+}
+
+// writeAllShardKeys prints one account per shard. With outPath set, keys go to
+// outPath-shardN.key (mode 0600) and are not printed. The single-shard stdout
+// line used by scripts/mine.sh is unchanged.
+func writeAllShardKeys(stdout, stderr io.Writer, outPath string) error {
+	fmt.Fprintln(stderr, "warning: this private key controls the account. Anyone who reads it can spend the funds.")
+	fmt.Fprintf(stderr, "warning: each address mines only its own shard. A cross-shard debt confirms after %d blocks on the source shard.\n", common.ConfirmedBlockNumber)
+	for shard := uint(1); shard <= common.ShardCount; shard++ {
+		publicKey, privateKey, err := GenerateKey(shard)
+		if err != nil {
+			return err
+		}
+		keyHex := hexutil.BytesToHex(crypto.FromECDSA(privateKey))
+		fmt.Fprintf(stdout, "shard %d\n", shard)
+		fmt.Fprintf(stdout, "Account:  %s\n", publicKey.Hex())
+		if outPath != "" {
+			path := fmt.Sprintf("%s-shard%d.key", outPath, shard)
+			if err := common.SaveFile(path, []byte(keyHex+"\n")); err != nil {
+				return err
+			}
+			if err := os.Chmod(path, 0600); err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "private key written to %s (mode 0600)\n", path)
+			continue
+		}
+		fmt.Fprintf(stdout, "private key: %s\n", keyHex)
+	}
+	return nil
 }
 
 // writeKeyPair prints the account and either the private key or a path to a 0600 file.

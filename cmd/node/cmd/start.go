@@ -57,6 +57,9 @@ var (
 
 	// dataDirFlag overrides basic.dataDir. Absolute paths are used as-is.
 	dataDirFlag string
+
+	// dbCacheFlag overrides basic.dbcache, in megabytes. 0 keeps the automatic size.
+	dbCacheFlag int
 )
 
 // startCmd represents the start command
@@ -154,6 +157,8 @@ var startCmd = &cobra.Command{
 				fmt.Printf("create light client manager failed. %s", err)
 				return
 			}
+			fmt.Printf("Full-syncing shard %d and header-syncing the other shards in parallel. A cross-shard debt waits until the source shard has %d confirmations. Mining needs -m start and a coinbase on shard %d.\n",
+				scdoNode.GetShardNumber(), common.ConfirmedBlockNumber, scdoNode.GetShardNumber())
 
 			// fullnode mode
 			scdoService, err := scdo.NewScdoService(ctx, nCfg, scdolog, engine, manager, startHeight, isPoolMode)
@@ -239,6 +244,7 @@ func init() {
 
 	startCmd.Flags().StringVarP(&miner, "miner", "m", "stop", "miner start or not, [start, stop]. Default is stop (sync only)")
 	startCmd.Flags().StringVar(&dataDirFlag, "datadir", "", "data directory. Absolute paths are used as-is; relative paths are placed under $HOME/.scdo. Overrides basic.dataDir")
+	startCmd.Flags().IntVar(&dbCacheFlag, "dbcache", 0, "chain database cache in MB. 0 uses 512 during initial sync and 128 once the chain database is larger")
 	startCmd.Flags().BoolVarP(&metricsEnableFlag, "metrics", "t", false, "start metrics")
 	startCmd.Flags().StringVarP(&accountsConfig, "accounts", "", "", "init accounts info")
 	startCmd.Flags().StringVarP(&poolAccountsConfig, "poolaccounts", "", "", "init pool accounts")
