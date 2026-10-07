@@ -408,6 +408,30 @@ func (u *udp) loopReply() {
 	}
 }
 
+// SeekShard asks a known node for peers of shard. A light client uses this
+// when that shard still has no TCP peer.
+func (u *udp) SeekShard(shard uint) {
+	if u == nil || u.table == nil || shard == 0 || int(shard) >= len(u.table.shardBuckets) {
+		return
+	}
+	var to *Node
+	if b := u.table.shardBuckets[shard]; b != nil && b.size() > 0 {
+		to = b.get(0)
+	}
+	if to == nil && u.db != nil {
+		to = u.db.getRandNode()
+	}
+	if to == nil && len(u.trustNodes) > 0 {
+		to = u.trustNodes[0]
+	}
+	if to == nil {
+		u.log.Debug("no discovery node yet to ask for shard %d", shard)
+		return
+	}
+	u.log.Info("discovery looking for shard %d peers via %s", shard, to.GetUDPAddr())
+	sendFindShardNodeRequest(u, shard, to)
+}
+
 func (u *udp) discovery() {
 	for {
 		id, err := crypto.GenerateRandomAddress()

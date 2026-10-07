@@ -166,6 +166,13 @@ var startCmd = &cobra.Command{
 
 			scdoService.Miner().SetGpuBlocksThreads(threadblocks, blockthreads)
 
+			// Disable mining before the node starts syncing. Otherwise every
+			// downloader and tx event tries to start the miner and logs
+			// "cannot start miner,stopper:1".
+			if minerInfo == "" || minerInfo == "stop" {
+				scdoService.Miner().SetStopper(1)
+			}
+
 			lightServerService, err := light.NewServiceServer(scdoService, nCfg, lightLog, scdoNode.GetShardNumber())
 			if err != nil {
 				fmt.Println("Create light server err. ", err.Error())

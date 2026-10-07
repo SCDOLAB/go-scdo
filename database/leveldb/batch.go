@@ -7,7 +7,13 @@ package leveldb
 
 import (
 	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 )
+
+// asyncWrite commits a batch without fsync. Combined with Options.NoSync this
+// is one write of the whole block (state, receipts, header) instead of a
+// disk sync per key.
+var asyncWrite = &opt.WriteOptions{Sync: false}
 
 // Batch implements batch for leveldb
 type Batch struct {
@@ -27,7 +33,7 @@ func (b *Batch) Delete(key []byte) {
 
 // Commit commits batch operation.
 func (b *Batch) Commit() error {
-	return b.leveldb.Write(b.batch, nil)
+	return b.leveldb.Write(b.batch, asyncWrite)
 }
 
 // Rollback rollbacks batch operation.

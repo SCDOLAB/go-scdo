@@ -125,9 +125,13 @@ func (miner *Miner) GetCoinbase() common.Address {
 	return miner.coinbase
 }
 
-// SetStopper. If stopper is 1, miner won't do mining
+// SetStopper. If stopper is 1, miner won't do mining and will not poll for work.
 func (miner *Miner) SetStopper(stopper int32) {
-	miner.stopper = stopper
+	atomic.StoreInt32(&miner.stopper, stopper)
+}
+
+func (miner *Miner) miningDisabled() bool {
+	return atomic.LoadInt32(&miner.stopper) != 0
 }
 
 // CanStart is true when the miner is stopped and stopper == 0 and
@@ -148,6 +152,9 @@ func (miner *Miner) handleMsg() {
 	for {
 		select {
 		case msg := <-miner.msgChan:
+			if miner.miningDisabled() {
+				continue
+			}
 			if msg == true {
 				if miner.CanStart() {
 					err := miner.Start()
@@ -155,7 +162,7 @@ func (miner *Miner) handleMsg() {
 						miner.log.Error("error start miner,%s", err.Error())
 					}
 				} else {
-					miner.log.Warn("cannot start miner,stopper:%d, stopped:%d,mining:%d,canStart:%d",
+					miner.log.Debug("miner start skipped,stopper:%d, stopped:%d,mining:%d,canStart:%d",
 						atomic.LoadInt32(&miner.stopper),
 						atomic.LoadInt32(&miner.stopped),
 						atomic.LoadInt32(&miner.mining),
@@ -166,7 +173,7 @@ func (miner *Miner) handleMsg() {
 					miner.Stop()
 
 				} else {
-					miner.log.Warn("miner is not working,stopper:%d, stopped:%d,mining:%d,canStart:%d",
+					miner.log.Debug("miner stop skipped,stopper:%d, stopped:%d,mining:%d,canStart:%d",
 						atomic.LoadInt32(&miner.stopper),
 						atomic.LoadInt32(&miner.stopped),
 						atomic.LoadInt32(&miner.mining),
@@ -240,6 +247,18 @@ func (miner *Miner) IsMining() bool {
 
 // downloaderEventCallback handles events which indicate the downloader state
 func (miner *Miner) downloaderEventCallback(e event.Event) {
+	// -m stop sets stopper before the node starts. Do not enqueue start/stop
+	// or log a warning on every downloader event.
+	if miner.miningDisabled() {
+		switch e.(int) {
+		case event.DownloaderStartEvent:
+			atomic.StoreInt32(&miner.canStart, 0)
+		case event.DownloaderDoneEvent, event.DownloaderFailedEvent:
+			atomic.StoreInt32(&miner.canStart, 1)
+			atomic.StoreInt32(&miner.isFirstDownloader, 0)
+		}
+		return
+	}
 
 	switch e.(int) {
 	case event.DownloaderStartEvent:
@@ -256,6 +275,9 @@ func (miner *Miner) downloaderEventCallback(e event.Event) {
 
 // newTxOrDebtCallback handles the new tx event
 func (miner *Miner) newTxOrDebtCallback(e event.Event) {
+	if miner.miningDisabled() {
+		return
+	}
 	miner.msgChan <- true
 }
 

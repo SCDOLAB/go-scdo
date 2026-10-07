@@ -12,6 +12,8 @@ import (
 	"github.com/scdoproject/go-scdo/database"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/syndtr/goleveldb/leveldb/filter"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 var (
@@ -25,12 +27,36 @@ type LevelDB struct {
 	quitChan chan struct{} // used by metrics
 }
 
+// syncOptions is the LevelDB profile used while a node writes the chain.
+// Defaults (4MiB buffer, 2MiB tables, 8MiB cache, no bloom filter, fsync on
+// every new table) stall a 5400rpm disk once compaction starts. These values
+// keep block writes in larger buffers, skip per-table fsync, and skip
+// negative bloom lookups instead of random reads.
+func syncOptions() *opt.Options {
+	return &opt.Options{
+		BlockCacheCapacity:     64 * opt.MiB,
+		WriteBuffer:            32 * opt.MiB,
+		CompactionTableSize:    8 * opt.MiB,
+		CompactionTotalSize:    64 * opt.MiB,
+		CompactionL0Trigger:    8,
+		WriteL0SlowdownTrigger: 16,
+		WriteL0PauseTrigger:    24,
+		OpenFilesCacheCapacity: 1024,
+		Filter:                 filter.NewBloomFilter(10),
+		// Journal and table fsync is skipped. A process crash still has the
+		// OS page cache; a power loss can drop the tail, which the recovery
+		// point rebuilds. Per-block fsync is what drops a HDD under 50 blk/s.
+		NoSync: true,
+	}
+}
+
 // NewLevelDB constructs and returns a LevelDB instance
 func NewLevelDB(path string) (database.Database, error) {
-	db, err := leveldb.OpenFile(path, nil)
+	opts := syncOptions()
+	db, err := leveldb.OpenFile(path, opts)
 
 	if _, corrupted := err.(*errors.ErrCorrupted); corrupted {
-		db, err = leveldb.RecoverFile(path, nil)
+		db, err = leveldb.RecoverFile(path, opts)
 	}
 
 	if err != nil {

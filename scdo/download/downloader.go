@@ -10,6 +10,7 @@ import (
 	"math/big"
 	rand2 "math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
@@ -100,6 +101,7 @@ type Downloader struct {
 	activeWG    *sync.WaitGroup
 	log         *log.ScdoLog
 	lock        sync.RWMutex
+	writeNS     int64 // smoothed nanoseconds spent in the last block writes
 }
 
 // BlockHeadersMsgBody represents a message struct for BlockHeadersMsg
@@ -590,7 +592,9 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 		if pool := d.scdo.TxPool(); pool != nil {
 			txPool = pool.Pool
 		}
+		started := time.Now()
 		err := d.chain.WriteBlock(h.block, txPool)
+		d.noteBlockWrite(time.Since(started))
 
 		if err != nil && !errors.IsOrContains(err, core.ErrBlockAlreadyExists) {
 			if isShardDataNotReady(err) {
@@ -615,9 +619,35 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 	return false
 }
 
+// waitingBlocks is how many headers may sit ahead of the last written block.
+func (d *Downloader) waitingBlocks() uint64 {
+	if d == nil {
+		return maxBlocksWaiting
+	}
+	return waitingLimit(atomic.LoadInt64(&d.writeNS))
+}
+
+// noteBlockWrite keeps a smoothed write time so the header queue can shrink
+// when the disk cannot keep up with the download.
+func (d *Downloader) noteBlockWrite(elapsed time.Duration) {
+	sample := elapsed.Nanoseconds()
+	if sample < 0 {
+		sample = 0
+	}
+	prev := atomic.LoadInt64(&d.writeNS)
+	var next int64
+	if prev == 0 {
+		next = sample
+	} else {
+		next = (prev*3 + sample) / 4
+	}
+	atomic.StoreInt64(&d.writeNS, next)
+}
+
 // isShardDataNotReady reports whether a block write failed only because the
-// source shard has not caught up (missing header or fewer than the required
-// confirmations). Those blocks stay queued. A real validation failure does not match.
+// source shard has not caught up (missing header, no peer to ask, or fewer
+// than the required confirmations). Those blocks stay queued. A real
+// validation failure does not match.
 func isShardDataNotReady(err error) bool {
 	return errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations)
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
+	"github.com/scdoproject/go-scdo/common/errors"
 	"github.com/scdoproject/go-scdo/core/state"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/event"
@@ -89,7 +90,13 @@ func (dp *DebtPool) loopCheckingDebt() {
 		} else {
 			err := dp.DoMulCheckingDebt()
 			if err != nil {
-				dp.log.Warn("multiple threads checking error: %s", err)
+				// A source header that is not synced yet is the queued-retry
+				// path. Log it at debug so a syncing node is not flooded.
+				if errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations) {
+					dp.log.Debug("debts waiting on source shard: %s", err)
+				} else {
+					dp.log.Warn("multiple threads checking error: %s", err)
+				}
 				// need to sleep some time
 				time.Sleep(5 * time.Second)
 			}

@@ -118,6 +118,7 @@ type LightProtocol struct {
 	syncCh              chan struct{}
 	chainHeaderChangeCh chan common.Hash
 	log                 *log.ScdoLog
+	p2pServer           *p2p.Server
 
 	shard uint
 }
@@ -213,6 +214,9 @@ func (lp *LightProtocol) synchronise(peers []*peer) {
 
 	if len(peers) == 0 {
 		lp.log.Info("lightchain, shard: %d, local height: %d, no peer connected", lp.shard, localCurHeader.Height)
+		if lp.p2pServer != nil {
+			lp.p2pServer.SeekShardPeers(lp.shard)
+		}
 		return
 	}
 

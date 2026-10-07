@@ -112,7 +112,43 @@ func (set *nodeSet) delete(p *discovery.Node) {
 	}
 }
 
-//if connected nodes fewer than the threshold return true
+// shardsWithoutPeers lists shards that have no connected node yet.
+func (set *nodeSet) shardsWithoutPeers() []uint {
+	set.lock.RLock()
+	defer set.lock.RUnlock()
+	connected := make([]int, common.ShardCount+1)
+	for _, v := range set.nodeMap {
+		if v.bConnected && v.node.Shard > 0 && int(v.node.Shard) <= common.ShardCount {
+			connected[v.node.Shard]++
+		}
+	}
+	var missing []uint
+	for shard := uint(1); shard <= uint(common.ShardCount); shard++ {
+		if connected[shard] == 0 {
+			missing = append(missing, shard)
+		}
+	}
+	return missing
+}
+
+// unconnected returns up to limit known nodes of shard that are not connected.
+func (set *nodeSet) unconnected(shard uint, limit int) []*discovery.Node {
+	set.lock.RLock()
+	defer set.lock.RUnlock()
+	var out []*discovery.Node
+	for _, item := range set.nodeMap {
+		if item.bConnected || item.node.Shard != shard {
+			continue
+		}
+		out = append(out, item.node)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// if connected nodes fewer than the threshold return true
 func (set *nodeSet) ifNeedAddNodes(shardid uint) bool {
 	set.lock.RLock()
 	defer set.lock.RUnlock()

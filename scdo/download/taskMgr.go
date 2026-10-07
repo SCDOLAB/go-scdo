@@ -21,12 +21,16 @@ const (
 	taskStatusWaitProcessing = 2 // block is downloaded, needs to process
 	taskStatusProcessed      = 3 // block is written to chain
 
-	maxBlocksWaiting = 1024 // max blocks waiting to download
+	maxBlocksWaiting     = 1024 // max blocks waiting to download on a fast disk
+	maxBlocksWaitingSlow = 64   // cap the queue when a block write is slower than 50 blk/s
 
-	// progressWindow is the span of the sync-rate moving average.
+	// progressWindow is the only span used for the sync ETA.
 	progressWindow = 3 * time.Minute
-	// progressAlpha is the weight of the newest window rate in the EMA.
-	progressAlpha = 0.25
+	// progressMinSpan ignores a short opening burst so the first fast
+	// samples are not extrapolated across the rest of the chain.
+	progressMinSpan = 45 * time.Second
+	// slowBlockWrite is one block taking longer than 1/50s.
+	slowBlockWrite = 20 * time.Millisecond
 )
 
 // heightSample is one sync-progress observation.
@@ -119,7 +123,7 @@ loopOut:
 		if waiting {
 			t.rewindUnprocessed()
 			if time.Since(t.lastWaitLog) > 10*time.Second {
-				t.log.Info("source shard header or confirmations are not ready; leaving blocks queued and retrying")
+				t.log.Info("source shard is not ready yet (header, peers, or confirmations); leaving blocks queued and retrying")
 				t.lastWaitLog = time.Now()
 			}
 			select {
@@ -180,12 +184,13 @@ func (t *taskMgr) logProgress() {
 	t.log.Info("sync progress: height %d / %d, %.1f blocks/min, ETA %s", written, to, t.smoothBPM, eta)
 }
 
-// smoothSyncRate returns blocks/min over the recent window, blended with prevSmooth
-// so a speed change does not replace the printed ETA in one step. Samples older
-// than the window are dropped, except the sample that anchors the left edge.
+// smoothSyncRate returns blocks/min measured only inside the recent window.
+// prevSmooth is ignored: an early burst must not keep pulling the ETA after
+// the window has moved on. A span shorter than progressMinSpan returns 0 so
+// the first samples are not extrapolated.
 func smoothSyncRate(samples []heightSample, prevSmooth float64, window time.Duration) (float64, []heightSample) {
 	if len(samples) == 0 {
-		return prevSmooth, samples
+		return 0, samples
 	}
 	cutoff := samples[len(samples)-1].at.Add(-window)
 	start := 0
@@ -195,23 +200,32 @@ func smoothSyncRate(samples []heightSample, prevSmooth float64, window time.Dura
 	kept := make([]heightSample, len(samples)-start)
 	copy(kept, samples[start:])
 
-	smooth := prevSmooth
-	if len(kept) >= 2 {
-		dt := kept[len(kept)-1].at.Sub(kept[0].at).Minutes()
-		if dt > 0 {
-			dh := float64(kept[len(kept)-1].height) - float64(kept[0].height)
-			if dh < 0 {
-				dh = 0
-			}
-			windowBPM := dh / dt
-			if prevSmooth > 0 {
-				smooth = progressAlpha*windowBPM + (1-progressAlpha)*prevSmooth
-			} else {
-				smooth = windowBPM
-			}
-		}
+	if len(kept) < 2 {
+		return 0, kept
 	}
-	return smooth, kept
+	dt := kept[len(kept)-1].at.Sub(kept[0].at)
+	if dt < progressMinSpan {
+		return 0, kept
+	}
+	minutes := dt.Minutes()
+	if minutes <= 0 {
+		return 0, kept
+	}
+	dh := float64(kept[len(kept)-1].height) - float64(kept[0].height)
+	if dh < 0 {
+		dh = 0
+	}
+	return dh / minutes, kept
+}
+
+// waitingLimit is how far ahead of the last written block the downloader may
+// fetch. A slow disk keeps a short queue so compaction is not buried under
+// a thousand buffered blocks.
+func waitingLimit(writeNS int64) uint64 {
+	if writeNS > int64(slowBlockWrite) {
+		return maxBlocksWaitingSlow
+	}
+	return maxBlocksWaiting
 }
 
 func (t *taskMgr) notify() {
@@ -268,7 +282,7 @@ func (t *taskMgr) getReqHeaderInfo(conn *peerConn) (uint64, int) {
 	var startNo uint64
 	if conn.peerID == t.masterPeer {
 		startNo = t.fromNo + uint64(len(t.downloadInfoList))
-		if startNo-t.curNo > maxBlocksWaiting {
+		if startNo-t.curNo > t.downloader.waitingBlocks() {
 			return 0, 0
 		}
 	} else {

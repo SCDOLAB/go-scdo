@@ -225,23 +225,31 @@ func newPeerHeadInfos(num int) *peerHeadInfo {
 	return p
 }
 
-func TestSmoothSyncRateDoesNotJump(t *testing.T) {
+func TestSmoothSyncRateUsesRecentWindowOnly(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0)
-	slow := []heightSample{
+	// A 15s opening burst must not become the ETA, even if a previous
+	// average was very high.
+	short := []heightSample{
 		{at: base, height: 1000},
-		{at: base.Add(15 * time.Second), height: 1010},
+		{at: base.Add(15 * time.Second), height: 5000},
 	}
-	rate, kept := smoothSyncRate(slow, 0, progressWindow)
-	// 10 blocks in 15s is 40 blocks/min. First sample has no previous average.
-	assert.InDelta(t, 40, rate, 0.01)
+	rate, kept := smoothSyncRate(short, 9999, progressWindow)
+	assert.Equal(t, float64(0), rate)
 	assert.Equal(t, 2, len(kept))
 
-	// A burst of 900 blocks in the next 15s is 3600 blocks/min on that step.
-	// The window still includes the slow start, and the EMA must not snap to 3600.
-	burst := append(kept, heightSample{at: base.Add(30 * time.Second), height: 1910})
-	rate2, _ := smoothSyncRate(burst, rate, progressWindow)
-	assert.True(t, rate2 > rate)
-	assert.True(t, rate2 < 1000, "smoothed rate jumped to %v", rate2)
+	// Once the window is long enough, the rate is that window only.
+	minute := []heightSample{
+		{at: base, height: 0},
+		{at: base.Add(time.Minute), height: 60},
+	}
+	rate, _ = smoothSyncRate(minute, 9999, progressWindow)
+	assert.InDelta(t, 60, rate, 0.01)
+}
+
+func TestWaitingLimitShrinksOnSlowDisk(t *testing.T) {
+	assert.Equal(t, uint64(maxBlocksWaiting), waitingLimit(int64(5*time.Millisecond)))
+	assert.Equal(t, uint64(maxBlocksWaitingSlow), waitingLimit(int64(slowBlockWrite)+1))
+	assert.Equal(t, uint64(maxBlocksWaiting), (*Downloader)(nil).waitingBlocks())
 }
 
 func TestSmoothSyncRateDropsOldSamples(t *testing.T) {
@@ -262,6 +270,8 @@ func TestIsShardDataNotReady(t *testing.T) {
 	wrapped := errors.NewStackedError(confirmations, "failed to validate debt via verifier")
 	assert.Equal(t, true, isShardDataNotReady(wrapped))
 	assert.Equal(t, true, isShardDataNotReady(errors.NewStackedError(types.ErrHeaderNotReady, "leveldb: not found")))
+	noPeers := errors.NewStackedError(types.ErrHeaderNotReady, "No peers found")
+	assert.Equal(t, true, isShardDataNotReady(errors.NewStackedError(noPeers, "failed to get tx")))
 	assert.Equal(t, false, isShardDataNotReady(errors.New("invalid parent hash")))
 }
 

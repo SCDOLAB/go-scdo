@@ -46,8 +46,11 @@ const (
 
 	// interval to select new node to connect from the free node list.
 	checkConnsNumInterval = 7 * time.Second
-	inboundConn           = 1
-	outboundConn          = 2
+
+	// seekShardInterval is the minimum gap between discovery queries for one shard.
+	seekShardInterval = 15 * time.Second
+	inboundConn       = 1
+	outboundConn      = 2
 	//minLocalShardConn     = 13
 	// In transferring handshake msg, length of extra data
 	extraDataLen = 24
@@ -123,6 +126,9 @@ type Server struct {
 	maxActiveConnections int
 
 	peerNumLock sync.Mutex // lock for num of peers per shard
+
+	seekMu   sync.Mutex
+	lastSeek []time.Time
 }
 
 // NewServer initialize a server
@@ -155,10 +161,10 @@ func NewServer(genesis core.GenesisInfo, config Config, protocols []Protocol) *S
 		genesisHash:          hash,
 		maxConnections:       maxConnsPerShard * common.ShardCount,
 		maxActiveConnections: maxActiveConnsPerShard * common.ShardCount,
+		lastSeek:             make([]time.Time, common.ShardCount+1),
 	}
 }
 
-//
 func (srv *Server) GetUDP() *discovery.UDP { return srv.udp }
 
 // PeerCount return the count of peers
@@ -228,7 +234,7 @@ loop:
 	}
 }
 
-//this function is triggered by udp when a new node is discovered
+// this function is triggered by udp when a new node is discovered
 func (srv *Server) addNode(node *discovery.Node) {
 	if err := node.ID.Validate(); err != nil {
 		srv.log.Info("invalid udp node address %v", node.ID)
@@ -376,12 +382,17 @@ runloop:
 		case <-ticker.C:
 			//srv.log.Error("connect loop")
 			go srv.doSelectNodeToConnect()
-			if srv.nodeSet.ifNeedAddNodes(common.LocalShardNumber) {
-				continue
-			} else {
-				//if already well connected, rest a little bit to avoid works no big help
-				time.Sleep(60 * time.Second)
+			// A light client for another shard can sit at "no peer connected"
+			// while the local shard is full. Keep looking until every shard
+			// has someone to talk to.
+			for _, shard := range srv.nodeSet.shardsWithoutPeers() {
+				srv.SeekShardPeers(shard)
 			}
+			if len(srv.nodeSet.shardsWithoutPeers()) > 0 {
+				continue
+			}
+			//if already well connected, rest a little bit to avoid works no big help
+			time.Sleep(60 * time.Second)
 			goto runloop
 		case <-srv.quit:
 			srv.log.Debug("server got quit signal, run cleanup logic")
@@ -396,6 +407,32 @@ runloop:
 			peer.Disconnect(discServerQuit)
 		}
 	}
+}
+
+// SeekShardPeers dials known nodes for shard and asks discovery for more.
+// Calls closer than seekShardInterval are ignored so a syncing light client
+// does not flood UDP.
+func (srv *Server) SeekShardPeers(shard uint) {
+	if srv == nil || shard == 0 || shard > uint(common.ShardCount) {
+		return
+	}
+	srv.seekMu.Lock()
+	if srv.lastSeek != nil && time.Since(srv.lastSeek[shard]) < seekShardInterval {
+		srv.seekMu.Unlock()
+		return
+	}
+	if srv.lastSeek != nil {
+		srv.lastSeek[shard] = time.Now()
+	}
+	srv.seekMu.Unlock()
+
+	for _, node := range srv.nodeSet.unconnected(shard, 3) {
+		go srv.connectNode(node)
+	}
+	if srv.udp != nil {
+		srv.udp.SeekShard(shard)
+	}
+	srv.log.Info("looking for peers on shard %d", shard)
 }
 
 // doSelectNodeToConnect selects one free node from nodeMap to connect
@@ -429,7 +466,7 @@ func (srv *Server) doSelectNodeToConnect() {
 	}
 }
 
-//no call for this function any more
+// no call for this function any more
 func (srv *Server) doSelectLocalNodeToConnect() {
 	//for _, node := range srv.StaticNodes {
 	//	if node.ID.IsEmpty() || srv.checkPeerExist(node.ID) {
@@ -560,7 +597,7 @@ func (srv *Server) setupConn(fd net.Conn, flags int, dialDest *discovery.Node) (
 	}
 	if recvMsg == nil {
 		srv.log.Error("handshake recvMsg is nil. %s -> %s", fd.LocalAddr(), fd.RemoteAddr())
-		return  errors.New("recvMsg is nil")
+		return errors.New("recvMsg is nil")
 	}
 	srv.log.Debug("handshake succeed. %s -> %s", fd.LocalAddr(), fd.RemoteAddr())
 	peerNodeID := recvMsg.NodeID

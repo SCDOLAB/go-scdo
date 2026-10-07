@@ -102,6 +102,7 @@ func (s *ServiceClient) Protocols() (protos []p2p.Protocol) {
 // Start implements node.Service, starting goroutines needed by ServiceClient.
 func (s *ServiceClient) Start(srvr *p2p.Server) error {
 	s.p2pServer = srvr
+	s.scdoProtocol.p2pServer = srvr
 
 	s.scdoProtocol.Start()
 	return nil
