@@ -65,9 +65,19 @@ func newLightChain(bcStore store.BlockchainStore, lightDB database.Database, odr
 	return chain, nil
 }
 
-// GetState get statedb by root hash(not supported, just implement the interface here)
+// GetState returns a statedb that reads accounts through a Merkle proof for root.
+// root is the state root of a header this node already checked. The proof is
+// verified against that root. A full node serves the proof; this client does
+// not store the account trie.
 func (lc *LightChain) GetState(root common.Hash) (*state.Statedb, error) {
-	panic("unsupported")
+	blockHash := common.EmptyHash
+	if lc.currentHeader != nil {
+		stateHash := lc.currentHeader.StateHash
+		if stateHash.Equal(root) {
+			blockHash = lc.currentHeader.Hash()
+		}
+	}
+	return lc.GetStateByRootAndBlockHash(root, blockHash)
 }
 
 // GetStateByRootAndBlockHash get the statedb by root and block hash
@@ -170,7 +180,7 @@ func (lc *LightChain) PutTd(td *big.Int) {
 	lc.canonicalTD = td
 }
 
-//PutCurrentHeader
+// PutCurrentHeader
 func (lc *LightChain) PutCurrentHeader(header *types.BlockHeader) {
 	lc.currentHeader = header
 }

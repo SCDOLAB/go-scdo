@@ -171,6 +171,22 @@ func (lp *LightProtocol) Stop() {
 	lp.wg.Wait()
 }
 
+// requestSync asks the header syncer to catch the best peer. A sync that is
+// already running is left alone. The send never blocks.
+func (lp *LightProtocol) requestSync() {
+	if lp.bServerMode || lp.syncCh == nil || lp.downloader == nil {
+		return
+	}
+	if lp.downloader.syncStatus == statusDownloading {
+		return
+	}
+	select {
+	case <-lp.quitCh:
+	case lp.syncCh <- struct{}{}:
+	default:
+	}
+}
+
 // syncer try to synchronise with remote peer
 func (lp *LightProtocol) syncer() {
 	defer lp.downloader.Terminate()
@@ -349,19 +365,29 @@ handler:
 
 		case announceCode:
 			var query AnnounceBody
-			if time.Now().Unix()-peer.lastAnnounceCodeTime < 60 {
-				lp.log.Warn("peer lastAnnounceCode less than 60s, peer:%s", peer.peerStrID)
-				break handler
-			}
 			err := common.Deserialize(msg.Payload, &query)
 			if err != nil {
 				lp.log.Error("failed to deserialize Announce, quit! %s", err)
 				break handler
 			}
+			var localHeight uint64
+			if header := lp.chain.CurrentHeader(); header != nil {
+				localHeight = header.Height
+			}
+			// Repeat announces that do not move the head are ignored. A peer
+			// that is ahead is handled immediately so a phone stays on the
+			// latest header instead of waiting out a long quiet period.
+			if query.CurrentBlockNum <= localHeight && peer.lastAnnounceCodeTime != 0 && time.Now().Unix()-peer.lastAnnounceCodeTime < 8 {
+				break handler
+			}
+			peer.lastAnnounceCodeTime = time.Now().Unix()
 			lp.log.Debug("handle msg announce code, peer:%s", peer.peerStrID)
 			if err := peer.handleAnnounce(&query); err != nil {
 				lp.log.Error("failed to handleAnnounce, quit! %s", err)
 				break handler
+			}
+			if query.CurrentBlockNum > localHeight {
+				lp.requestSync()
 			}
 
 		case syncHashRequestCode:

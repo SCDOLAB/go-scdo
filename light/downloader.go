@@ -131,6 +131,8 @@ needQuit:
 			curHeight := uint64(0)
 			counter := 0
 			for _, head := range headMsg.Hearders[1:] {
+				// WriteHeader checks the parent link and ZPoW. There is no
+				// checkpoint: every header from fork genesis is verified.
 				if err = d.chain.WriteHeader(head); err != nil && !errors.IsOrContains(err, core.ErrBlockAlreadyExists) {
 					d.log.Warn("Downloader.doSynchronise WriteHeader error. %s", err)
 					if errors.IsOrContains(err, consensus.ErrBlockNonceInvalid) {

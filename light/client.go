@@ -36,6 +36,10 @@ type ServiceClient struct {
 	lightDB database.Database // database used to store blocks and account state.
 
 	shard uint
+
+	// publishAPI is false for the extra shards of a phone node so the process
+	// registers the scdo namespace once. The light namespace covers every shard.
+	publishAPI bool
 }
 
 // NewServiceClient create ServiceClient
@@ -94,6 +98,7 @@ func NewServiceClient(ctx context.Context, conf *node.Config, log *log.ScdoLog, 
 	}
 
 	s.odrBackend.start(s.scdoProtocol.peerSet) // start the odr backend
+	s.publishAPI = true
 	log.Info("light mode started.")
 	return s, nil
 }
@@ -134,5 +139,8 @@ func (s *ServiceClient) Stop() error {
 
 // APIs implements node.Service, returning the collection of RPC services the scdo package offers.
 func (s *ServiceClient) APIs() (apis []rpc.API) {
+	if !s.publishAPI {
+		return nil
+	}
 	return append(apis, api.GetAPIs(NewLightBackend(s))...)
 }

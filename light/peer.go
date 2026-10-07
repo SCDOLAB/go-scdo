@@ -124,6 +124,13 @@ func (p *peer) Info() *PeerInfo {
 }
 
 // Head retrieves a copy of the current head hash and total difficulty.
+// HeadHeight is the peer's announced canonical height.
+func (p *peer) HeadHeight() uint64 {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return p.headBlockNum
+}
+
 func (p *peer) Head() (hash common.Hash, td *big.Int) {
 	p.lock.RLock()
 	defer p.lock.RUnlock()

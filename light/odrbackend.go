@@ -92,6 +92,9 @@ func (o *odrBackend) handleResponse(msg *p2p.Message) {
 }
 
 func (o *odrBackend) getReqInfo(filter peerFilter) (uint32, chan odrResponse, []*peer, error) {
+	if o.peers == nil {
+		return 0, nil, nil, errNoMorePeers
+	}
 	peerL := o.peers.choosePeers(filter)
 	if len(peerL) == 0 {
 		return 0, nil, nil, ErrNoMorePeers

@@ -138,13 +138,23 @@ var startCmd = &cobra.Command{
 		}
 
 		if lightNode {
-			lightService, err := light.NewServiceClient(ctx, nCfg, lightLog, common.LightChainDir, scdoNode.GetShardNumber(), engine)
+			fmt.Printf("Header-syncing shards 1-%d from fork genesis %d. Every header is checked with ZPoW. There is no snapshot. light_getBalance, light_getTxProof and light_getDebtProof return Merkle proofs.\n",
+				common.ShardCount, common.ScdoForkHeight)
+			clients, err := light.OpenShards(ctx, nCfg, engine)
 			if err != nil {
 				fmt.Println("Create light service error.", err.Error())
 				return
 			}
-
-			if err := scdoNode.Register(lightService); err != nil {
+			for _, client := range clients {
+				if client == nil {
+					continue
+				}
+				if err := scdoNode.Register(client); err != nil {
+					fmt.Println(err.Error())
+					return
+				}
+			}
+			if err := scdoNode.Register(light.NewMultiService(clients)); err != nil {
 				fmt.Println(err.Error())
 				return
 			}
@@ -266,12 +276,12 @@ func init() {
 
 	startCmd.Flags().StringVarP(&miner, "miner", "m", "stop", "miner start or not, [start, stop]. Default is stop (sync only)")
 	startCmd.Flags().StringVar(&dataDirFlag, "datadir", "", "data directory. Absolute paths are used as-is; relative paths are placed under $HOME/.scdo. Overrides basic.dataDir")
-	startCmd.Flags().IntVar(&dbCacheFlag, "dbcache", 0, "chain database cache in MB. 0 uses 512 during initial sync and 128 once the chain database is larger")
+	startCmd.Flags().IntVar(&dbCacheFlag, "dbcache", 0, "chain database cache in MB. 0 uses the 64 MiB HDD and phone profile")
 	startCmd.Flags().BoolVarP(&metricsEnableFlag, "metrics", "t", false, "start metrics")
 	startCmd.Flags().StringVarP(&accountsConfig, "accounts", "", "", "init accounts info")
 	startCmd.Flags().StringVarP(&poolAccountsConfig, "poolaccounts", "", "", "init pool accounts")
 	startCmd.Flags().IntVarP(&threads, "threads", "", 1, "miner thread value")
-	startCmd.Flags().BoolVarP(&lightNode, "light", "l", false, "whether start with light mode")
+	startCmd.Flags().BoolVarP(&lightNode, "light", "l", false, "header-only sync of shards 1-4 from fork genesis, with Merkle proofs")
 	startCmd.Flags().BoolVar(&lightServer, "lightserver", true, "serve phone light clients (lightScdo_<shard> version 1) on this node's TCP port. On by default")
 	startCmd.Flags().Uint64VarP(&pprofPort, "port", "", 0, "which port pprof http server listen to")
 	startCmd.Flags().IntVarP(&startHeight, "startheight", "", -1, "the block height to start from")
