@@ -433,6 +433,11 @@ func (u *udp) SeekShard(shard uint) {
 }
 
 func (u *udp) discovery() {
+	// Ask every shard once before the paced loop. The paced loop sleeps
+	// 25s between batches, which left a restarted node with no peers.
+	for shard := uint(1); shard <= uint(common.ShardCount); shard++ {
+		u.SeekShard(shard)
+	}
 	for {
 		id, err := crypto.GenerateRandomAddress()
 		if err != nil {
@@ -708,6 +713,8 @@ func (u *udp) loadNodes(nodeDir string) {
 			continue
 		}
 		u.bootstrapNodes = append(u.bootstrapNodes, n)
+		u.db.add(n, false)
+		u.table.addNode(n)
 	}
 
 	u.log.Debug("load %d nodes from back file", len(u.bootstrapNodes))

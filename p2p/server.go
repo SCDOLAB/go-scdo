@@ -129,7 +129,11 @@ type Server struct {
 
 	seekMu   sync.Mutex
 	lastSeek []time.Time
+	nodeDir  string
 }
+
+// knownPeersPerShard is how many persisted peers of one shard are dialed at startup.
+const knownPeersPerShard = 8
 
 // NewServer initialize a server
 func NewServer(genesis core.GenesisInfo, config Config, protocols []Protocol) *Server {
@@ -191,6 +195,7 @@ func (srv *Server) Start(nodeDir string, shard uint) (err error) {
 	srv.SelfNode = discovery.NewNodeWithAddr(*address, addr, shard)
 
 	srv.log.Info("Starting P2P Server, MyNodeID [%s]", srv.SelfNode)
+	srv.nodeDir = nodeDir
 	srv.kadDB, srv.udp = discovery.StartService(nodeDir, *address, addr, srv.Config.StaticNodes, shard)
 	srv.kadDB.SetHookForNewNode(srv.addNode)
 	srv.kadDB.SetHookForDeleteNode(srv.deleteNode)
@@ -373,6 +378,8 @@ func (srv *Server) deletePeerRand() {
 func (srv *Server) run() {
 	defer srv.loopWG.Done()
 	srv.log.Info("p2p start running...")
+	srv.dialKnownPeersNow()
+	go srv.doSelectNodeToConnect()
 	ticker := time.NewTicker(5 * checkConnsNumInterval)
 runloop:
 	for {
@@ -407,6 +414,39 @@ runloop:
 			peer.Disconnect(discServerQuit)
 		}
 	}
+}
+
+// dialKnownPeersNow opens TCP to persisted peers of every shard at startup.
+// Waiting for the UDP ping cycle left the node with no peers for several minutes.
+func (srv *Server) dialKnownPeersNow() {
+	if srv == nil || srv.kadDB == nil {
+		return
+	}
+	chosen := groupDialList(srv.kadDB.GetCopy(), knownPeersPerShard)
+	for _, node := range chosen {
+		srv.nodeSet.tryAdd(node)
+		go srv.connectNode(node)
+	}
+	if len(chosen) > 0 {
+		srv.log.Info("dialing %d known peers", len(chosen))
+	}
+}
+
+// groupDialList picks up to perShard nodes of each shard.
+func groupDialList(nodes map[common.Hash]*discovery.Node, perShard int) []*discovery.Node {
+	counts := make(map[uint]int)
+	out := make([]*discovery.Node, 0)
+	for _, node := range nodes {
+		if node == nil || node.Shard == 0 || node.Shard > uint(common.ShardCount) {
+			continue
+		}
+		if counts[node.Shard] >= perShard {
+			continue
+		}
+		counts[node.Shard]++
+		out = append(out, node)
+	}
+	return out
 }
 
 // SeekShardPeers dials known nodes for shard and asks discovery for more.
@@ -872,6 +912,9 @@ func (srv *Server) Stop() {
 
 	if !srv.running {
 		return
+	}
+	if srv.kadDB != nil && srv.nodeDir != "" {
+		srv.kadDB.SaveNodes(srv.nodeDir)
 	}
 	srv.running = false
 

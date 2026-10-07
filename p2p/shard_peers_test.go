@@ -6,6 +6,7 @@
 package p2p
 
 import (
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -36,6 +37,26 @@ func TestShardsWithoutPeers(t *testing.T) {
 	got := set.unconnected(2, 3)
 	if len(got) != 1 || !got[0].ID.Equal(n2.ID) {
 		t.Fatalf("unconnected shard 2 nodes = %d", len(got))
+	}
+}
+
+func TestGroupDialListCapsEachShard(t *testing.T) {
+	nodes := make(map[common.Hash]*discovery.Node)
+	for i := 0; i < 20; i++ {
+		n := discovery.NewNode(*crypto.MustGenerateRandomAddress(), net.ParseIP("10.1.0.1"), 8000+i, 1)
+		nodes[common.StringToHash(fmt.Sprintf("s1-%d", i))] = n
+	}
+	for i := 0; i < 3; i++ {
+		n := discovery.NewNode(*crypto.MustGenerateRandomAddress(), net.ParseIP("10.2.0.1"), 9000+i, 2)
+		nodes[common.StringToHash(fmt.Sprintf("s2-%d", i))] = n
+	}
+	chosen := groupDialList(nodes, knownPeersPerShard)
+	counts := map[uint]int{}
+	for _, n := range chosen {
+		counts[n.Shard]++
+	}
+	if counts[1] != knownPeersPerShard || counts[2] != 3 {
+		t.Fatalf("dial counts = %v", counts)
 	}
 }
 

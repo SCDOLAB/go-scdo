@@ -6,6 +6,7 @@
 package core
 
 import (
+	"encoding/json"
 	"io/ioutil"
 	"math/big"
 	"os"
@@ -94,6 +95,36 @@ func Test_RecoveryPoint_Serialization(t *testing.T) {
 	rp.onOverwriteStaleBlocks(common.StringToHash("stale block hash 2"))
 	rp2, _ = loadRecoveryPoint(rpFile)
 	assert.Equal(t, *rp2, recoveryPoint{StaleHash: common.StringToHash("stale block hash 2"), file: rpFile})
+}
+
+func Test_RecoveryPoint_AtomicWrite(t *testing.T) {
+	rpFile, dispose := newTestRecoveryPointFile()
+	defer dispose()
+
+	original := []byte("{\"LargerHeight\":1}\n")
+	assert.Nil(t, ioutil.WriteFile(rpFile, original, 0644))
+
+	rp, err := loadRecoveryPoint(rpFile)
+	assert.Nil(t, err)
+	rp.LargerHeight = 9
+	rp.StaleHash = common.StringToHash("stale block hash")
+	rp.serialize()
+
+	if _, err := os.Stat(rpFile + ".tmp"); err == nil {
+		t.Fatal("temp recovery file was left behind")
+	}
+	loaded, err := loadRecoveryPoint(rpFile)
+	assert.Nil(t, err)
+	assert.Equal(t, uint64(9), loaded.LargerHeight)
+	assert.Equal(t, rp.StaleHash, loaded.StaleHash)
+
+	// A failed replace must leave the previous file readable.
+	assert.NotNil(t, writeAtomic(rpFile+"/missing", []byte("{}")))
+	again, err := ioutil.ReadFile(rpFile)
+	assert.Nil(t, err)
+	assert.True(t, len(again) > 0)
+	var parsed recoveryPoint
+	assert.Nil(t, json.Unmarshal(again, &parsed))
 }
 
 func Test_RecoveryPoint_PutBlockCorrupted(t *testing.T) {

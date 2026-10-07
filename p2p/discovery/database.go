@@ -31,8 +31,9 @@ type Database struct {
 }
 
 const (
-	// NodesBackupInterval is the nodes info of backup interval time
-	NodesBackupInterval = time.Minute * 20
+	// NodesBackupInterval is how often known peers are written to disk.
+	// A restart dials this file immediately, so it has to stay current.
+	NodesBackupInterval = time.Minute
 
 	// NodesBackupFileName is the nodes info of backup file name
 	NodesBackupFileName = "nodes.json"

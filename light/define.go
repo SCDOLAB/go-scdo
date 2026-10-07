@@ -32,6 +32,12 @@ const (
 	// MinHashesCached minimum items cached in peer for client mode
 	MinHashesCached uint64 = 256
 
+	// maxPeerHashWindow is the most header hashes retained per light peer.
+	// The sync only needs the recent window (batch overlap, announce
+	// lookback, ancestor near the tip). Keeping the whole chain is about
+	// 6.3M hashes per peer.
+	maxPeerHashWindow = 2048
+
 	forceSyncInterval = time.Second * 13 // interval time of synchronising with remote peer
 )
 

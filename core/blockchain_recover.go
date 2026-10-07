@@ -135,10 +135,33 @@ func (rp *recoveryPoint) serialize() {
 		return
 	}
 
-	if err := ioutil.WriteFile(rp.file, encoded, os.ModePerm); err != nil {
+	if err := writeAtomic(rp.file, encoded); err != nil {
 		// just log the error so as not to block the blockchain initialization.
 		rpLog.Warn("Failed to write recovery point JSON data to file, file = %v, error = %v", rp.file, err.Error())
 	}
+}
+
+// writeAtomic replaces path by writing a temp file, fsyncing it, then renaming.
+// A kill during the write leaves the previous file intact.
+func writeAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	cerr := f.Close()
+	if err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // onPutBlockStart is used before putting a block in storage; it stores the previous block info

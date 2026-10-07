@@ -57,7 +57,10 @@ type peer struct {
 
 	curSyncMagic    uint32
 	blockNumBegin   uint64        // first block number of blockHashArr
-	blockHashArr    []common.Hash // block hashes that should be identical with remote server peer, and is only useful in client mode.
+	blockHashArr    []common.Hash // recent header hashes from the remote peer, client mode only
+	hashIndex       map[common.Hash]uint64
+	anchorNum       uint64      // height where this hash sync started
+	anchorHash      common.Hash // hash at anchorNum, kept after the window slides
 	updatedAncestor uint64
 
 	lastAnnounceCodeTime int64
@@ -79,6 +82,7 @@ func newPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter, log *log.ScdoLog, 
 		rw:                   rw,
 		protocolManager:      protocolManager,
 		log:                  log,
+		hashIndex:            make(map[common.Hash]uint64),
 		updatedAncestor:      uint64(0),
 		lastAnnounceCodeTime: int64(0),
 	}
@@ -156,6 +160,22 @@ func (p *peer) findAncestor() (uint64, error) {
 				curNum = p.updatedAncestor
 			}
 			return curNum, nil
+		}
+	}
+
+	// The retained window is the peer tip. During catch-up the local head is
+	// older than that window; the hash sync started at anchorNum.
+	if p.anchorHash != (common.Hash{}) {
+		localBlock, err := chain.GetStore().GetBlockByHeight(p.anchorNum)
+		if err == nil && localBlock.HeaderHash == p.anchorHash {
+			header := chain.CurrentHeader()
+			if p.updatedAncestor > p.anchorNum && header != nil && p.updatedAncestor <= header.Height {
+				return p.updatedAncestor, nil
+			}
+			if header != nil && header.Height > p.anchorNum {
+				return header.Height, nil
+			}
+			return p.anchorNum, nil
 		}
 	}
 
@@ -252,15 +272,77 @@ func (p *peer) handleSyncHashRequest(msg *HeaderHashSyncQuery) error {
 	return p2p.SendMessage(p.rw, syncHashResponseCode, buff)
 }
 
-// findIdxByHash finds index of hash in p.blockHashArr, and returns -1 if not found
+// findIdxByHash finds index of hash in the retained window, and returns -1 if not found.
 func (p *peer) findIdxByHash(hash common.Hash) int {
-	for idx := 0; idx < len(p.blockHashArr); idx++ {
-		if p.blockHashArr[idx] == hash {
-			return idx
-		}
-	}
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return p.findIdxByHashLocked(hash)
+}
 
-	return -1
+func (p *peer) findIdxByHashLocked(hash common.Hash) int {
+	height, ok := p.hashIndex[hash]
+	if !ok || height < p.blockNumBegin {
+		return -1
+	}
+	idx := int(height - p.blockNumBegin)
+	if idx >= len(p.blockHashArr) {
+		return -1
+	}
+	return idx
+}
+
+// setHashWindow replaces the retained hashes with one batch.
+func (p *peer) setHashWindow(begin uint64, hashes []common.Hash) {
+	p.hashIndex = make(map[common.Hash]uint64, len(hashes))
+	p.blockNumBegin = begin
+	p.blockHashArr = nil
+	if len(hashes) > 0 {
+		p.anchorNum = begin
+		p.anchorHash = hashes[0]
+	}
+	p.appendHashes(hashes)
+}
+
+// replaceFrom keeps hashes before idx and appends the new batch.
+func (p *peer) replaceFrom(idx int, hashes []common.Hash) {
+	if p.hashIndex == nil {
+		p.hashIndex = make(map[common.Hash]uint64)
+	}
+	for i := idx; i < len(p.blockHashArr); i++ {
+		delete(p.hashIndex, p.blockHashArr[i])
+	}
+	merged := make([]common.Hash, 0, idx+len(hashes))
+	merged = append(merged, p.blockHashArr[:idx]...)
+	p.blockHashArr = merged
+	p.appendHashes(hashes)
+}
+
+func (p *peer) appendHashes(hashes []common.Hash) {
+	if p.hashIndex == nil {
+		p.hashIndex = make(map[common.Hash]uint64)
+	}
+	base := p.blockNumBegin + uint64(len(p.blockHashArr))
+	for i, hash := range hashes {
+		p.blockHashArr = append(p.blockHashArr, hash)
+		p.hashIndex[hash] = base + uint64(i)
+	}
+	p.trimHashWindow()
+}
+
+// trimHashWindow drops the oldest hashes and copies the tail into a new
+// slice so the discarded prefix can be garbage-collected.
+func (p *peer) trimHashWindow() {
+	extra := len(p.blockHashArr) - maxPeerHashWindow
+	if extra <= 0 {
+		return
+	}
+	for i := 0; i < extra; i++ {
+		delete(p.hashIndex, p.blockHashArr[i])
+	}
+	p.blockNumBegin += uint64(extra)
+	kept := make([]common.Hash, maxPeerHashWindow)
+	copy(kept, p.blockHashArr[extra:])
+	p.blockHashArr = kept
 }
 
 // getHashByHeight returns header hash of height, only useful in client mode
@@ -285,16 +367,16 @@ func (p *peer) handleSyncHash(msg *HeaderHashSync) error {
 	}
 
 	if len(p.blockHashArr) == 0 {
-		p.blockNumBegin, p.blockHashArr = msg.BeginNum, msg.HeaderArr
+		p.setHashWindow(msg.BeginNum, msg.HeaderArr)
 	} else {
-		idx := p.findIdxByHash(msg.HeaderArr[0])
+		idx := p.findIdxByHashLocked(msg.HeaderArr[0])
 		if idx < 0 {
 			p.log.Info("handleSyncHash hash not match. %s", p.blockHashArr[0].Hex())
 			p.curSyncMagic = 0
 			return nil
 		}
 
-		p.blockHashArr = append(p.blockHashArr[0:idx], msg.HeaderArr...)
+		p.replaceFrom(idx, msg.HeaderArr)
 		p.log.Debug("peer handleSyncHash. headBlockNum=%d p.blockNumBegin=%d idx=%d idxheight=%d len(p.blockHashArr)=%d",
 			p.headBlockNum, p.blockNumBegin, idx, msg.BeginNum, len(p.blockHashArr))
 	}
@@ -400,8 +482,7 @@ func (p *peer) handleAnnounce(msg *AnnounceBody) error {
 	if len(p.blockHashArr) == 0 {
 		if len(msg.HeaderArr) == 1 {
 			// server only has genesis block
-			p.blockHashArr = append(p.blockHashArr, msg.HeaderArr[0])
-			p.blockNumBegin = msg.BlockNumArr[0]
+			p.setHashWindow(msg.BlockNumArr[0], msg.HeaderArr[:1])
 			p.curSyncMagic = 0
 			return nil
 		}
