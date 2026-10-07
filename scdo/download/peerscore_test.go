@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/scdoproject/go-scdo/common/errors"
+	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/database/leveldb"
 	"github.com/stretchr/testify/assert"
 )
@@ -67,4 +69,36 @@ func TestProgressReportsBlockRate(t *testing.T) {
 	assert.Equal(t, uint64(2), prog.Highest)
 	assert.InDelta(t, 120.0, prog.BlocksPerSec, 0.01)
 	assert.NotEqual(t, "unknown", prog.ETA)
+}
+
+func TestConfirmationCounts(t *testing.T) {
+	need, have := confirmationCounts("invalid debt because not enough confirmed block number, wanted is 120, actual is 89")
+	assert.Equal(t, uint64(120), need)
+	assert.Equal(t, uint64(89), have)
+	need, have = confirmationCounts("no numbers here")
+	assert.Equal(t, uint64(0), need)
+	assert.Equal(t, uint64(0), have)
+}
+
+func TestNoteShardWaitReportsConfirmations(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	d := newTestDownloader(db)
+	defer d.tm.close()
+
+	err := errors.NewStackedErrorf(types.ErrNotEnoughConfirmations, "invalid debt because not enough confirmed block number, wanted is %d, actual is %d", 120, 89)
+	d.noteShardWait(err)
+	prog := d.Progress()
+	assert.Equal(t, "source-shard-confirmations", prog.WaitingOn)
+	assert.Equal(t, uint64(120), prog.ConfirmationsNeed)
+	assert.Equal(t, uint64(89), prog.ConfirmationsHave)
+	assert.Equal(t, "source shard has 89/120 confirmations; waiting, not rejecting the block", d.WaitDetail())
+
+	d.noteShardWait(types.ErrHeaderNotReady)
+	assert.Equal(t, "source-shard-header", d.Progress().WaitingOn)
+	assert.Contains(t, d.WaitDetail(), "header is not synced yet")
+
+	d.clearShardWait()
+	assert.Equal(t, "", d.Progress().WaitingOn)
+	assert.Equal(t, "", d.WaitDetail())
 }

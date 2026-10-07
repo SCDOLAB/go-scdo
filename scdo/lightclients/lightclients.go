@@ -122,6 +122,24 @@ func (manager *LightClientsManager) ValidateDebt(debt *types.Debt) (packed bool,
 	return true, true, nil
 }
 
+// ShardHeights returns the header tip of every other shard this node is syncing.
+// Those light clients run beside the full shard, the same way Alephium syncs
+// its chains in parallel so a block can see its dependencies.
+func (manager *LightClientsManager) ShardHeights() []types.ShardHeight {
+	if manager == nil {
+		return nil
+	}
+	out := make([]types.ShardHeight, 0, common.ShardCount)
+	for i := 1; i <= common.ShardCount; i++ {
+		client := manager.lightClients[i]
+		if client == nil {
+			continue
+		}
+		out = append(out, types.ShardHeight{Shard: client.Shard(), Height: client.CurrentHeight()})
+	}
+	return out
+}
+
 // GetServices get node service
 func (manager *LightClientsManager) GetServices() []node.Service {
 	services := make([]node.Service, 0)
