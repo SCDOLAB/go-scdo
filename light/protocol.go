@@ -177,7 +177,9 @@ func (lp *LightProtocol) syncer() {
 	defer lp.wg.Done()
 	lp.wg.Add(1)
 
-	forceSync := time.NewTicker(forceSyncInterval * 5)
+	// Each shard header-syncs on its own. Poll on the base interval so a shard
+	// that aborted a session retries quickly instead of waiting a minute.
+	forceSync := time.NewTicker(forceSyncInterval)
 	lp.log.Debug("lp with peerset size %d", len(lp.peerSet.getPeers()))
 	for {
 		select {

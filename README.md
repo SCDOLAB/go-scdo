@@ -92,7 +92,9 @@ Tagged releases `v*` (including `v2.0.0`) build Linux and Windows `node` and `cl
 
 SCDO Classic is a fork coin. A fresh node starts at fork genesis height 2979594. That height is the chain start, not a snapshot and not a bug. The node then full-syncs later blocks (headers first, block bodies in parallel from several peers) and logs current height, peer target, blocks/min, blk/s and a smoothed ETA.
 
-`scdo_syncing` returns `current`, `highest`, `blkPerSec`, `eta`, `peers` and `syncing` for a wallet progress overlay. `--dbcache N` sets the chain LevelDB cache in megabytes. The default is 512 while the chain directory is still small and 128 after it grows. Public seed nodes are built in, and a peer that stays much slower than the others is disconnected.
+`scdo_syncing` returns `current`, `highest`, `blkPerSec`, `eta`, `peers` and `syncing` for a wallet progress overlay. It also lists each shard (`mode` `full` or `headers`). While a block is queued on a cross-shard debt, `waitingOn` is `source-shard-header` or `source-shard-confirmations`, with `confirmationsNeed` and `confirmationsHave`. That wait is not a rejected block. `--dbcache N` sets the chain LevelDB cache in megabytes. The default is 512 while the chain directory is still small and 128 after it grows. The three header-sync databases stay at 128 MB or less. Public seed nodes are built in, and a peer that stays much slower than the others is disconnected.
+
+This process full-syncs the shard in its config and header-syncs the other three in parallel. A debt spends only after the source shard has the transaction and 120 blocks after it. `node key --all-shards` prints one mining address per shard. Each address mines only that shard. `--all-shards --out wallet` writes `wallet-shard1.key` through `wallet-shard4.key` (mode 0600) and does not print the keys.
 
 First run:
 
@@ -101,6 +103,8 @@ First run:
 # warns on stderr, then prints Account and private key. Save the private key.
 # Or keep the key off the terminal:
 #   ./build/node key --shard 1 --out wallet.key
+# One address for every shard:
+#   ./build/node key --all-shards
 ./build/node start -c cmd/node/config/node1.json
 ```
 

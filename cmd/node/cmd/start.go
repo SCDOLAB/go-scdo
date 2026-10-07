@@ -161,6 +161,8 @@ var startCmd = &cobra.Command{
 				fmt.Printf("create light client manager failed. %s", err)
 				return
 			}
+			fmt.Printf("Full-syncing shard %d and header-syncing the other shards in parallel. A cross-shard debt waits until the source shard has %d confirmations. Mining needs -m start and a coinbase on shard %d.\n",
+				scdoNode.GetShardNumber(), common.ConfirmedBlockNumber, scdoNode.GetShardNumber())
 
 			// fullnode mode
 			scdoService, err := scdo.NewScdoService(ctx, nCfg, scdolog, engine, manager, startHeight, isPoolMode)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/big"
 	rand2 "math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,6 +110,13 @@ type Downloader struct {
 	lock        sync.RWMutex
 	writeNS int64 // smoothed nanoseconds spent in the last block writes
 	scores  map[string]*peerStat
+
+	// Cross-shard dependency wait. Alephium keeps a block queued until its
+	// group dependencies exist; QuarkChain will not spend a cross-shard
+	// transfer until the source shard has buried it. Neither case is a bad block.
+	waitReason string
+	waitNeed   uint64
+	waitHave   uint64
 }
 
 // BlockHeadersMsgBody represents a message struct for BlockHeadersMsg
@@ -183,9 +191,18 @@ func (d *Downloader) Progress() SyncProgress {
 	tm := d.tm
 	peers := len(d.peers)
 	chain := d.chain
+	waitReason := d.waitReason
+	waitNeed := d.waitNeed
+	waitHave := d.waitHave
 	d.lock.RUnlock()
 
-	prog := SyncProgress{Peers: peers, ETA: "0s"}
+	prog := SyncProgress{
+		Peers:             peers,
+		ETA:               "0s",
+		WaitingOn:         waitReason,
+		ConfirmationsNeed: waitNeed,
+		ConfirmationsHave: waitHave,
+	}
 	if status == statusFetching && tm != nil {
 		cur, high, bps, eta := tm.progressSnapshot()
 		prog.Syncing = cur < high
@@ -737,9 +754,11 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 
 		if err != nil && !errors.IsOrContains(err, core.ErrBlockAlreadyExists) {
 			if isShardDataNotReady(err) {
+				d.noteShardWait(err)
 				d.log.Debug("queue block height=%d until the source shard is ready: %s", h.block.Header.Height, err)
 				return true
 			}
+			d.clearShardWait()
 			d.log.Error("failed to write block err=%s", err)
 			// recover local blocks if localTotalDifficulty is larger than the synchronized total difficulty
 			// if writeblock fails in the middle (the whole process not successfully completed), then we need to consider write back our localblocks
@@ -754,6 +773,7 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 		}
 
 		h.status = taskStatusProcessed
+		d.clearShardWait()
 	}
 	return false
 }
@@ -781,6 +801,59 @@ func (d *Downloader) noteBlockWrite(elapsed time.Duration) {
 		next = (prev*3 + sample) / 4
 	}
 	atomic.StoreInt64(&d.writeNS, next)
+}
+
+// noteShardWait records why a block is queued. The numbers come from the
+// verifier message "wanted is N, actual is M" and are not a new consensus rule.
+func (d *Downloader) noteShardWait(err error) {
+	reason := "source-shard-header"
+	var need, have uint64
+	if errors.IsOrContains(err, types.ErrNotEnoughConfirmations) {
+		reason = "source-shard-confirmations"
+		need, have = confirmationCounts(err.Error())
+	}
+	d.lock.Lock()
+	d.waitReason = reason
+	d.waitNeed = need
+	d.waitHave = have
+	d.lock.Unlock()
+}
+
+func (d *Downloader) clearShardWait() {
+	d.lock.Lock()
+	d.waitReason = ""
+	d.waitNeed = 0
+	d.waitHave = 0
+	d.lock.Unlock()
+}
+
+// WaitDetail is the operator-facing line for a queued cross-shard dependency.
+func (d *Downloader) WaitDetail() string {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+	switch d.waitReason {
+	case "source-shard-confirmations":
+		if d.waitNeed > 0 {
+			return fmt.Sprintf("source shard has %d/%d confirmations; waiting, not rejecting the block", d.waitHave, d.waitNeed)
+		}
+		return "source shard confirmations are not ready; waiting, not rejecting the block"
+	case "source-shard-header":
+		return "source shard header is not synced yet; waiting, not rejecting the block"
+	default:
+		return ""
+	}
+}
+
+func confirmationCounts(msg string) (need, have uint64) {
+	const wanted = "wanted is "
+	const actual = "actual is "
+	if i := strings.Index(msg, wanted); i >= 0 {
+		fmt.Sscanf(msg[i:], "wanted is %d", &need)
+	}
+	if i := strings.Index(msg, actual); i >= 0 {
+		fmt.Sscanf(msg[i:], "actual is %d", &have)
+	}
+	return need, have
 }
 
 // isShardDataNotReady reports whether a block write failed only because the

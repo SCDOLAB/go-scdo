@@ -76,7 +76,49 @@ func (api *PublicScdoAPI) Syncing() (*downloader.SyncProgress, error) {
 	if peers > got.Peers {
 		got.Peers = peers
 	}
+	got.Shards = api.shardSync()
 	return &got, nil
+}
+
+// shardHeights is implemented by the light-client manager. The method is not
+// part of DebtVerifier, so a test verifier does not have to provide it.
+type shardHeights interface {
+	ShardHeights() []types.ShardHeight
+}
+
+func (api *PublicScdoAPI) shardSync() []downloader.ShardSync {
+	if api.s == nil || api.s.chain == nil || api.s.chain.CurrentBlock() == nil {
+		return nil
+	}
+	full := downloader.ShardSync{
+		Shard:  common.LocalShardNumber,
+		Height: api.s.chain.CurrentBlock().Header.Height,
+		Mode:   "full",
+	}
+	if api.s.scdoProtocol != nil {
+		full.Peers = api.s.scdoProtocol.peerSet.getPeerCountByShard(common.LocalShardNumber)
+	}
+	shards := []downloader.ShardSync{full}
+	if api.s.debtVerifier == nil {
+		return shards
+	}
+	src, ok := api.s.debtVerifier.(shardHeights)
+	if !ok {
+		return shards
+	}
+	for _, h := range src.ShardHeights() {
+		peers := 0
+		if api.s.scdoProtocol != nil {
+			peers = api.s.scdoProtocol.peerSet.getPeerCountByShard(h.Shard)
+		}
+		shards = append(shards, downloader.ShardSync{
+			Shard:  h.Shard,
+			Height: h.Height,
+			Mode:   "headers",
+			Peers:  peers,
+		})
+	}
+	return shards
 }
 
 // GetInfo gets the account address that mining rewards will be send to.

@@ -127,7 +127,11 @@ loopOut:
 		if waiting {
 			t.rewindUnprocessed()
 			if time.Since(t.lastWaitLog) > 10*time.Second {
-				t.log.Info("source shard is not ready yet (header, peers, or confirmations); leaving blocks queued and retrying")
+				detail := t.downloader.WaitDetail()
+				if detail == "" {
+					detail = "source shard header or confirmations are not ready; waiting, not rejecting the block"
+				}
+				t.log.Info("%s; leaving blocks queued and retrying", detail)
 				t.lastWaitLog = time.Now()
 			}
 			select {
