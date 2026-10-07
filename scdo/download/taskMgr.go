@@ -21,7 +21,9 @@ const (
 	taskStatusWaitProcessing = 2 // block is downloaded, needs to process
 	taskStatusProcessed      = 3 // block is written to chain
 
-	maxBlocksWaiting = 1024 // max blocks waiting to download
+	maxBlocksWaiting = 4096 // headers kept ahead of the write cursor
+	// bodySlowAfter returns a body request to the idle queue so a faster peer can take it.
+	bodySlowAfter = 4 * time.Second
 
 	// progressWindow is the span of the sync-rate moving average.
 	progressWindow = 3 * time.Minute
@@ -42,10 +44,11 @@ var (
 
 // downloadInfo header info for master peer
 type downloadInfo struct {
-	header *types.BlockHeader
-	block  *types.Block
-	peerID string
-	status int // block download status
+	header     *types.BlockHeader
+	block      *types.Block
+	peerID     string
+	status     int // block download status
+	assignedAt time.Time
 }
 
 // peerHeadInfo header info for ordinary peer
@@ -83,6 +86,7 @@ type taskMgr struct {
 	lastWaitLog     time.Time
 	progressSamples []heightSample
 	smoothBPM       float64
+	slowNote        []string
 }
 
 func newTaskMgr(d *Downloader, masterPeer string, conn *peerConn, from uint64, to uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block) *taskMgr {
@@ -130,6 +134,9 @@ loopOut:
 			continue
 		}
 		t.logProgress()
+		if t.isDone() {
+			t.downloader.Cancel()
+		}
 
 		select {
 		case <-t.procCh:
@@ -177,7 +184,27 @@ func (t *taskMgr) logProgress() {
 		mins := float64(to-written) / t.smoothBPM
 		eta = (time.Duration(mins * float64(time.Minute))).Truncate(time.Second).String()
 	}
-	t.log.Info("sync progress: height %d / %d, %.1f blocks/min, ETA %s", written, to, t.smoothBPM, eta)
+	peers := 0
+	t.downloader.lock.RLock()
+	peers = len(t.downloader.peers)
+	t.downloader.lock.RUnlock()
+	t.log.Info("sync progress: height %d / %d, %.1f blocks/min (%.1f blk/s), ETA %s, peers %d", written, to, t.smoothBPM, t.smoothBPM/60, eta, peers)
+}
+
+func (t *taskMgr) progressSnapshot() (current, highest uint64, blocksPerSec float64, eta string) {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	highest = t.toNo
+	if t.curNo > 0 {
+		current = t.curNo - 1
+	}
+	blocksPerSec = t.smoothBPM / 60
+	eta = "unknown"
+	if t.smoothBPM > 0 && highest >= current {
+		mins := float64(highest-current) / t.smoothBPM
+		eta = (time.Duration(mins * float64(time.Minute))).Truncate(time.Second).String()
+	}
+	return current, highest, blocksPerSec, eta
 }
 
 // smoothSyncRate returns blocks/min over the recent window, blended with prevSmooth
@@ -297,6 +324,8 @@ func (t *taskMgr) getReqBlocks(conn *peerConn) (uint64, int) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
+	t.reclaimSlowLocked(time.Now())
+
 	headInfo, ok := t.peersHeaderMap[conn.peerID]
 	if !ok || len(headInfo.headers) == 0 {
 		return 0, 0
@@ -318,6 +347,7 @@ func (t *taskMgr) getReqBlocks(conn *peerConn) (uint64, int) {
 		startNo = masterHead.header.Height
 		masterHead.status = taskStatusDownloading
 		masterHead.peerID = conn.peerID
+		masterHead.assignedAt = time.Now()
 		amount = 1
 		break
 	}
@@ -338,6 +368,7 @@ func (t *taskMgr) getReqBlocks(conn *peerConn) (uint64, int) {
 				amount++
 				masterHead.status = taskStatusDownloading
 				masterHead.peerID = conn.peerID
+				masterHead.assignedAt = time.Now()
 			} else {
 				break
 			}
@@ -367,6 +398,7 @@ func (t *taskMgr) onPeerQuit(peerID string) {
 		if masterHead.status == taskStatusDownloading && masterHead.peerID == peerID {
 			masterHead.peerID = ""
 			masterHead.status = taskStatusIdle
+			masterHead.assignedAt = time.Time{}
 		}
 	}
 }
@@ -426,6 +458,7 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 			if headInfo.status == taskStatusDownloading {
 				headInfo.status = taskStatusIdle
 				headInfo.peerID = ""
+				headInfo.assignedAt = time.Time{}
 			}
 		}
 		return
@@ -441,12 +474,24 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 		}
 		headInfo := t.downloadInfoList[idx]
 		if headInfo.peerID != peerID {
-			t.log.Info("Received block from different peer, discard this block. headInfo.peerID=%s, peerID=%s", headInfo.peerID, peerID)
+			t.log.Debug("Received block from different peer, discard this block. headInfo.peerID=%s, peerID=%s", headInfo.peerID, peerID)
 			continue
+		}
+		if headInfo.header != nil && b.Header != nil {
+			got := b.Header.Hash()
+			want := headInfo.header.Hash()
+			if !got.Equal(want) {
+				headInfo.status = taskStatusIdle
+				headInfo.peerID = ""
+				headInfo.assignedAt = time.Time{}
+				t.slowNote = append(t.slowNote, peerID)
+				continue
+			}
 		}
 
 		headInfo.block = b
 		headInfo.status = taskStatusWaitProcessing
+		headInfo.assignedAt = time.Time{}
 		t.downloadedNum++
 		toHeight = b.Header.Height
 	}
@@ -469,6 +514,33 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 		}
 
 		headInfo.status = taskStatusIdle
+		headInfo.assignedAt = time.Time{}
 	}
 	t.notify()
+}
+
+func (t *taskMgr) reclaimSlowLocked(now time.Time) {
+	for _, info := range t.downloadInfoList {
+		if info.status != taskStatusDownloading || info.assignedAt.IsZero() {
+			continue
+		}
+		if now.Sub(info.assignedAt) < bodySlowAfter {
+			continue
+		}
+		if info.peerID != "" {
+			t.slowNote = append(t.slowNote, info.peerID)
+		}
+		info.status = taskStatusIdle
+		info.peerID = ""
+		info.assignedAt = time.Time{}
+	}
+}
+
+func (t *taskMgr) drainSlow() []string {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	t.reclaimSlowLocked(time.Now())
+	out := t.slowNote
+	t.slowNote = nil
+	return out
 }

@@ -72,6 +72,9 @@ func LoadConfigFromFile(configFile string, accounts string, poolAccounts string)
 	if dataDirFlag != "" {
 		config.BasicConfig.DataDir = dataDirFlag
 	}
+	if dbCacheFlag > 0 {
+		config.BasicConfig.DbCache = dbCacheFlag
+	}
 	rawDataDir := config.BasicConfig.DataDir
 	config.BasicConfig.DataDir = common.ResolveDataDir(rawDataDir)
 	logDirName := rawDataDir
@@ -87,6 +90,7 @@ func LoadConfigFromFile(configFile string, accounts string, poolAccounts string)
 	if err != nil {
 		return config, err
 	}
+	p2p.MergeBootnodes(&config.P2PConfig)
 
 	if len(config.BasicConfig.Coinbase) > 0 {
 		config.ScdoConfig.Coinbase = common.HexMustToAddres(config.BasicConfig.Coinbase)

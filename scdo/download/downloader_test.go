@@ -19,7 +19,6 @@ import (
 	"github.com/scdoproject/go-scdo/crypto"
 	"github.com/scdoproject/go-scdo/database"
 	"github.com/scdoproject/go-scdo/database/leveldb"
-	"github.com/scdoproject/go-scdo/p2p"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -484,7 +483,6 @@ func Test_Downloader_DeliverMsg(t *testing.T) {
 
 	pc := testTaskMgrPeerConn("peerID")
 	dl.peers["peerID"] = pc
-	dl.peers["peerID"].waitingMsgMap[BlockHeadersMsg] = make(chan *p2p.Message)
 	cancelCh := make(chan struct{})
 	go func() {
 		ret, err := dl.peers["peerID"].waitMsg(uint32(1), BlockHeadersMsg, cancelCh)
