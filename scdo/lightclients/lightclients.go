@@ -111,7 +111,9 @@ func (manager *LightClientsManager) ValidateDebt(debt *types.Debt) (packed bool,
 	header := backend.ChainBackend().CurrentHeader()
 	duration := header.Height - index.BlockHeight
 	if duration < common.ConfirmedBlockNumber {
-		return true, false, fmt.Errorf("invalid debt because not enough confirmed block number, wanted is %d, actual is %d", common.ConfirmedBlockNumber, duration)
+		// Not a bad block: the source shard simply has not buried the tx yet.
+		// The inner sentinel lets the downloader queue the block and retry.
+		return true, false, errors.NewStackedErrorf(types.ErrNotEnoughConfirmations, "invalid debt because not enough confirmed block number, wanted is %d, actual is %d", common.ConfirmedBlockNumber, duration)
 	}
 
 	// cache the confirmed tx

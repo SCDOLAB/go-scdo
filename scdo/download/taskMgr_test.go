@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
+	"github.com/scdoproject/go-scdo/common/errors"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/database"
 
@@ -222,6 +223,46 @@ func newPeerHeadInfos(num int) *peerHeadInfo {
 	p.maxNo = uint64(num)
 
 	return p
+}
+
+func TestSmoothSyncRateDoesNotJump(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	slow := []heightSample{
+		{at: base, height: 1000},
+		{at: base.Add(15 * time.Second), height: 1010},
+	}
+	rate, kept := smoothSyncRate(slow, 0, progressWindow)
+	// 10 blocks in 15s is 40 blocks/min. First sample has no previous average.
+	assert.InDelta(t, 40, rate, 0.01)
+	assert.Equal(t, 2, len(kept))
+
+	// A burst of 900 blocks in the next 15s is 3600 blocks/min on that step.
+	// The window still includes the slow start, and the EMA must not snap to 3600.
+	burst := append(kept, heightSample{at: base.Add(30 * time.Second), height: 1910})
+	rate2, _ := smoothSyncRate(burst, rate, progressWindow)
+	assert.True(t, rate2 > rate)
+	assert.True(t, rate2 < 1000, "smoothed rate jumped to %v", rate2)
+}
+
+func TestSmoothSyncRateDropsOldSamples(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	samples := []heightSample{
+		{at: base, height: 0},
+		{at: base.Add(7 * time.Minute), height: 100},
+		{at: base.Add(10 * time.Minute), height: 1900},
+	}
+	_, kept := smoothSyncRate(samples, 0, progressWindow)
+	assert.Equal(t, 2, len(kept))
+	assert.Equal(t, uint64(100), kept[0].height)
+	assert.Equal(t, uint64(1900), kept[1].height)
+}
+
+func TestIsShardDataNotReady(t *testing.T) {
+	confirmations := errors.NewStackedErrorf(types.ErrNotEnoughConfirmations, "invalid debt because not enough confirmed block number, wanted is %d, actual is %d", 120, 89)
+	wrapped := errors.NewStackedError(confirmations, "failed to validate debt via verifier")
+	assert.Equal(t, true, isShardDataNotReady(wrapped))
+	assert.Equal(t, true, isShardDataNotReady(errors.NewStackedError(types.ErrHeaderNotReady, "leveldb: not found")))
+	assert.Equal(t, false, isShardDataNotReady(errors.New("invalid parent hash")))
 }
 
 func newTestBlockHeaderWithHeight(height uint64) *types.BlockHeader {

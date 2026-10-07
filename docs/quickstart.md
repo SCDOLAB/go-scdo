@@ -46,7 +46,8 @@ Windows: use the one-click miner package (`start-miner.bat`). Or set things up b
 ### 1. Your SCDO address
 
 The prefix decides your shard (`1S01` = shard 1, `2S02` = shard 2, `3S03` = shard 3,
-`4S04` = shard 4). No address yet? Run `node key --shard 1` (or `client key --shard 1`) and keep the private key safe.
+`4S04` = shard 4). No address yet? Run `node key --shard 1` (or `client key --shard 1`).
+The command warns that this private key controls the account. Add `--out wallet.key` to write it to a mode-0600 file instead of the terminal.
 
 ### 2. Save this as `node.json`
 
@@ -98,7 +99,7 @@ Public P2P seed nodes (TCP + UDP), one port per shard:
 
 ### 3. Start the node + miner
 
-`node start` syncs only. Mining is opt-in with `-m start`.
+`node start` syncs only, and `coinbase` may be empty for that. Mining is opt-in with `-m start` and needs a coinbase.
 
 Data files go to `$HOME/.scdo/<dataDir>` unless `dataDir` is absolute or you pass
 `--datadir`. `$HOME` / `%USERPROFILE%` is honored.

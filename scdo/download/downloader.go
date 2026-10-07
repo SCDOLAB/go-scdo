@@ -576,8 +576,8 @@ outLoop:
 }
 
 // processBlocks writes blocks to the blockchain.
-// waiting is true when a cross-shard debt needs a source-shard header that is not
-// synced yet. The task manager leaves those blocks queued and retries.
+// waiting is true when a cross-shard debt needs a source-shard header or more
+// confirmations on that shard. The task manager leaves those blocks queued and retries.
 func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block, conn *peerConn) (waiting bool) {
 	if len(headInfos) > 0 {
 		d.log.Info(" [%d] blocks will be processed into local database", len(headInfos))
@@ -593,8 +593,8 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 		err := d.chain.WriteBlock(h.block, txPool)
 
 		if err != nil && !errors.IsOrContains(err, core.ErrBlockAlreadyExists) {
-			if errors.IsOrContains(err, types.ErrHeaderNotReady) {
-				d.log.Debug("queue block height=%d until the source shard header is synced: %s", h.block.Header.Height, err)
+			if isShardDataNotReady(err) {
+				d.log.Debug("queue block height=%d until the source shard is ready: %s", h.block.Header.Height, err)
 				return true
 			}
 			d.log.Error("failed to write block err=%s", err)
@@ -613,6 +613,13 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 		h.status = taskStatusProcessed
 	}
 	return false
+}
+
+// isShardDataNotReady reports whether a block write failed only because the
+// source shard has not caught up (missing header or fewer than the required
+// confirmations). Those blocks stay queued. A real validation failure does not match.
+func isShardDataNotReady(err error) bool {
+	return errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations)
 }
 
 // reverse the chain back to the common ancestor of local node and peer

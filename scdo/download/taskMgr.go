@@ -22,7 +22,18 @@ const (
 	taskStatusProcessed      = 3 // block is written to chain
 
 	maxBlocksWaiting = 1024 // max blocks waiting to download
+
+	// progressWindow is the span of the sync-rate moving average.
+	progressWindow = 3 * time.Minute
+	// progressAlpha is the weight of the newest window rate in the EMA.
+	progressAlpha = 0.25
 )
+
+// heightSample is one sync-progress observation.
+type heightSample struct {
+	at     time.Time
+	height uint64
+}
 
 var (
 	errMasterHeadersNotMatch = errors.New("Master headers not match")
@@ -60,16 +71,18 @@ type taskMgr struct {
 	peersHeaderMap   map[string]*peerHeadInfo // peer's header information
 	downloadInfoList []*downloadInfo          // download process info
 
-	masterPeer   string
-	masterConn   *peerConn
-	lock         sync.RWMutex
-	quitCh       chan struct{}
-	wg           sync.WaitGroup
-	log          *log.ScdoLog
-	startTime    time.Time
-	procCh       chan struct{}
-	lastProgress time.Time
-	lastWaitLog  time.Time
+	masterPeer      string
+	masterConn      *peerConn
+	lock            sync.RWMutex
+	quitCh          chan struct{}
+	wg              sync.WaitGroup
+	log             *log.ScdoLog
+	startTime       time.Time
+	procCh          chan struct{}
+	lastProgress    time.Time
+	lastWaitLog     time.Time
+	progressSamples []heightSample
+	smoothBPM       float64
 }
 
 func newTaskMgr(d *Downloader, masterPeer string, conn *peerConn, from uint64, to uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block) *taskMgr {
@@ -106,7 +119,7 @@ loopOut:
 		if waiting {
 			t.rewindUnprocessed()
 			if time.Since(t.lastWaitLog) > 10*time.Second {
-				t.log.Info("source shard header is not synced yet; leaving blocks queued and retrying")
+				t.log.Info("source shard header or confirmations are not ready; leaving blocks queued and retrying")
 				t.lastWaitLog = time.Now()
 			}
 			select {
@@ -150,25 +163,55 @@ func (t *taskMgr) logProgress() {
 	cur := t.curNo
 	to := t.toNo
 	from := t.fromNo
-	downloaded := t.downloadedNum
-	start := t.startTime
 	t.lock.RUnlock()
 	if cur <= from {
 		return
 	}
-	t.lastProgress = time.Now()
+	now := time.Now()
+	t.lastProgress = now
 	written := cur - 1
-	elapsedMin := time.Since(start).Minutes()
-	bpm := 0.0
-	if elapsedMin > 0 {
-		bpm = float64(downloaded) / elapsedMin
-	}
+	t.progressSamples = append(t.progressSamples, heightSample{at: now, height: written})
+	t.smoothBPM, t.progressSamples = smoothSyncRate(t.progressSamples, t.smoothBPM, progressWindow)
 	eta := "unknown"
-	if bpm > 0 && to >= written {
-		mins := float64(to-written) / bpm
+	if t.smoothBPM > 0 && to >= written {
+		mins := float64(to-written) / t.smoothBPM
 		eta = (time.Duration(mins * float64(time.Minute))).Truncate(time.Second).String()
 	}
-	t.log.Info("sync progress: height %d / %d, %.1f blocks/min, ETA %s", written, to, bpm, eta)
+	t.log.Info("sync progress: height %d / %d, %.1f blocks/min, ETA %s", written, to, t.smoothBPM, eta)
+}
+
+// smoothSyncRate returns blocks/min over the recent window, blended with prevSmooth
+// so a speed change does not replace the printed ETA in one step. Samples older
+// than the window are dropped, except the sample that anchors the left edge.
+func smoothSyncRate(samples []heightSample, prevSmooth float64, window time.Duration) (float64, []heightSample) {
+	if len(samples) == 0 {
+		return prevSmooth, samples
+	}
+	cutoff := samples[len(samples)-1].at.Add(-window)
+	start := 0
+	for start+1 < len(samples) && !samples[start+1].at.After(cutoff) {
+		start++
+	}
+	kept := make([]heightSample, len(samples)-start)
+	copy(kept, samples[start:])
+
+	smooth := prevSmooth
+	if len(kept) >= 2 {
+		dt := kept[len(kept)-1].at.Sub(kept[0].at).Minutes()
+		if dt > 0 {
+			dh := float64(kept[len(kept)-1].height) - float64(kept[0].height)
+			if dh < 0 {
+				dh = 0
+			}
+			windowBPM := dh / dt
+			if prevSmooth > 0 {
+				smooth = progressAlpha*windowBPM + (1-progressAlpha)*prevSmooth
+			} else {
+				smooth = windowBPM
+			}
+		}
+	}
+	return smooth, kept
 }
 
 func (t *taskMgr) notify() {

@@ -179,6 +179,10 @@ func (miner *Miner) handleMsg() {
 
 // Start is used to start the miner
 func (miner *Miner) Start() error {
+	if miner.coinbase.Equal(common.Address{}) && len(miner.coinbaseList) == 0 {
+		return fmt.Errorf("coinbase can not be empty when mining")
+	}
+
 	miner.stopChan = make(chan struct{})
 
 	if istanbul, ok := miner.engine.(consensus.Istanbul); ok {
@@ -382,7 +386,7 @@ func (miner *Miner) commitTask(task *Task, recv chan *types.Block) {
 	miner.engine.Seal(miner.scdo.BlockChain(), block, miner.stopChan, recv)
 }
 
-//GetWork get the current task in a printable format
+// GetWork get the current task in a printable format
 func (miner *Miner) GetWork() map[string]interface{} {
 	if miner.current == nil {
 		miner.log.Info("there is no task so far")

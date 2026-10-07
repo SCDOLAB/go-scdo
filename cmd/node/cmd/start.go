@@ -75,10 +75,16 @@ var startCmd = &cobra.Command{
 			return
 		}
 		Cast(nCfg)
+		minerInfo := strings.ToLower(miner)
 		if len(nCfg.BasicConfig.Coinbase) == 0 {
-			fmt.Println("No coinbase is set. Create a wallet key first, then put the address in basic.coinbase:")
-			fmt.Println("  node key --shard N")
-			fmt.Println("N is 1, 2, 3 or 4. Keep the private key safe. Mining rewards go to that address.")
+			if minerInfo == "start" {
+				fmt.Println("Mining needs a coinbase. Create a wallet key, then put the address in basic.coinbase:")
+				fmt.Println("  node key --shard N")
+				fmt.Println("N is 1, 2, 3 or 4. Keep the private key safe. Mining rewards go to that address.")
+				fmt.Println("To sync without mining, omit -m start.")
+				return
+			}
+			fmt.Println("No coinbase is set. Syncing without mining. Set basic.coinbase before -m start.")
 		}
 		if !comm.LogConfiguration.PrintLog {
 			fmt.Printf("log folder: %s\n", filepath.Join(log.LogFolder, comm.LogConfiguration.DataDir))
@@ -194,7 +200,6 @@ var startCmd = &cobra.Command{
 				return
 			}
 
-			minerInfo := strings.ToLower(miner)
 			if minerInfo == "start" {
 				err = scdoService.Miner().Start()
 				if err != nil && err != miner2.ErrMinerIsRunning {
