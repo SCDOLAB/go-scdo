@@ -4,8 +4,11 @@
 //
 // The bind needs a C compiler because the node id uses libsecp256k1.
 // Start header-syncs shards 1-4 from fork genesis and checks every header
-// with ZPoW. There is no snapshot. Balance, transaction and debt calls
-// return Merkle proofs the node has already checked.
+// with ZPoW. There is no snapshot. After a header checks out, older ones
+// are pruned down to the last 10_000 per shard. A hash accumulator keeps
+// older transaction proofs checkable. Balance, transaction and debt calls
+// return Merkle proofs the node has already checked. Sync pauses when the
+// app reports a metered network or a low battery.
 //
 // The same process also serves JSON-RPC on 127.0.0.1:18037 under the light
 // namespace. See docs/mobile-light-client.md.
@@ -102,6 +105,9 @@ func Start(dataDir string) error {
 	if err = n.Register(service); err != nil {
 		return err
 	}
+	// The desktop -l node leaves this off. A phone opts in, then reports
+	// the OS state through SetDeviceState.
+	light.SetSyncPolicy(true, true)
 	if err = n.Start(); err != nil {
 		return err
 	}
@@ -189,6 +195,82 @@ func Estimate(head int64) string {
 		return jsonErr(err.Error())
 	}
 	return jsonOK(est)
+}
+
+// Pause stops header downloads. The verified tip stays on disk.
+func Pause(reason string) error {
+	light.Pause(reason)
+	return nil
+}
+
+// Resume clears a manual pause. A metered network or low battery can still hold sync.
+func Resume() error {
+	light.Resume()
+	return nil
+}
+
+// SetSyncPolicy chooses whether a metered network or a low battery pauses sync.
+func SetSyncPolicy(pauseOnMetered, pauseOnLowBattery bool) error {
+	light.SetSyncPolicy(pauseOnMetered, pauseOnLowBattery)
+	return nil
+}
+
+// SetDeviceState reports the phone's network and battery. Go cannot read those itself.
+func SetDeviceState(metered, lowBattery bool) error {
+	light.SetDeviceState(metered, lowBattery)
+	return nil
+}
+
+// VerifyHeader checks headerHex (RLP hex) and siblingsJSON (hex hash array)
+// against the accumulator this phone built. shard is 1-4.
+func VerifyHeader(shard int, headerHex, siblingsJSON string) string {
+	api := api()
+	if api == nil {
+		return jsonErr("light node is not started")
+	}
+	var siblings []string
+	if err := json.Unmarshal([]byte(siblingsJSON), &siblings); err != nil {
+		return jsonErr(err.Error())
+	}
+	if err := api.VerifyHeader(uint(shard), headerHex, siblings); err != nil {
+		return jsonErr(err.Error())
+	}
+	return jsonOK(map[string]bool{"verified": true})
+}
+
+// VerifyTx checks a historical transaction against a header the phone's accumulator accepts.
+func VerifyTx(shard int, headerHex, siblingsJSON, txHash, proofJSON string) string {
+	return verifyTrie(shard, headerHex, siblingsJSON, txHash, proofJSON, true)
+}
+
+// VerifyDebt checks a historical cross-shard debt the same way.
+func VerifyDebt(shard int, headerHex, siblingsJSON, debtHash, proofJSON string) string {
+	return verifyTrie(shard, headerHex, siblingsJSON, debtHash, proofJSON, false)
+}
+
+func verifyTrie(shard int, headerHex, siblingsJSON, itemHash, proofJSON string, tx bool) string {
+	api := api()
+	if api == nil {
+		return jsonErr("light node is not started")
+	}
+	var siblings []string
+	if err := json.Unmarshal([]byte(siblingsJSON), &siblings); err != nil {
+		return jsonErr(err.Error())
+	}
+	var nodes []light.ProofNode
+	if err := json.Unmarshal([]byte(proofJSON), &nodes); err != nil {
+		return jsonErr(err.Error())
+	}
+	var err error
+	if tx {
+		err = api.VerifyTx(uint(shard), headerHex, siblings, itemHash, nodes)
+	} else {
+		err = api.VerifyDebt(uint(shard), headerHex, siblings, itemHash, nodes)
+	}
+	if err != nil {
+		return jsonErr(err.Error())
+	}
+	return jsonOK(map[string]bool{"verified": true})
 }
 
 // VerifyAccount checks a balance proof without the network.

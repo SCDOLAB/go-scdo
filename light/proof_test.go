@@ -109,18 +109,22 @@ func TestConfirmationsUseExistingRule(t *testing.T) {
 }
 
 func TestPhoneEstimateFitsALargePhone(t *testing.T) {
-	header := sampleClassicHeader()
-	raw := common.SerializePanic(header)
-	est := EstimateSync(SampledClassicHead, len(raw), HeaderDiskBytes(header, header.Difficulty))
+	headerBytes, diskBytes := sampleHeaderSizes()
+	est := EstimateSync(SampledClassicHead, headerBytes, diskBytes)
 	assert.Equal(t, uint64(common.ScdoForkHeight), est.ForkGenesis)
 	assert.Equal(t, 4, est.Shards)
 	assert.Equal(t, true, est.HeadersPerShard > uint64(6_000_000))
-	// One header is a few hundred bytes. Four shards from fork genesis are
-	// several gigabytes, which is a phone with room to spare, not the full chain.
+	// Kept rows are the recent window, not the full header history.
 	assert.Equal(t, true, est.BytesPerHeader < 2000)
-	assert.Equal(t, true, est.PhoneStorageBytes > uint64(4<<30))
-	assert.Equal(t, true, est.PhoneStorageBytes < uint64(20<<30))
+	assert.Equal(t, uint64(RetainedHeaders), est.RetainedPerShard)
+	assert.Equal(t, uint64(RetainedHeaders+1), est.StoredHeadersPerShard)
+	// Pruned headers plus accumulator snapshots, with LevelDB slack, stay
+	// under a gigabyte. The download is still every header: verification
+	// does not skip any of them.
+	assert.Equal(t, true, est.PhoneStorageBytes > uint64(1<<20))
+	assert.Equal(t, true, est.PhoneStorageBytes < uint64(1<<30))
+	assert.Equal(t, true, est.DownloadBytes > uint64(4<<30))
 	assert.Equal(t, true, est.SteadyBytesPerSecond < 500)
-	t.Logf("header %d bytes, disk %d bytes, phone storage %d, download %d, steady %.1f B/s",
-		len(raw), est.BytesPerHeader, est.PhoneStorageBytes, est.DownloadBytes, est.SteadyBytesPerSecond)
+	t.Logf("header %d bytes, disk %d bytes, retained %d, stored %d, mmr %d, phone storage %d, download %d, steady %.1f B/s",
+		est.HeaderBytes, est.BytesPerHeader, est.RetainedPerShard, est.StoredHeadersPerShard, est.MMRBytes, est.PhoneStorageBytes, est.DownloadBytes, est.SteadyBytesPerSecond)
 }

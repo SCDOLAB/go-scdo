@@ -25,6 +25,8 @@ import (
 type LightChain struct {
 	mutex                     sync.RWMutex
 	bcStore                   store.BlockchainStore
+	db                        database.Database
+	mmr                       *chainMMR
 	odrBackend                *odrBackend
 	engine                    consensus.Engine
 	currentHeader             *types.BlockHeader
@@ -38,6 +40,7 @@ type LightChain struct {
 func newLightChain(bcStore store.BlockchainStore, lightDB database.Database, odrBackend *odrBackend, engine consensus.Engine) (*LightChain, error) {
 	chain := &LightChain{
 		bcStore:                   bcStore,
+		db:                        lightDB,
 		odrBackend:                odrBackend,
 		engine:                    engine,
 		headerChangedEventManager: event.NewEventManager(),
@@ -61,6 +64,9 @@ func newLightChain(bcStore store.BlockchainStore, lightDB database.Database, odr
 	}
 
 	chain.canonicalTD = td
+	if err = chain.prepareAccumulator(); err != nil {
+		return nil, errors.NewStackedError(err, "failed to prepare the header accumulator")
+	}
 
 	return chain, nil
 }
@@ -140,6 +146,15 @@ func (lc *LightChain) WriteHeader(header *types.BlockHeader) error {
 
 	currentTd := new(big.Int).Add(previousTd, header.Difficulty)
 	isHead := currentTd.Cmp(lc.canonicalTD) > 0
+
+	// Record the hash only after parent, difficulty and ZPoW checks succeed,
+	// and before the header becomes canonical. A deep reorg that the
+	// accumulator cannot represent is refused without moving the tip.
+	if isHead {
+		if err = lc.noteVerified(header); err != nil {
+			return errors.NewStackedError(err, "failed to record verified header")
+		}
+	}
 
 	if err := lc.bcStore.PutBlockHeader(header.Hash(), header, currentTd, isHead); err != nil {
 		return errors.NewStackedErrorf(err, "failed to put block header, header = %+v", header)

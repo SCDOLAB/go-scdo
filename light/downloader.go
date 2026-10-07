@@ -27,13 +27,14 @@ var (
 
 // Downloader sync block chain with remote peer
 type Downloader struct {
-	cancelCh   chan struct{} // Cancel current synchronising session
-	msgCh      chan *p2p.Message
-	syncStatus int32
-	chain      BlockChain
-	wg         sync.WaitGroup
-	log        *log.ScdoLog
-	lock       sync.RWMutex
+	cancelCh      chan struct{} // Cancel current synchronising session
+	msgCh         chan *p2p.Message
+	syncStatus    int32
+	chain         BlockChain
+	wg            sync.WaitGroup
+	log           *log.ScdoLog
+	lock          sync.RWMutex
+	onSessionDone func(started bool, local, peer uint64)
 }
 
 // NewDownloader create Downloader
@@ -67,14 +68,35 @@ func (d *Downloader) synchronise(p *peer) error {
 }
 
 func (d *Downloader) doSynchronise(p *peer) {
+	started := false
+	var localH, peerH uint64
+	if header := d.chain.CurrentHeader(); header != nil {
+		localH = header.Height
+	}
+	if p != nil {
+		peerH = p.HeadHeight()
+	}
 	defer func() {
 		d.cancel()
 		d.wg.Done()
 		d.lock.Lock()
 		close(d.msgCh)
 		d.syncStatus = statusNotDownloading
+		done := d.onSessionDone
 		d.lock.Unlock()
+		if header := d.chain.CurrentHeader(); header != nil {
+			localH = header.Height
+		}
+		if done != nil {
+			done(started, localH, peerH)
+		}
 	}()
+
+	if paused, reason := SyncPause(); paused {
+		d.log.Info("light sync paused (%s); verified height %d kept", reason, localH)
+		return
+	}
+	started = true
 
 	ancestor, err := p.findAncestor()
 	if err != nil {
@@ -98,6 +120,10 @@ needQuit:
 	for {
 		select {
 		case msg := <-d.msgCh:
+			if paused, reason := SyncPause(); paused {
+				d.log.Info("light sync paused (%s); verified height kept", reason)
+				break needQuit
+			}
 			if msg.Code != downloadHeadersResponseCode {
 				break
 			}
@@ -219,12 +245,17 @@ func (d *Downloader) reverseLightBCstore(ancestor uint64) error {
 	}
 
 	localCurHeader, err := bcStore.GetBlockHeader(localCurHash)
-	d.log.Debug("lightchain START reverse local %d to Height: %d", localCurHeader.Height, ancestor)
 	if err != nil {
 		return err
 	}
-
 	localHeight := localCurHeader.Height
+	if localHeight <= ancestor {
+		return nil
+	}
+	if _, err = bcStore.GetBlockHash(ancestor); err != nil {
+		return errors.NewStackedErrorf(err, "common ancestor %d is outside the retained header window", ancestor)
+	}
+	d.log.Debug("lightchain START reverse local %d to Height: %d", localHeight, ancestor)
 	curHeight := localHeight
 	localHashes := make([]common.Hash, 0)
 
@@ -258,6 +289,12 @@ func (d *Downloader) reverseLightBCstore(ancestor uint64) error {
 
 	// rollback the txs in txpool
 	d.chain.GetHeadRollbackEventManager().Fire(localHashes)
+
+	if rewinder, ok := d.chain.(interface{ RewindVerified(uint64) error }); ok {
+		if err = rewinder.RewindVerified(ancestor); err != nil {
+			return err
+		}
+	}
 
 	return nil
 

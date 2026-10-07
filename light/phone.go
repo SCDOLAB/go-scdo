@@ -29,13 +29,21 @@ type ShardStatus struct {
 	Syncing     bool   `json:"syncing"`
 	Mode        string `json:"mode"`
 	ForkGenesis uint64 `json:"forkGenesis"`
+	Paused      bool   `json:"paused"`
+	PauseReason string `json:"pauseReason,omitempty"`
+	Retained    uint64 `json:"retained"`
+	MMRLeaves   uint64 `json:"mmrLeaves"`
 }
 
 // Status reports this shard's header tip. Mode is always headers.
 func (s *ServiceClient) Status() ShardStatus {
+	paused, reason := SyncPause()
 	st := ShardStatus{
 		Mode:        "headers",
 		ForkGenesis: common.ScdoForkHeight,
+		Paused:      paused,
+		PauseReason: reason,
+		Retained:    RetainedHeaders,
 	}
 	if s == nil {
 		return st
@@ -43,6 +51,7 @@ func (s *ServiceClient) Status() ShardStatus {
 	st.Shard = s.shard
 	if s.chain != nil && s.chain.CurrentHeader() != nil {
 		st.Height = s.chain.CurrentHeader().Height
+		st.MMRLeaves = s.chain.MMRLeaves()
 	}
 	if s.scdoProtocol == nil {
 		return st
@@ -153,11 +162,108 @@ func (api *PublicAPI) GetDebtProof(debtHash string) (*DebtProof, error) {
 }
 
 // Estimate sizes header-only sync of all four shards up to head.
-// head 0 uses the 2026-10-07 public-network sample.
+// head 0 uses the 2026-10-07 public-network sample. Storage is the pruned
+// window plus the accumulator. Download is still every header from fork genesis.
 func (api *PublicAPI) Estimate(head uint64) (*SyncEstimate, error) {
 	headerBytes, diskBytes := sampleHeaderSizes()
 	est := EstimateSync(head, headerBytes, diskBytes)
 	return &est, nil
+}
+
+// Pause stops header downloads until Resume. The verified tip stays on disk.
+func (api *PublicAPI) Pause(reason string) error {
+	Pause(reason)
+	return nil
+}
+
+// Resume clears a manual pause.
+func (api *PublicAPI) Resume() error {
+	Resume()
+	return nil
+}
+
+// SetSyncPolicy opts into pausing on a metered network or a low battery.
+func (api *PublicAPI) SetSyncPolicy(pauseOnMetered, pauseOnLowBattery bool) error {
+	SetSyncPolicy(pauseOnMetered, pauseOnLowBattery)
+	return nil
+}
+
+// SetDeviceState records what the phone app read from the OS. Go cannot see
+// Android BatteryManager or the metered-network flag itself.
+func (api *PublicAPI) SetDeviceState(metered, lowBattery bool) error {
+	SetDeviceState(metered, lowBattery)
+	return nil
+}
+
+// VerifyHeader checks a header and its MMR siblings against the accumulator
+// this shard built while it verified the chain. The header bytes come from a
+// full node's light_getHeaderProof.
+func (api *PublicAPI) VerifyHeader(shard uint, headerHex string, siblings []string) error {
+	_, _, err := api.verifiedHeader(shard, headerHex, siblings)
+	return err
+}
+
+// VerifyTx checks a historical transaction. The header must verify against
+// this phone's accumulator, and the trie proof must match that header's tx root.
+func (api *PublicAPI) VerifyTx(shard uint, headerHex string, siblings []string, txHash string, proof []ProofNode) error {
+	header, _, err := api.verifiedHeader(shard, headerHex, siblings)
+	if err != nil {
+		return err
+	}
+	hash, err := common.HexToHash(txHash)
+	if err != nil {
+		return err
+	}
+	value, err := VerifyTrieValue(header.TxHash, hash.Bytes(), proof)
+	if err != nil {
+		return err
+	}
+	if len(value) == 0 {
+		return fmt.Errorf("transaction proof shows the transaction is absent")
+	}
+	return nil
+}
+
+// VerifyDebt checks a historical cross-shard debt against the same accumulator.
+func (api *PublicAPI) VerifyDebt(shard uint, headerHex string, siblings []string, debtHash string, proof []ProofNode) error {
+	header, _, err := api.verifiedHeader(shard, headerHex, siblings)
+	if err != nil {
+		return err
+	}
+	hash, err := common.HexToHash(debtHash)
+	if err != nil {
+		return err
+	}
+	value, err := VerifyTrieValue(header.DebtHash, hash.Bytes(), proof)
+	if err != nil {
+		return err
+	}
+	if len(value) == 0 {
+		return fmt.Errorf("debt proof shows the debt is absent")
+	}
+	return nil
+}
+
+func (api *PublicAPI) verifiedHeader(shard uint, headerHex string, siblings []string) (*types.BlockHeader, []common.Hash, error) {
+	client, err := api.clientFor(shard)
+	if err != nil {
+		return nil, nil, err
+	}
+	if client.chain == nil {
+		return nil, nil, fmt.Errorf("shard %d header chain is not ready", shard)
+	}
+	header, err := headerFromHex(headerHex)
+	if err != nil {
+		return nil, nil, err
+	}
+	sibs, err := decodeHashes(siblings)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = client.chain.verifyCanonicalHeader(header, sibs); err != nil {
+		return nil, nil, err
+	}
+	return header, sibs, nil
 }
 
 func (api *PublicAPI) client(shard uint) *ServiceClient {

@@ -14,13 +14,17 @@ The bind needs the Android NDK and a C compiler. Peer identity uses libsecp256k1
 
 | Call | What the wallet gets |
 | --- | --- |
-| `Start(dataDir)` | Header-sync shards 1–4 into `dataDir`. A relative path is placed under `$HOME/.scdo`. |
+| `Start(dataDir)` | Header-sync shards 1–4 into `dataDir`. A relative path is placed under `$HOME/.scdo`. Sync pauses on a metered network or a low battery once the app reports that state. |
 | `Stop()` | Shut the node down. |
 | `Syncing()` | JSON array, one object per shard. |
 | `Balance(address)` | JSON account proof for that address's shard. |
 | `TxProof(txHash)` | JSON transaction inclusion proof. |
 | `DebtProof(debtHash)` | JSON cross-shard debt proof. |
 | `Estimate(head)` | JSON storage and bandwidth. `head` 0 uses the sample below. |
+| `Pause(reason)` / `Resume()` | Stop or continue header downloads. The verified tip stays on disk. |
+| `SetSyncPolicy(metered, lowBattery)` | Choose which device states pause sync. `Start` turns both on. |
+| `SetDeviceState(metered, lowBattery)` | Tell the node what Android reported. Go cannot read the battery or the metered flag itself. |
+| `VerifyHeader` / `VerifyTx` / `VerifyDebt` | Check an older proof against the hash accumulator this phone built. |
 | `VerifyAccount(stateRoot, accountKey, proofJSON)` | Re-check a balance proof in-process. No network. |
 
 `Start` also opens JSON-RPC on `127.0.0.1:18037` and listens for peers on `0.0.0.0:18057`. The same methods are available as `light_*` if the app talks HTTP instead of the AAR. A desktop node serves them too:
@@ -42,14 +46,19 @@ The bind needs the Android NDK and a C compiler. Peer identity uses libsecp256k1
     "peers": 3,
     "syncing": true,
     "mode": "headers",
-    "forkGenesis": 2979594
+    "forkGenesis": 2979594,
+    "paused": false,
+    "retained": 10000,
+    "mmrLeaves": 1
   }
 ]
 ```
 
-`height` starts at 2979594 because that is the fork genesis, not block 0. `syncing` is true while a header batch is being written. Each write checks the parent link, the difficulty rule, and the ZPoW determinant. A header that fails those checks is not stored.
+`height` starts at 2979594 because that is the fork genesis, not block 0. `syncing` is true while a header batch is being written. Each write checks the parent link, the difficulty rule, and the ZPoW determinant. A header that fails those checks is not stored. `mmrLeaves` counts headers whose hashes were committed after that check. `retained` is how many recent headers stay on disk per shard, plus fork genesis.
 
-When a peer announces a higher head, the client starts a sync immediately. A 13 second poll is the backup. After the phone has caught up, a new block (about every 20 seconds) is the real-time path. 5G delay is the peer round trip, not a multi-block wait.
+When a peer announces a higher head, the client starts a sync immediately. A 13 second poll is the backup. If a session starts and then dies while the phone is still behind, it retries after 2 seconds. A dropped session does not roll the verified tip backwards. After the phone has caught up, a new block (about every 20 seconds) is the real-time path. 5G delay is the peer round trip, not a multi-block wait.
+
+`light_pause`, `light_resume`, `light_setSyncPolicy` and `light_setDeviceState` control the same gate as the AAR methods. Pausing cancels the download in progress and leaves the stored tip where it is. `Start` on the phone opts into pausing for a metered network and a low battery. A desktop `node start -l` does not, until something calls `SetSyncPolicy`. Low battery wins over a metered network when both are set.
 
 ## `light_getBalance`
 
@@ -100,7 +109,9 @@ The hash does not name a shard, so the phone asks all four. The first shard that
 }
 ```
 
-The proof is the transaction Merkle trie under that header's `txRoot`. The header is one this phone stored. `confirmed` means the transaction is at least 120 blocks behind that shard's head (`ConfirmedBlockNumber`). That count is the existing finality rule, not a new one. `included` false means the transaction is still only in the pool, so there is no trie proof yet.
+The proof is the transaction Merkle trie under that header's `txRoot`. For a transaction inside the retained window the header is one this phone still stores. `confirmed` means the transaction is at least 120 blocks behind that shard's head (`ConfirmedBlockNumber`). That count is the existing finality rule, not a new one. `included` false means the transaction is still only in the pool, so there is no trie proof yet.
+
+A transaction older than the retained window is checked with `light_verifyTx` (AAR `VerifyTx`). A full node serves `light_getHeaderProof(height, accumulatorHead)`, where `accumulatorHead` is this phone's verified height from `light_syncing`. The phone checks the header hash against its own accumulator, then checks the transaction trie against that header's `txRoot`. The same path is `light_verifyDebt` / `VerifyDebt` for a cross-shard debt. The phone does not accept a header it did not verify itself.
 
 ## `light_getDebtProof`
 
@@ -112,23 +123,23 @@ Same shape as the transaction proof, plus `debtRoot` and `confirmationsNeed` (12
 
 ## Storage and bandwidth
 
-Measured from a live shard-1 header at height 9,275,180 on 2026-10-07 (`TestPhoneEstimateFitsALargePhone`):
+Measured from a live shard-1 header at height 9,275,180 on 2026-10-07 (`TestPhoneEstimateFitsALargePhone`). Every header from fork genesis is still downloaded and checked. After the check, each shard keeps fork genesis plus the last 10,000 headers (about 55 hours, more than the 120-confirmation window) and an MMR snapshot of the verified header hashes for that window.
 
 | | |
 | --- | --- |
-| Headers after fork genesis, per shard | 9,275,180 − 2,979,594 = 6,295,586 |
+| Headers verified per shard | 9,275,180 − 2,979,594 = 6,295,586 |
+| Headers kept per shard | 10,000 + fork genesis (10,001) |
 | Header on the wire | 259 bytes |
-| Header plus difficulty and indexes | 370 bytes |
-| Four shards, raw records | about 9.3 GB |
-| Four shards, phone budget (records × 2) | about 18.6 GB |
-| One-time download | about 6.5 GB |
-| After catch-up | about 52 bytes/second (4 headers × 259 bytes / 20 seconds) |
+| Header plus difficulty and indexes | 373 bytes |
+| Accumulator snapshots, four shards | 31,640,000 bytes |
+| Four shards, raw records | 46,561,492 bytes |
+| Four shards, phone budget (records × 2) | 93,122,984 bytes (about 89 MiB) |
+| One-time download | 6,522,227,096 bytes (about 6.5 GB) |
+| After catch-up | 51.8 bytes/second |
 
-The ×2 budget is room for LevelDB indexes and compaction. Random header hashes do not compress much, so plan on roughly 10–19 GB free. A 128 GB phone can keep all four header chains. A 32 GB phone cannot. This is still the header chain only: a full block is on the order of 100 KB, so four full shards would be hundreds of gigabytes.
+The ×2 budget is room for LevelDB indexes and compaction. The exact byte counts are what `light_estimate` and `mobile.Estimate` return; the test logs them. Passing 0 repeats the 2026-10-07 sample. The sample is not a trusted checkpoint. The node still downloads and checks every header from 2979594. It does not keep every header.
 
-On 5G, 6.5 GB at 20–50 Mbps is roughly 20–45 minutes of download. The ZPoW step that dominates verification is a 30×30 determinant, about 17 µs on a server core (`BenchmarkMatrixDet` in `consensus/zpow`). One shard's history is a couple of minutes of that work on that CPU. A phone core is slower, and the four shards verify side by side. Once the phone is caught up, one new header per shard per 20 seconds stays real-time.
-
-`light_estimate` and `mobile.Estimate` return these fields for any head height. Passing 0 repeats the 2026-10-07 sample. The sample is not a trusted checkpoint. The node still downloads and checks every header from 2979594.
+On 5G, 6.5 GB at 20–50 Mbps is roughly 20–45 minutes of download, and a dropped transfer resumes from the verified tip. The ZPoW step that dominates verification is a 30×30 determinant, about 17 µs on a server core (`BenchmarkMatrixDet` in `consensus/zpow`). One shard's history is a couple of minutes of that work on that CPU. A phone core is slower, and the four shards verify side by side. Once the phone is caught up, one new header per shard per 20 seconds stays real-time. Steady storage does not grow with the chain: a new verified header pushes the oldest retained header out.
 
 ## What the wallet should do
 
@@ -137,4 +148,5 @@ On 5G, 6.5 GB at 20–50 Mbps is roughly 20–45 minutes of download. The ZPoW s
 3. Show balance from `Balance`. Keep `headerHash` and `proof` if you want `VerifyAccount` to check them again later.
 4. Track a payment with `TxProof`. Treat `confirmed` as the 120-block finality.
 5. Track a cross-shard incoming payment with `DebtProof` the same way.
-6. Call `Stop` when the app leaves the foreground if you need to release the radio. The header databases stay on disk, so the next `Start` resumes from the stored tip rather than from genesis.
+6. Call `SetDeviceState` when the network is metered or the battery is low. Call `Pause` when the app leaves the foreground if you need to release the radio. Call `Resume` and `SetDeviceState(false, false)` to continue. The header databases stay on disk, so the next `Start` resumes from the stored tip rather than from genesis.
+7. For a payment older than the retained window, ask a full node for `light_getHeaderProof` at that height and this phone's `height`, then `VerifyTx` or `VerifyDebt`.

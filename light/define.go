@@ -39,6 +39,10 @@ const (
 	maxPeerHashWindow = 2048
 
 	forceSyncInterval = time.Second * 13 // interval time of synchronising with remote peer
+
+	// flakyRetryInterval retries a header session that died while this shard
+	// was still behind. It is not used when sync is paused.
+	flakyRetryInterval = time.Second * 2
 )
 
 // statusData the structure for peers to exchange status

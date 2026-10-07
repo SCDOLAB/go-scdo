@@ -45,6 +45,60 @@ func TestEstimateJSON(t *testing.T) {
 	if est.PhoneStorageBytes == 0 || est.DownloadBytes == 0 {
 		t.Fatalf("%+v", est)
 	}
+	if est.PhoneStorageBytes >= 1<<30 {
+		t.Fatalf("phone storage %d", est.PhoneStorageBytes)
+	}
+	if est.DownloadBytes < 4<<30 {
+		t.Fatalf("download %d", est.DownloadBytes)
+	}
+	if est.RetainedPerShard != light.RetainedHeaders {
+		t.Fatalf("%+v", est)
+	}
+}
+
+func TestSyncPolicyPausesOnMetered(t *testing.T) {
+	light.Resume()
+	light.SetSyncPolicy(false, false)
+	light.SetDeviceState(false, false)
+	t.Cleanup(func() {
+		light.Resume()
+		light.SetSyncPolicy(false, false)
+		light.SetDeviceState(false, false)
+	})
+	if err := SetSyncPolicy(true, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetDeviceState(true, false); err != nil {
+		t.Fatal(err)
+	}
+	paused, reason := light.SyncPause()
+	if !paused || reason != "metered" {
+		t.Fatalf("paused=%v reason=%s", paused, reason)
+	}
+	if err := SetDeviceState(false, true); err != nil {
+		t.Fatal(err)
+	}
+	paused, reason = light.SyncPause()
+	if !paused || reason != "low-battery" {
+		t.Fatalf("paused=%v reason=%s", paused, reason)
+	}
+	if err := Resume(); err != nil {
+		t.Fatal(err)
+	}
+	paused, _ = light.SyncPause()
+	if !paused {
+		t.Fatal("low battery should still pause")
+	}
+	if err := SetDeviceState(false, false); err != nil {
+		t.Fatal(err)
+	}
+	paused, _ = light.SyncPause()
+	if paused {
+		t.Fatal("expected sync to resume")
+	}
+	if !strings.Contains(VerifyHeader(1, "0x", "[]"), "light node is not started") {
+		t.Fatal(VerifyHeader(1, "0x", "[]"))
+	}
 }
 
 func TestVerifyAccountProof(t *testing.T) {

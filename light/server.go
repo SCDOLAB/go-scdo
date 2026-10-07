@@ -65,9 +65,19 @@ func (s *ServiceServer) Stop() error {
 	return nil
 }
 
-// APIs implements node.Service, returning the collection of RPC services the scdo package offers.
-func (s *ServiceServer) APIs() (apis []rpc.API) {
-	return
+// APIs implements node.Service. A full node serves header inclusion proofs
+// under light_getHeaderProof. It does not register the phone's light namespace
+// methods; those belong to the light client process.
+func (s *ServiceServer) APIs() []rpc.API {
+	if s == nil || s.scdoProtocol == nil {
+		return nil
+	}
+	return []rpc.API{{
+		Namespace: "light",
+		Version:   "1.0",
+		Service:   &headerProofAPI{chain: s.scdoProtocol.chain},
+		Public:    true,
+	}}
 }
 
 func (pm *LightProtocol) chainHeaderChanged(e event.Event) {

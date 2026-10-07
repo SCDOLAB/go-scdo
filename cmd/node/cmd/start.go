@@ -138,8 +138,8 @@ var startCmd = &cobra.Command{
 		}
 
 		if lightNode {
-			fmt.Printf("Header-syncing shards 1-%d from fork genesis %d. Every header is checked with ZPoW. There is no snapshot. light_getBalance, light_getTxProof and light_getDebtProof return Merkle proofs.\n",
-				common.ShardCount, common.ScdoForkHeight)
+			fmt.Printf("Header-syncing shards 1-%d from fork genesis %d. Every header is checked with ZPoW. There is no snapshot. After verification only the last %d headers per shard are kept, plus a hash accumulator. light_getBalance, light_getTxProof and light_getDebtProof return Merkle proofs.\n",
+				common.ShardCount, common.ScdoForkHeight, light.RetainedHeaders)
 			clients, err := light.OpenShards(ctx, nCfg, engine)
 			if err != nil {
 				fmt.Println("Create light service error.", err.Error())
@@ -281,7 +281,7 @@ func init() {
 	startCmd.Flags().StringVarP(&accountsConfig, "accounts", "", "", "init accounts info")
 	startCmd.Flags().StringVarP(&poolAccountsConfig, "poolaccounts", "", "", "init pool accounts")
 	startCmd.Flags().IntVarP(&threads, "threads", "", 1, "miner thread value")
-	startCmd.Flags().BoolVarP(&lightNode, "light", "l", false, "header-only sync of shards 1-4 from fork genesis, with Merkle proofs")
+	startCmd.Flags().BoolVarP(&lightNode, "light", "l", false, "header-only sync of shards 1-4 from fork genesis, keeping the last 10000 headers per shard")
 	startCmd.Flags().BoolVar(&lightServer, "lightserver", true, "serve phone light clients (lightScdo_<shard> version 1) on this node's TCP port. On by default")
 	startCmd.Flags().Uint64VarP(&pprofPort, "port", "", 0, "which port pprof http server listen to")
 	startCmd.Flags().IntVarP(&startHeight, "startheight", "", -1, "the block height to start from")

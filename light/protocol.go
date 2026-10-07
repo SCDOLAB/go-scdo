@@ -147,6 +147,7 @@ func NewLightProtocol(networkID string, txPool TransactionPool, debtPool *core.D
 
 	if !serverMode {
 		s.downloader = newDownloader(chain)
+		s.downloader.onSessionDone = s.onDownloadDone
 	}
 
 	s.Protocol.AddPeer = s.handleAddPeer
@@ -160,15 +161,36 @@ func NewLightProtocol(networkID string, txPool TransactionPool, debtPool *core.D
 func (lp *LightProtocol) Start() {
 	lp.log.Debug("LightProtocol.Start called!")
 	if !lp.bServerMode {
+		registerClientProtocol(lp)
 		go lp.syncer()
 	}
 }
 
 // Stop stops protocol, called when scdoService quits.
 func (lp *LightProtocol) Stop() {
+	unregisterClientProtocol(lp)
 	close(lp.quitCh)
 	close(lp.syncCh)
 	lp.wg.Wait()
+}
+
+func (lp *LightProtocol) onDownloadDone(started bool, local, peer uint64) {
+	paused, _ := SyncPause()
+	if !shouldRetrySession(started, local, peer, paused) {
+		return
+	}
+	lp.log.Info("lightchain, shard: %d, session ended at verified height %d, peer %d; retrying", lp.shard, local, peer)
+	time.AfterFunc(flakyRetryInterval, func() {
+		select {
+		case <-lp.quitCh:
+			return
+		default:
+		}
+		if paused, _ := SyncPause(); paused {
+			return
+		}
+		lp.requestSync()
+	})
 }
 
 // requestSync asks the header syncer to catch the best peer. A sync that is
@@ -210,6 +232,14 @@ func (lp *LightProtocol) syncer() {
 }
 
 func (lp *LightProtocol) synchronise(peers []*peer) {
+	if paused, reason := SyncPause(); paused {
+		height := uint64(0)
+		if header := lp.chain.CurrentHeader(); header != nil {
+			height = header.Height
+		}
+		lp.log.Info("lightchain, shard: %d, sync paused (%s), verified height %d kept", lp.shard, reason, height)
+		return
+	}
 
 	hash, err := lp.chain.GetStore().GetHeadBlockHash()
 	if err != nil {
@@ -239,7 +269,7 @@ func (lp *LightProtocol) synchronise(peers []*peer) {
 	}
 
 	bestPeer := peers[0]
-	lp.log.Info("lightchain, shard: %d, local height: %d, best peer: %v, peer height: %d", lp.shard, localCurHeader.Height, bestPeer.peerID, bestPeer.headBlockNum)
+	lp.log.Info("lightchain, shard: %d, resuming from verified height %d, best peer: %v, peer height: %d", lp.shard, localCurHeader.Height, bestPeer.peerID, bestPeer.headBlockNum)
 
 	for _, p := range peers {
 		_, pTd := p.Head()

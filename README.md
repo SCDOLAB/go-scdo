@@ -110,7 +110,7 @@ First run:
 
 `node start` only syncs, and `basic.coinbase` may be empty for that. Add `-m start --threads N` to mine; mining requires a coinbase. `scripts/mine.sh` already passes `-m start`.
 
-`node start -l` header-syncs shards 1-4 from fork genesis. Every header is checked with ZPoW. There is no snapshot. `light_getBalance`, `light_getTxProof` and `light_getDebtProof` return Merkle proofs. An Android wallet embeds the same client through package `mobile`. See [docs/mobile-light-client.md](docs/mobile-light-client.md).
+`node start -l` header-syncs shards 1-4 from fork genesis. Every header is checked with ZPoW. There is no snapshot. After that check the node keeps the last 10,000 headers per shard plus a hash accumulator, which is sized for a phone. `light_getBalance`, `light_getTxProof` and `light_getDebtProof` return Merkle proofs. An Android wallet embeds the same client through package `mobile`. See [docs/mobile-light-client.md](docs/mobile-light-client.md).
 
 Data directory: a relative `dataDir` is created under `$HOME/.scdo` (`%USERPROFILE%\.scdo` on Windows). An absolute `dataDir`, or `--datadir`, is used as-is. The IPC socket is created inside that directory so two nodes do not share one socket.
 

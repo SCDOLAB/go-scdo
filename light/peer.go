@@ -451,8 +451,14 @@ func (p *peer) sendAnnounce(magic uint32, begin uint64, end uint64) error {
 
 		curBlock, err := chain.GetStore().GetBlockByHeight(curNum)
 		if err != nil {
-			p.log.Error("Load block error: %s", err)
-			return err
+			// A pruned light chain no longer has this sample. Skip it and
+			// keep walking toward begin. begin itself is fork genesis and
+			// stays on disk for the handshake.
+			if curNum == begin || power2 > uint64(1)<<62 {
+				p.log.Error("Load block error: %s", err)
+				return err
+			}
+			continue
 		}
 
 		numArr = append(numArr, curNum)
