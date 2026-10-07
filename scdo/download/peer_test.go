@@ -91,7 +91,7 @@ func Test_Download_WaitMsg(t *testing.T) {
 	}()
 
 	time.Sleep(100 * time.Millisecond)
-	pc.waitingMsgMap[BlockHeadersMsg] <- msg
+	pc.deliverMsg(BlockHeadersMsg, msg)
 
 	// BlocksMsg
 	msgCode = BlocksMsg
@@ -114,7 +114,7 @@ func Test_Download_WaitMsg(t *testing.T) {
 	}()
 
 	time.Sleep(time.Second)
-	pc.waitingMsgMap[BlocksMsg] <- msg
+	pc.deliverMsg(BlocksMsg, msg)
 
 	// BlocksMsg sent by deliverMsg
 	pc2 := testPeerConn()
@@ -181,7 +181,7 @@ func newTestBlockHeader() *types.BlockHeader {
 		Height:            1,
 		CreateTimestamp:   big.NewInt(time.Now().Unix()),
 		Witness:           common.CopyBytes([]byte("")),
-		SecondWitness:           common.CopyBytes([]byte("")),
+		SecondWitness:     common.CopyBytes([]byte("")),
 		ExtraData:         common.CopyBytes([]byte("")),
 	}
 }

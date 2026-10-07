@@ -35,10 +35,10 @@ func Test_PublicScdoAPI(t *testing.T) {
 	dataDir := ctx.Value("ServiceContext").(ServiceContext).DataDir
 	log := log.GetLogger("scdo")
 	consensusEngine, err := factory.GetConsensusEngine(common.Sha256Algorithm)
-	if err !=nil {
+	if err != nil {
 		t.Fatal()
 	}
-	ss, err := NewScdoService(ctx, conf, log, consensusEngine, nil, -1,false)
+	ss, err := NewScdoService(ctx, conf, log, consensusEngine, nil, -1, false)
 	if err != nil {
 		t.Fatal()
 	}
@@ -128,10 +128,10 @@ func newTestAPI(t *testing.T, dbPath string) *PublicScdoAPI {
 	ctx := context.WithValue(context.Background(), key, serviceContext)
 	log := log.GetLogger("scdo")
 	consensusEngine, err := factory.GetConsensusEngine(common.Sha256Algorithm)
-	if err !=nil {
+	if err != nil {
 		t.Fatal()
 	}
-	ss, err := NewScdoService(ctx, conf, log, consensusEngine, nil, -1,false)
+	ss, err := NewScdoService(ctx, conf, log, consensusEngine, nil, -1, false)
 	assert.Equal(t, err, nil)
 	return NewPublicScdoAPI(ss)
 }
@@ -279,6 +279,23 @@ func Test_EstimateGas(t *testing.T) {
 	estimateGas4, err10 := api.EstimateGas(callContractTx)
 	assert.NoError(t, err10)
 	assert.NotZero(t, estimateGas4)
+}
+
+func Test_Syncing(t *testing.T) {
+	dbPath := filepath.Join(common.GetTempFolder(), ".Syncing")
+	api := newTestAPI(t, dbPath)
+	defer func() {
+		api.s.Stop()
+		os.RemoveAll(dbPath)
+	}()
+
+	prog, err := api.Syncing()
+	assert.Nil(t, err)
+	assert.NotNil(t, prog)
+	assert.Equal(t, false, prog.Syncing)
+	assert.Equal(t, api.s.chain.CurrentBlock().Header.Height, prog.Current)
+	assert.Equal(t, prog.Current, prog.Highest)
+	assert.Equal(t, "0s", prog.ETA)
 }
 
 func Test_GetInfo(t *testing.T) {

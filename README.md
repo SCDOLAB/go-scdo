@@ -90,7 +90,9 @@ Tagged releases `v*` (including `v2.0.0`) build Linux and Windows `node` and `cl
 
 # Run SCDO
 
-SCDO Classic is a fork coin. A fresh node starts at fork genesis height 2979594. That height is the chain start, not a snapshot and not a bug. The node then full-syncs later blocks and logs current height, peer target, blocks/min and ETA.
+SCDO Classic is a fork coin. A fresh node starts at fork genesis height 2979594. That height is the chain start, not a snapshot and not a bug. The node then full-syncs later blocks (headers first, block bodies in parallel from several peers) and logs current height, peer target, blocks/min, blk/s and a smoothed ETA.
+
+`scdo_syncing` returns `current`, `highest`, `blkPerSec`, `eta`, `peers` and `syncing` for a wallet progress overlay. `--dbcache N` sets the chain LevelDB cache in megabytes. The default is 512 while the chain directory is still small and 128 after it grows. Public seed nodes are built in, and a peer that stays much slower than the others is disconnected.
 
 First run:
 
