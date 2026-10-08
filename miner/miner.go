@@ -192,6 +192,13 @@ func (miner *Miner) Start() error {
 
 	miner.stopChan = make(chan struct{})
 
+	if miner.scdo == nil || miner.scdo.BlockChain() == nil {
+		return fmt.Errorf("miner has no blockchain")
+	}
+	if miner.engine == nil {
+		return fmt.Errorf("miner has no consensus engine")
+	}
+
 	if istanbul, ok := miner.engine.(consensus.Istanbul); ok {
 		if err := istanbul.Start(miner.scdo.BlockChain(), miner.scdo.BlockChain().CurrentBlock, nil); err != nil {
 			panic(fmt.Sprintf("failed to start istanbul engine: %v", err))
@@ -333,10 +340,20 @@ func newHeaderByParent(parent *types.Block, coinbase common.Address, timestamp i
 func (miner *Miner) prepareNewBlock(recv chan *types.Block) error {
 	miner.log.Debug("starting mining the new block")
 
+	if miner.scdo == nil || miner.scdo.BlockChain() == nil {
+		return fmt.Errorf("miner has no blockchain")
+	}
+	if miner.engine == nil {
+		return fmt.Errorf("miner has no consensus engine")
+	}
+
 	timestamp := time.Now().Unix()
 	parent, stateDB, err := miner.scdo.BlockChain().GetCurrentInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get current info, %s", err)
+	}
+	if parent == nil || parent.Header == nil {
+		return fmt.Errorf("miner has no parent block")
 	}
 
 	if parent.Header.CreateTimestamp.Cmp(new(big.Int).SetInt64(timestamp)) >= 0 {
@@ -379,6 +396,9 @@ func (miner *Miner) prepareNewBlock(recv chan *types.Block) error {
 	if miner.poolMode {
 		miner.log.Info("create a new task for the pool, height:%d, difficult:%d", header.Height, header.Difficulty)
 		preBlock := miner.current.generateBlock()
+		if preBlock == nil || preBlock.Header == nil {
+			return fmt.Errorf("pool task has no block header")
+		}
 		miner.current.header = preBlock.Header.Clone()
 	} else {
 		miner.log.Info("committing a new task to engine, height:%d, difficult:%d", header.Height, header.Difficulty)

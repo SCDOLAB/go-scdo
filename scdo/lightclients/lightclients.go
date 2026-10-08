@@ -54,7 +54,7 @@ func NewLightClientManager(targetShard uint, context context.Context, config *no
 		copyConf.ScdoConfig.GenesisConfig.ShardNumber = shard
 
 		dbFolder := filepath.Join("db", fmt.Sprintf("lightchainforshard_%d", i))
-		clients[i], err = light.NewServiceClient(context, copyConf, log.GetLogger(fmt.Sprintf("lightclient_%d", i)), dbFolder, shard, engine)
+		clients[i], err = light.NewFullNodeHeaderClient(context, copyConf, log.GetLogger(fmt.Sprintf("lightclient_%d", i)), dbFolder, shard, engine)
 		if err != nil {
 			return nil, err
 		}

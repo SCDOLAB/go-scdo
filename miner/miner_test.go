@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/scdoproject/go-scdo/common"
-	"github.com/scdoproject/go-scdo/consensus/factory"
+	"github.com/scdoproject/go-scdo/consensus/pow"
 	"github.com/scdoproject/go-scdo/core"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/crypto"
@@ -121,7 +121,7 @@ func minerPackWithVerifier(t *testing.T, verifier types.DebtVerifier) {
 
 	// init miner
 	coinbase := *crypto.MustGenerateShardAddress(types.TestGenesisShard)
-	miner := NewMiner(coinbase, backend, verifier, factory.MustGetConsensusEngine(common.Sha256Algorithm))
+	miner := NewMiner(coinbase, nil, backend, verifier, pow.NewEngine(1), false)
 	miner.log.SetLevel(logrus.WarnLevel)
 	miner.mining = 1
 
@@ -170,7 +170,7 @@ func mineNewBlock(t *testing.T, miner *Miner) *types.Block {
 	wg.Wait()
 
 	bc := miner.scdo.BlockChain()
-	err = bc.WriteBlock(resultBlock)
+	err = bc.WriteBlock(resultBlock, nil)
 	assert.Nil(t, err)
 	oldHeader := bc.GetHeaderByHeight(resultBlock.Header.Height - 1).Hash()
 	miner.scdo.TxPool().HandleChainHeaderChanged(resultBlock.HeaderHash, oldHeader)
@@ -180,7 +180,7 @@ func mineNewBlock(t *testing.T, miner *Miner) *types.Block {
 }
 
 func createMiner() *Miner {
-	return NewMiner(defaultMinerAddr, scdo, nil, factory.MustGetConsensusEngine(common.Sha256Algorithm))
+	return NewMiner(defaultMinerAddr, nil, scdo, nil, pow.NewEngine(1), false)
 }
 
 func checkMinerMembers(miner *Miner, addr common.Address, scdo ScdoBackend, t *testing.T) {

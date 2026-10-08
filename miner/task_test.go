@@ -108,7 +108,7 @@ func testWithBackend(verifier types.DebtVerifier, t *testing.T) (*types.Block, *
 	assert.Equal(t, err, nil)
 
 	log := log.GetLogger("test_task")
-	err = task.applyTransactionsAndDebts(backend, state, log)
+	err = task.applyTransactionsAndDebts(backend, state, bc.AccountDB(), log)
 	assert.Equal(t, err, nil)
 
 	block := task.generateBlock()
@@ -126,7 +126,7 @@ func testWithBackend(verifier types.DebtVerifier, t *testing.T) (*types.Block, *
 
 	wg.Wait()
 
-	err = bc.WriteBlock(resultBlock)
+	err = bc.WriteBlock(resultBlock, nil)
 	assert.Equal(t, nil, err)
 
 	return resultBlock, debtPool

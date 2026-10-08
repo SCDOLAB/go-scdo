@@ -6,6 +6,7 @@
 package miner
 
 import (
+	"fmt"
 	"math/big"
 	"time"
 
@@ -42,6 +43,9 @@ func NewTask(header *types.BlockHeader, coinbase common.Address, verifier types.
 
 // applyTransactionsAndDebts TODO need to check more about the transactions, such as gas limit
 func (task *Task) applyTransactionsAndDebts(scdo ScdoBackend, statedb *state.Statedb, accountStateDB database.Database, log *log.ScdoLog) error {
+	if task == nil || task.header == nil {
+		return fmt.Errorf("mining task has no header")
+	}
 	now := time.Now()
 	// entrance
 	memory.Print(log, "task applyTransactionsAndDebts entrance", now, false)
@@ -82,6 +86,9 @@ func (task *Task) chooseDebts(scdo ScdoBackend, statedb *state.Statedb, log *log
 	memory.Print(log, "task chooseDebts entrance", now, false)
 
 	size := core.BlockByteLimit
+	if task == nil || task.header == nil || scdo == nil || scdo.BlockChain() == nil || scdo.DebtPool() == nil {
+		return size
+	}
 
 	for size > 0 {
 		debts, _ := scdo.DebtPool().GetProcessableDebts(size)
@@ -90,6 +97,9 @@ func (task *Task) chooseDebts(scdo ScdoBackend, statedb *state.Statedb, log *log
 		}
 
 		canonicalHeadBlock := scdo.BlockChain().CurrentBlock()
+		if canonicalHeadBlock == nil || canonicalHeadBlock.Header == nil {
+			return size
+		}
 		preHeader, err := scdo.BlockChain().GetStore().GetBlockHeader(task.header.PreviousBlockHash)
 		if err != nil {
 			return size
@@ -145,6 +155,9 @@ func (task *Task) chooseTransactions(scdo ScdoBackend, statedb *state.Statedb, l
 	now := time.Now()
 	// entrance
 	memory.Print(log, "task chooseTransactions entrance", now, false)
+	if task == nil || task.header == nil || scdo == nil || scdo.TxPool() == nil || scdo.BlockChain() == nil {
+		return
+	}
 
 	txIndex := 1 // the first tx is miner reward
 
@@ -184,6 +197,9 @@ func (task *Task) chooseTransactions(scdo ScdoBackend, statedb *state.Statedb, l
 
 // generateBlock builds a block from task
 func (task *Task) generateBlock() *types.Block {
+	if task == nil || task.header == nil {
+		return nil
+	}
 	return types.NewBlock(task.header, task.txs, task.receipts, task.debts)
 }
 

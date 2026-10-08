@@ -168,6 +168,26 @@ func (o *odrBackend) retrieveWithFilter(request odrRequest, filter peerFilter) (
 	}
 }
 
+// deliver hands a response to the ODR loop. After close it returns
+// errServiceQuited. The message channel stays open so a late handler cannot
+// panic by sending on a closed channel.
+func (o *odrBackend) deliver(msg *p2p.Message) error {
+	if o == nil || msg == nil {
+		return errServiceQuited
+	}
+	select {
+	case <-o.quitCh:
+		return errServiceQuited
+	default:
+	}
+	select {
+	case <-o.quitCh:
+		return errServiceQuited
+	case o.msgCh <- msg:
+		return nil
+	}
+}
+
 func (o *odrBackend) close() {
 	select {
 	case <-o.quitCh:
@@ -176,5 +196,4 @@ func (o *odrBackend) close() {
 	}
 
 	o.wg.Wait()
-	close(o.msgCh)
 }

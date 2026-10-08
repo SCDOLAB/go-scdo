@@ -55,6 +55,9 @@ func (lc *LightChain) noteVerified(header *types.BlockHeader) error {
 }
 
 func (lc *LightChain) pruneOne(head uint64) error {
+	if lc.retainAll {
+		return nil
+	}
 	return lc.pruneWindow(head, uint64(RetainedHeaders))
 }
 
@@ -67,6 +70,9 @@ func (lc *LightChain) pruneWindow(head, keep uint64) error {
 }
 
 func (lc *LightChain) pruneToWindow() error {
+	if lc.retainAll {
+		return nil
+	}
 	return lc.pruneTo(uint64(RetainedHeaders))
 }
 
@@ -142,6 +148,15 @@ func (lc *LightChain) prepareAccumulator() error {
 	if lc.db == nil || lc.currentHeader == nil || lc.currentHeader.Height < common.ScdoForkHeight {
 		return nil
 	}
+	if lc.retainAll {
+		restored, err := lc.restorePrunedHistory()
+		if err != nil {
+			return err
+		}
+		if restored {
+			return nil
+		}
+	}
 	loaded, err := loadChainMMR(lc.db)
 	if err != nil {
 		return err
@@ -156,6 +171,120 @@ func (lc *LightChain) prepareAccumulator() error {
 		return err
 	}
 	return lc.pruneToWindow()
+}
+
+// restorePrunedHistory rewinds a full-node header store that has already
+// dropped headers between fork genesis and the light tip. Only this shard's
+// light database is touched. The node's own full chain is left in place, and
+// the light client downloads the missing headers again from fork genesis.
+func (lc *LightChain) restorePrunedHistory() (bool, error) {
+	head := lc.currentHeader.Height
+	if head <= common.ScdoForkHeight {
+		return false, nil
+	}
+	if _, err := lc.bcStore.GetBlockHash(common.ScdoForkHeight + 1); err == nil {
+		return false, nil
+	} else if !isNotFound(err) {
+		return false, err
+	}
+
+	genesisHash, err := lc.bcStore.GetBlockHash(common.ScdoForkHeight)
+	if err != nil {
+		return false, errors.NewStackedError(err, "pruned header store is missing fork genesis")
+	}
+	genesisHeader, err := lc.bcStore.GetBlockHeader(genesisHash)
+	if err != nil {
+		return false, errors.NewStackedError(err, "pruned header store is missing the fork genesis header")
+	}
+	genesisTD, err := lc.bcStore.GetBlockTotalDifficulty(genesisHash)
+	if err != nil {
+		return false, errors.NewStackedError(err, "pruned header store is missing fork genesis difficulty")
+	}
+
+	lc.log.Info("other-shard header store was pruned below the local chain; rewinding light canonical head %d to fork genesis %d so the missing headers can be downloaded again", head, common.ScdoForkHeight)
+	for h := uint64(common.ScdoForkHeight) + 1; h <= head; h++ {
+		hash, hashErr := lc.bcStore.GetBlockHash(h)
+		if hashErr == nil {
+			if err = lc.bcStore.DeleteBlockHeader(hash); err != nil && !isNotFound(err) {
+				return false, err
+			}
+		} else if !isNotFound(hashErr) {
+			return false, hashErr
+		}
+		if _, err = lc.bcStore.DeleteBlockHash(h); err != nil && !isNotFound(err) {
+			return false, err
+		}
+		if lc.db != nil {
+			if err = lc.db.Delete(mmrSnapKey(h)); err != nil && !isNotFound(err) {
+				return false, err
+			}
+		}
+		if (h-common.ScdoForkHeight)%500000 == 0 {
+			lc.log.Info("rewinding pruned header index through height %d", h)
+		}
+	}
+	if err = lc.bcStore.PutHeadBlockHash(genesisHash); err != nil {
+		return false, err
+	}
+	lc.currentHeader = genesisHeader
+	lc.canonicalTD = genesisTD
+
+	fresh := &chainMMR{db: lc.db}
+	if err = fresh.commit(genesisHash, common.ScdoForkHeight); err != nil {
+		return false, err
+	}
+	lc.mmr = fresh
+	return true, nil
+}
+
+// dropCanonicalFrom removes canonical height mappings from height upward
+// until the first height that is not indexed. Header bodies stay; the next
+// WriteHeader records the new canonical hash. A gap is the end of the index,
+// not an error.
+func (lc *LightChain) dropCanonicalFrom(height uint64) error {
+	for h := height; ; h++ {
+		found, err := lc.bcStore.DeleteBlockHash(h)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+	}
+}
+
+// retargetCanonical points ancestor heights at this header's parent chain.
+// It stops when the stored canonical hash already matches, or when a header
+// below the parent is gone. A missing grandparent must not fail the sync.
+func (lc *LightChain) retargetCanonical(header *types.BlockHeader) error {
+	if header == nil {
+		return nil
+	}
+	parentHash := header.PreviousBlockHash
+	for !parentHash.IsEmpty() {
+		parent, err := lc.bcStore.GetBlockHeader(parentHash)
+		if err != nil {
+			if isNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if parent.Height <= common.ScdoForkHeight {
+			return nil
+		}
+		canon, err := lc.bcStore.GetBlockHash(parent.Height)
+		if err != nil && !isNotFound(err) {
+			return err
+		}
+		if err == nil && canon == parentHash {
+			return nil
+		}
+		if err = lc.bcStore.PutBlockHash(parent.Height, parentHash); err != nil {
+			return err
+		}
+		parentHash = parent.PreviousBlockHash
+	}
+	return nil
 }
 
 func (lc *LightChain) repair() error {

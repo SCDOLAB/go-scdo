@@ -42,8 +42,24 @@ type ServiceClient struct {
 	publishAPI bool
 }
 
-// NewServiceClient create ServiceClient
+// NewServiceClient create ServiceClient. The header store is pruned to the
+// retained window. Phones in lite mode and `node -l` use this.
 func NewServiceClient(ctx context.Context, conf *node.Config, log *log.ScdoLog, dbFolder string, shard uint, engine consensus.Engine) (s *ServiceClient, err error) {
+	return newServiceClient(ctx, conf, log, dbFolder, shard, engine, false)
+}
+
+// NewFullNodeHeaderClient is the other-shard header client used by a full
+// node. It keeps every header from fork genesis so cross-shard debts can be
+// checked while the local chain is still far behind the light tip.
+func NewFullNodeHeaderClient(ctx context.Context, conf *node.Config, log *log.ScdoLog, dbFolder string, shard uint, engine consensus.Engine) (s *ServiceClient, err error) {
+	s, err = newServiceClient(ctx, conf, log, dbFolder, shard, engine, true)
+	if err == nil && s != nil && log != nil {
+		log.Info("full node keeps every other-shard header for shard %d", shard)
+	}
+	return s, err
+}
+
+func newServiceClient(ctx context.Context, conf *node.Config, log *log.ScdoLog, dbFolder string, shard uint, engine consensus.Engine, retainAll bool) (s *ServiceClient, err error) {
 	s = &ServiceClient{
 		log:        log,
 		networkID:  conf.P2PConfig.NetworkID,
@@ -81,7 +97,7 @@ func NewServiceClient(ctx context.Context, conf *node.Config, log *log.ScdoLog, 
 		return nil, err
 	}
 
-	s.chain, err = newLightChain(bcStore, s.lightDB, s.odrBackend, engine)
+	s.chain, err = openLightChain(bcStore, s.lightDB, s.odrBackend, engine, retainAll)
 	if err != nil {
 		s.lightDB.Close()
 		s.odrBackend.close()
@@ -133,9 +149,18 @@ func (s *ServiceClient) Start(srvr *p2p.Server) error {
 
 // Stop implements node.Service, terminating all internal goroutines.
 func (s *ServiceClient) Stop() error {
-	s.scdoProtocol.Stop()
-	s.lightDB.Close()
-	s.odrBackend.close()
+	// Protocol handlers exit before the ODR channel is shut and the database
+	// is closed. Closing the database first left handlers sending on a closed
+	// ODR channel during SIGTERM.
+	if s.scdoProtocol != nil {
+		s.scdoProtocol.Stop()
+	}
+	if s.odrBackend != nil {
+		s.odrBackend.close()
+	}
+	if s.lightDB != nil {
+		s.lightDB.Close()
+	}
 	return nil
 }
 

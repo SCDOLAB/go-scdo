@@ -26,6 +26,10 @@ func newTestBlockchainDatabase(db database.Database) store.BlockchainStore {
 	return store.NewBlockchainDatabase(db)
 }
 
+// testCreator is fixed for the process so header hashes stay stable across
+// newTestBlockHeader calls. The old hard-coded 0x address is not a shard address.
+var testCreator = *crypto.MustGenerateRandomAddress()
+
 func newTestLightChain() (*LightChain, func(), error) {
 	db, dispose := leveldb.NewTestDatabase()
 	bcStore := newTestBlockchainDatabase(db)
@@ -43,7 +47,7 @@ func newTestLightChain() (*LightChain, func(), error) {
 func newTestBlockHeader() *types.BlockHeader {
 	return &types.BlockHeader{
 		PreviousBlockHash: common.EmptyHash,
-		Creator:           common.HexMustToAddres("0x55c76ac9f0d4de0efb11207cb67cf13f01357fc1"),
+		Creator:           testCreator,
 		StateHash:         common.StringToHash("StateHash"),
 		TxHash:            common.StringToHash("TxHash"),
 		Difficulty:        big.NewInt(1),

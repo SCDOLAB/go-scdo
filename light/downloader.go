@@ -255,6 +255,14 @@ func (d *Downloader) reverseLightBCstore(ancestor uint64) error {
 	if _, err = bcStore.GetBlockHash(ancestor); err != nil {
 		return errors.NewStackedErrorf(err, "common ancestor %d is outside the retained header window", ancestor)
 	}
+	// A gap in the canonical index used to delete the retained window on the
+	// way down and then fail, leaving the light store unable to restart.
+	// Refuse the rewind until every height in between is still stored.
+	for h := ancestor + 1; h <= localHeight; h++ {
+		if _, err = bcStore.GetBlockHash(h); err != nil {
+			return errors.NewStackedErrorf(err, "failed to reverse the light chain to height %d", ancestor)
+		}
+	}
 	d.log.Debug("lightchain START reverse local %d to Height: %d", localHeight, ancestor)
 	curHeight := localHeight
 	localHashes := make([]common.Hash, 0)

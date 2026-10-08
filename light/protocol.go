@@ -114,6 +114,9 @@ type LightProtocol struct {
 	odrBackend          *odrBackend
 	downloader          *Downloader
 	wg                  sync.WaitGroup
+	handlerWg           sync.WaitGroup
+	handlerMu           sync.Mutex
+	quitOnce            sync.Once
 	quitCh              chan struct{}
 	syncCh              chan struct{}
 	chainHeaderChangeCh chan common.Hash
@@ -162,15 +165,34 @@ func (lp *LightProtocol) Start() {
 	lp.log.Debug("LightProtocol.Start called!")
 	if !lp.bServerMode {
 		registerClientProtocol(lp)
+		lp.wg.Add(1)
 		go lp.syncer()
 	}
 }
 
 // Stop stops protocol, called when scdoService quits.
+// Handlers are waited out before the caller closes the ODR backend, and
+// syncCh is left open so a retry cannot send on a closed channel.
 func (lp *LightProtocol) Stop() {
 	unregisterClientProtocol(lp)
-	close(lp.quitCh)
-	close(lp.syncCh)
+	lp.handlerMu.Lock()
+	lp.quitOnce.Do(func() { close(lp.quitCh) })
+	lp.handlerMu.Unlock()
+	if lp.downloader != nil {
+		lp.downloader.cancel()
+	}
+	if lp.peerSet != nil {
+		for _, p := range lp.peerSet.getPeers() {
+			if p == nil {
+				continue
+			}
+			if p.Peer != nil {
+				p.Disconnect("shutdown")
+			}
+			p.close()
+		}
+	}
+	lp.handlerWg.Wait()
 	lp.wg.Wait()
 }
 
@@ -199,11 +221,15 @@ func (lp *LightProtocol) requestSync() {
 	if lp.bServerMode || lp.syncCh == nil || lp.downloader == nil {
 		return
 	}
+	select {
+	case <-lp.quitCh:
+		return
+	default:
+	}
 	if lp.downloader.syncStatus == statusDownloading {
 		return
 	}
 	select {
-	case <-lp.quitCh:
 	case lp.syncCh <- struct{}{}:
 	default:
 	}
@@ -213,7 +239,6 @@ func (lp *LightProtocol) requestSync() {
 func (lp *LightProtocol) syncer() {
 	defer lp.downloader.Terminate()
 	defer lp.wg.Done()
-	lp.wg.Add(1)
 
 	// Each shard header-syncs on its own. Poll on the base interval so a shard
 	// that aborted a session retries quickly instead of waiting a minute.
@@ -346,8 +371,25 @@ func (lp *LightProtocol) handleAddPeer(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) 
 
 	lp.log.Info("add peer %s -> %s to LightProtocol.", p2pPeer.LocalAddr(), p2pPeer.RemoteAddr())
 	lp.peerSet.Add(newPeer)
-	go lp.handleMsg(newPeer)
+	lp.spawnHandler(newPeer)
 	return true
+}
+
+// spawnHandler runs a peer read loop that Stop waits for. A handler started
+// after Stop is refused so Wait cannot race with Add.
+func (lp *LightProtocol) spawnHandler(p *peer) {
+	lp.handlerMu.Lock()
+	defer lp.handlerMu.Unlock()
+	select {
+	case <-lp.quitCh:
+		return
+	default:
+	}
+	lp.handlerWg.Add(1)
+	go func() {
+		defer lp.handlerWg.Done()
+		lp.handleMsg(p)
+	}()
 }
 
 func (lp *LightProtocol) handleGetPeer(address common.Address) interface{} {
@@ -472,7 +514,9 @@ handler:
 		}
 
 		if bNeedDeliverOdr {
-			lp.odrBackend.msgCh <- msg
+			if err := lp.odrBackend.deliver(msg); err != nil {
+				break handler
+			}
 		}
 	}
 

@@ -34,10 +34,21 @@ type LightChain struct {
 	headerChangedEventManager *event.EventManager
 	headRollbackEventManager  *event.EventManager
 	log                       *log.ScdoLog
+	// retainAll keeps every verified header. Full nodes need other-shard
+	// headers back to fork genesis so debt checks can see the heights their
+	// own chain is still validating. Phones in lite mode leave this false
+	// and keep only the recent window.
+	retainAll bool
 }
 
-// newLightChain create light chain
+// newLightChain create light chain. Phone lite mode prunes to the retained window.
 func newLightChain(bcStore store.BlockchainStore, lightDB database.Database, odrBackend *odrBackend, engine consensus.Engine) (*LightChain, error) {
+	return openLightChain(bcStore, lightDB, odrBackend, engine, false)
+}
+
+// openLightChain create light chain. retainAll is set before the accumulator
+// runs so a full node neither prunes nor refuses to rebuild a pruned store.
+func openLightChain(bcStore store.BlockchainStore, lightDB database.Database, odrBackend *odrBackend, engine consensus.Engine, retainAll bool) (*LightChain, error) {
 	chain := &LightChain{
 		bcStore:                   bcStore,
 		db:                        lightDB,
@@ -46,6 +57,7 @@ func newLightChain(bcStore store.BlockchainStore, lightDB database.Database, odr
 		headerChangedEventManager: event.NewEventManager(),
 		headRollbackEventManager:  event.NewEventManager(),
 		log:                       log.GetLogger("LightChain"),
+		retainAll:                 retainAll,
 	}
 
 	currentHeaderHash, err := bcStore.GetHeadBlockHash()
@@ -156,20 +168,25 @@ func (lc *LightChain) WriteHeader(header *types.BlockHeader) error {
 		}
 	}
 
+	// Header rows have no body. The full-chain stale-block walk looks one
+	// header below the parent and aborts when that header was pruned, which
+	// stalled sync with "failed to overwrite stale blocks in old canonical
+	// chain". Update the height index directly and stop at the first gap.
+	if isHead {
+		if err = lc.retargetCanonical(header); err != nil {
+			return err
+		}
+		if err = lc.dropCanonicalFrom(header.Height); err != nil {
+			return errors.NewStackedErrorf(err, "failed to clear canonical headers from height %d", header.Height)
+		}
+	}
+
 	if err := lc.bcStore.PutBlockHeader(header.Hash(), header, currentTd, isHead); err != nil {
 		return errors.NewStackedErrorf(err, "failed to put block header, header = %+v", header)
 	}
 
 	if !isHead {
 		return nil
-	}
-
-	if err := core.DeleteLargerHeightBlocks(lc.bcStore, header.Height+1, nil); err != nil {
-		return errors.NewStackedErrorf(err, "failed to delete larger height blocks in canonical chain, height = %v", header.Height+1)
-	}
-
-	if err := core.OverwriteStaleBlocks(lc.bcStore, header.PreviousBlockHash, nil); err != nil {
-		return errors.NewStackedErrorf(err, "failed to overwrite stale blocks in old canonical chain, hash = %v", header.PreviousBlockHash)
 	}
 
 	lc.canonicalTD = currentTd
