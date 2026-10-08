@@ -69,6 +69,10 @@ type BasicConfig struct {
 
 	// MinerAlgorithm miner algorithm
 	MinerAlgorithm string `json:"algorithm"`
+
+	// DbCache is the chain database block cache in megabytes.
+	// 0 uses the 64 MiB phone and HDD profile (bloom filter, 8 MiB tables, no per-table fsync).
+	DbCache int `json:"dbcache"`
 }
 
 // HTTPServer config for http server

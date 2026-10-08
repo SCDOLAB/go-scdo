@@ -26,6 +26,7 @@ type DebtPool struct {
 	*Pool
 	verifier         types.DebtVerifier
 	toConfirmedDebts *ConcurrentDebtMap
+	shard            uint
 }
 
 // NewDebtPool creates and returns a new debt pool
@@ -142,9 +143,25 @@ func (dp *DebtPool) DoMulCheckingDebt() error {
 	return err
 }
 
+// SetShard pins debt checks to one chain. Zero keeps common.LocalShardNumber,
+// which is what the unit tests set.
+func (dp *DebtPool) SetShard(shard uint) {
+	if dp == nil {
+		return
+	}
+	dp.shard = shard
+}
+
+func (dp *DebtPool) localShard() uint {
+	if dp != nil && dp.shard > 0 {
+		return dp.shard
+	}
+	return common.LocalShardNumber
+}
+
 // DoMulCheckingDebtHandler DoMulCheckingDebt handler
 func (dp *DebtPool) DoMulCheckingDebtHandler(d *types.Debt) error {
-	recoverable, err := d.Validate(dp.verifier, false, common.LocalShardNumber)
+	recoverable, err := d.Validate(dp.verifier, false, dp.localShard())
 	if err != nil {
 		if recoverable || debtSourceNotReady(err) {
 			dp.log.Debug("check debt waiting on source shard: %s", err)
@@ -176,7 +193,7 @@ func debtSourceNotReady(err error) bool {
 func (dp *DebtPool) DoCheckingDebt() {
 	tmp := dp.toConfirmedDebts.items()
 	for h, d := range tmp {
-		recoverable, err := d.Validate(dp.verifier, false, common.LocalShardNumber)
+		recoverable, err := d.Validate(dp.verifier, false, dp.localShard())
 		if err != nil {
 			if recoverable || debtSourceNotReady(err) {
 				dp.log.Debug("check debt waiting on source shard: %s", err)

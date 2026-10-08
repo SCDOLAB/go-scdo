@@ -89,6 +89,16 @@ type Blockchain struct {
 	debtVerifier types.DebtVerifier
 
 	lastBlockTime time.Time // last sucessful written block time.
+
+	// shard is the genesis shard. It stays 0 for test chains so validation
+	// keeps using common.LocalShardNumber. A phone running several full
+	// shards sets it so each chain checks its own shard.
+	shard uint
+
+	// indexFile records the last height whose height-to-hash map was checked.
+	indexFile     string
+	indexVerified uint64
+	indexMu       sync.Mutex
 }
 
 // NewBlockchain returns an initialized blockchain with the given store and account state DB.
@@ -125,6 +135,9 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 	if err != nil {
 		return nil, errors.NewStackedErrorf(err, "failed to get genesis block by hash %v", genesisHash)
 	}
+	if shard, shardErr := bc.GetShardNumber(); shardErr == nil {
+		bc.shard = shard
+	}
 
 	// Get the HEAD block from store
 	var currentHeaderHash common.Hash
@@ -154,8 +167,35 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 	bc.currentBlock.Store(currentBlock)
 	bc.log.Info("SCDO Classic chain starts at fork genesis height %d (full history after the fork, not a snapshot). current head height %d", genesisBlockHeight, currentBlock.Header.Height)
 
-	// recover height-to-block mapping
-	bc.recoverHeightIndices()
+	// recover height-to-block mapping. A clean checkpoint skips heights that
+	// were already checked. This does not skip block verification on sync.
+	bc.indexFile = indexCheckpointPath(recoveryPointFile)
+	cp := loadIndexCheckpoint(bc.indexFile)
+	floor := indexScanFloor(cp, currentBlock.Header.Height)
+	// A crash from here on is an unclean shutdown, including a crash during
+	// this scan. The previous clean height is what this scan trusts.
+	if bc.indexFile != "" && cp.Clean {
+		bc.indexMu.Lock()
+		bc.indexVerified = cp.VerifiedHeight
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: cp.VerifiedHeight, Clean: false})
+		bc.indexMu.Unlock()
+	}
+	if bc.indexFile == "" {
+		bc.log.Info("checking blockchain database from %d down to fork height %d", currentBlock.Header.Height, floor)
+	} else if floor == uint64(common.SecondForkHeight) {
+		bc.log.Info("height index checkpoint missing or last shutdown was not clean; checking blockchain database from %d down to fork height %d", currentBlock.Header.Height, floor)
+	} else if floor >= currentBlock.Header.Height {
+		bc.log.Info("height index checkpoint %d is clean; skipping the height-index scan", floor)
+	} else {
+		bc.log.Info("height index checkpoint %d is clean; checking blockchain database from %d down to %d", floor, currentBlock.Header.Height, floor)
+	}
+	bc.recoverHeightIndices(floor)
+	if bc.indexFile != "" {
+		bc.indexMu.Lock()
+		bc.indexVerified = currentBlock.Header.Height
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: bc.indexVerified, Clean: false})
+		bc.indexMu.Unlock()
+	}
 
 	td, err := bcStore.GetBlockTotalDifficulty(currentHeaderHash)
 	if err != nil {
@@ -174,7 +214,12 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 // most every recoveryFlushInterval, without an fsync. Node shutdown calls this
 // so the last marker is durable before the databases close.
 func (bc *Blockchain) FlushRecovery() {
-	if bc == nil || bc.rp == nil {
+	if bc == nil {
+		return
+	}
+	bc.log.Info("flushing recoveryPoint and height-index checkpoint")
+	bc.markIndexClean()
+	if bc.rp == nil {
 		return
 	}
 	bc.rp.flush()
@@ -446,6 +491,9 @@ func (bc *Blockchain) doWriteBlock(block *types.Block, pool *Pool) error {
 	}
 
 	bc.lastBlockTime = time.Now()
+	if isHead {
+		bc.noteIndexVerified(block.Header.Height)
+	}
 
 	return nil
 }
@@ -472,10 +520,12 @@ func (bc *Blockchain) validateBlock(block *types.Block) error {
 		return ErrBlockTooManyTxs
 	}
 
-	// Validate miner shard
+	// Validate miner shard. Prefer this chain's genesis shard so several full
+	// shards can validate in one process.
 	if common.IsShardEnabled() {
-		if shard := block.GetShardNumber(); shard != common.LocalShardNumber {
-			return fmt.Errorf("invalid shard number. block shard number is [%v], but local shard number is [%v]", shard, common.LocalShardNumber)
+		local := bc.shardNumber()
+		if shard := block.GetShardNumber(); shard != local {
+			return fmt.Errorf("invalid shard number. block shard number is [%v], but local shard number is [%v]", shard, local)
 		}
 	}
 
@@ -526,7 +576,7 @@ func (bc *Blockchain) applyTxs(block *types.Block, root common.Hash) (*state.Sta
 	}
 
 	//validate debts
-	err = types.BatchValidateDebt(block.Debts, bc.debtVerifier)
+	err = types.BatchValidateDebtOnShard(block.Debts, bc.debtVerifier, bc.shardNumber())
 	if err != nil {
 		return nil, nil, errors.NewStackedError(err, "failed to batch validate debt")
 	}
@@ -578,7 +628,7 @@ func (bc *Blockchain) applyRewardAndRegularTxs(statedb *state.Statedb, rewardTx 
 	auditor.Audit("succeed to validate and apply reward tx")
 
 	// batch validate signature to improve perf
-	if err := types.BatchValidateTxs(regularTxs); err != nil {
+	if err := types.BatchValidateTxsOnShard(regularTxs, bc.shardNumber()); err != nil {
 		return nil, errors.NewStackedErrorf(err, "failed to batch validate %v txs", len(regularTxs))
 	}
 	auditor.Audit("succeed to batch validate (signature) %v txs", len(regularTxs))
@@ -856,6 +906,22 @@ func overwriteSingleStaleBlock(bcStore store.BlockchainStore, hash common.Hash) 
 	return true, header.PreviousBlockHash, nil
 }
 
+// ChainShard is the genesis shard cached at startup. It is 0 when genesis
+// does not name a shard, and validation then uses common.LocalShardNumber.
+func (bc *Blockchain) ChainShard() uint {
+	if bc == nil {
+		return 0
+	}
+	return bc.shard
+}
+
+func (bc *Blockchain) shardNumber() uint {
+	if bc != nil && bc.shard > 0 {
+		return bc.shard
+	}
+	return common.LocalShardNumber
+}
+
 // GetShardNumber returns the shard number of blockchain.
 func (bc *Blockchain) GetShardNumber() (uint, error) {
 	data, err := getShardInfo(bc.genesisBlock)
@@ -880,9 +946,8 @@ func (bc *Blockchain) GetHeadRollbackEventManager() *event.EventManager {
 }
 
 // recoverHeightIndices examines the previous blockchain data to make sure
-// no data is missing
-func (bc *Blockchain) recoverHeightIndices() {
-	bc.log.Info("checking blockchain database...")
+// no data is missing. floor is the last height already known to be indexed.
+func (bc *Blockchain) recoverHeightIndices(floor uint64) {
 	curBlock := bc.CurrentBlock()
 	curHeight := curBlock.Header.Height
 	chainHeight := curHeight
@@ -890,7 +955,7 @@ func (bc *Blockchain) recoverHeightIndices() {
 	numGetBlockByHeight := 0
 	numGetBlockByHash := 0
 	numIrrecoverable := 0
-	for curHeight > common.SecondForkHeight {
+	for curHeight > floor {
 		bc.log.Debug("checking blockchain database, height: %d", curHeight)
 		if curBlock, err := bc.bcStore.GetBlockByHeight(curHeight); err != nil {
 			bc.log.Error("height: %d, can't get block by height.", curHeight)

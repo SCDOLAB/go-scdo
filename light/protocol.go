@@ -147,6 +147,7 @@ func NewLightProtocol(networkID string, txPool TransactionPool, debtPool *core.D
 
 	if !serverMode {
 		s.downloader = newDownloader(chain)
+		s.downloader.onSessionDone = s.onDownloadDone
 	}
 
 	s.Protocol.AddPeer = s.handleAddPeer
@@ -160,15 +161,52 @@ func NewLightProtocol(networkID string, txPool TransactionPool, debtPool *core.D
 func (lp *LightProtocol) Start() {
 	lp.log.Debug("LightProtocol.Start called!")
 	if !lp.bServerMode {
+		registerClientProtocol(lp)
 		go lp.syncer()
 	}
 }
 
 // Stop stops protocol, called when scdoService quits.
 func (lp *LightProtocol) Stop() {
+	unregisterClientProtocol(lp)
 	close(lp.quitCh)
 	close(lp.syncCh)
 	lp.wg.Wait()
+}
+
+func (lp *LightProtocol) onDownloadDone(started bool, local, peer uint64) {
+	paused, _ := SyncPause()
+	if !shouldRetrySession(started, local, peer, paused) {
+		return
+	}
+	lp.log.Info("lightchain, shard: %d, session ended at verified height %d, peer %d; retrying", lp.shard, local, peer)
+	time.AfterFunc(flakyRetryInterval, func() {
+		select {
+		case <-lp.quitCh:
+			return
+		default:
+		}
+		if paused, _ := SyncPause(); paused {
+			return
+		}
+		lp.requestSync()
+	})
+}
+
+// requestSync asks the header syncer to catch the best peer. A sync that is
+// already running is left alone. The send never blocks.
+func (lp *LightProtocol) requestSync() {
+	if lp.bServerMode || lp.syncCh == nil || lp.downloader == nil {
+		return
+	}
+	if lp.downloader.syncStatus == statusDownloading {
+		return
+	}
+	select {
+	case <-lp.quitCh:
+	case lp.syncCh <- struct{}{}:
+	default:
+	}
 }
 
 // syncer try to synchronise with remote peer
@@ -177,7 +215,9 @@ func (lp *LightProtocol) syncer() {
 	defer lp.wg.Done()
 	lp.wg.Add(1)
 
-	forceSync := time.NewTicker(forceSyncInterval * 5)
+	// Each shard header-syncs on its own. Poll on the base interval so a shard
+	// that aborted a session retries quickly instead of waiting a minute.
+	forceSync := time.NewTicker(forceSyncInterval)
 	lp.log.Debug("lp with peerset size %d", len(lp.peerSet.getPeers()))
 	for {
 		select {
@@ -192,6 +232,14 @@ func (lp *LightProtocol) syncer() {
 }
 
 func (lp *LightProtocol) synchronise(peers []*peer) {
+	if paused, reason := SyncPause(); paused {
+		height := uint64(0)
+		if header := lp.chain.CurrentHeader(); header != nil {
+			height = header.Height
+		}
+		lp.log.Info("lightchain, shard: %d, sync paused (%s), verified height %d kept", lp.shard, reason, height)
+		return
+	}
 
 	hash, err := lp.chain.GetStore().GetHeadBlockHash()
 	if err != nil {
@@ -221,7 +269,7 @@ func (lp *LightProtocol) synchronise(peers []*peer) {
 	}
 
 	bestPeer := peers[0]
-	lp.log.Info("lightchain, shard: %d, local height: %d, best peer: %v, peer height: %d", lp.shard, localCurHeader.Height, bestPeer.peerID, bestPeer.headBlockNum)
+	lp.log.Info("lightchain, shard: %d, resuming from verified height %d, best peer: %v, peer height: %d", lp.shard, localCurHeader.Height, bestPeer.peerID, bestPeer.headBlockNum)
 
 	for _, p := range peers {
 		_, pTd := p.Head()
@@ -347,19 +395,29 @@ handler:
 
 		case announceCode:
 			var query AnnounceBody
-			if time.Now().Unix()-peer.lastAnnounceCodeTime < 60 {
-				lp.log.Warn("peer lastAnnounceCode less than 60s, peer:%s", peer.peerStrID)
-				break handler
-			}
 			err := common.Deserialize(msg.Payload, &query)
 			if err != nil {
 				lp.log.Error("failed to deserialize Announce, quit! %s", err)
 				break handler
 			}
+			var localHeight uint64
+			if header := lp.chain.CurrentHeader(); header != nil {
+				localHeight = header.Height
+			}
+			// Repeat announces that do not move the head are ignored. A peer
+			// that is ahead is handled immediately so a phone stays on the
+			// latest header instead of waiting out a long quiet period.
+			if query.CurrentBlockNum <= localHeight && peer.lastAnnounceCodeTime != 0 && time.Now().Unix()-peer.lastAnnounceCodeTime < 8 {
+				break handler
+			}
+			peer.lastAnnounceCodeTime = time.Now().Unix()
 			lp.log.Debug("handle msg announce code, peer:%s", peer.peerStrID)
 			if err := peer.handleAnnounce(&query); err != nil {
 				lp.log.Error("failed to handleAnnounce, quit! %s", err)
 				break handler
+			}
+			if query.CurrentBlockNum > localHeight {
+				lp.requestSync()
 			}
 
 		case syncHashRequestCode:

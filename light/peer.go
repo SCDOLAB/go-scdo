@@ -124,6 +124,13 @@ func (p *peer) Info() *PeerInfo {
 }
 
 // Head retrieves a copy of the current head hash and total difficulty.
+// HeadHeight is the peer's announced canonical height.
+func (p *peer) HeadHeight() uint64 {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return p.headBlockNum
+}
+
 func (p *peer) Head() (hash common.Hash, td *big.Int) {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
@@ -444,8 +451,14 @@ func (p *peer) sendAnnounce(magic uint32, begin uint64, end uint64) error {
 
 		curBlock, err := chain.GetStore().GetBlockByHeight(curNum)
 		if err != nil {
-			p.log.Error("Load block error: %s", err)
-			return err
+			// A pruned light chain no longer has this sample. Skip it and
+			// keep walking toward begin. begin itself is fork genesis and
+			// stays on disk for the handshake.
+			if curNum == begin || power2 > uint64(1)<<62 {
+				p.log.Error("Load block error: %s", err)
+				return err
+			}
+			continue
 		}
 
 		numArr = append(numArr, curNum)

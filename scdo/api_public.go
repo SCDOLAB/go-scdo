@@ -20,6 +20,7 @@ import (
 	"github.com/scdoproject/go-scdo/core/state"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/crypto"
+	"github.com/scdoproject/go-scdo/scdo/download"
 )
 
 // PublicScdoAPI provides an API to access full node-related information.
@@ -59,6 +60,65 @@ func (api *PublicScdoAPI) EstimateGas(tx *types.Transaction) (uint64, error) {
 		return 0, errors.New(string(receipt.Result))
 	}
 	return receipt.UsedGas, nil
+}
+
+// Syncing returns the wallet sync overlay: current height, peer target,
+// smoothed blocks/sec, ETA and connected peers. syncing is false once
+// current has reached highest. This is a full sync from fork genesis;
+// there is no snapshot or assumevalid shortcut.
+func (api *PublicScdoAPI) Syncing() (*downloader.SyncProgress, error) {
+	prog := &downloader.SyncProgress{ETA: "0s"}
+	if api.s == nil || api.s.scdoProtocol == nil || api.s.scdoProtocol.downloader == nil {
+		return prog, nil
+	}
+	got := api.s.scdoProtocol.downloader.Progress()
+	peers := api.s.scdoProtocol.peerSet.getPeerCountByShard(common.LocalShardNumber)
+	if peers > got.Peers {
+		got.Peers = peers
+	}
+	got.Shards = api.shardSync()
+	return &got, nil
+}
+
+// shardHeights is implemented by the light-client manager. The method is not
+// part of DebtVerifier, so a test verifier does not have to provide it.
+type shardHeights interface {
+	ShardHeights() []types.ShardHeight
+}
+
+func (api *PublicScdoAPI) shardSync() []downloader.ShardSync {
+	if api.s == nil || api.s.chain == nil || api.s.chain.CurrentBlock() == nil {
+		return nil
+	}
+	full := downloader.ShardSync{
+		Shard:  common.LocalShardNumber,
+		Height: api.s.chain.CurrentBlock().Header.Height,
+		Mode:   "full",
+	}
+	if api.s.scdoProtocol != nil {
+		full.Peers = api.s.scdoProtocol.peerSet.getPeerCountByShard(common.LocalShardNumber)
+	}
+	shards := []downloader.ShardSync{full}
+	if api.s.debtVerifier == nil {
+		return shards
+	}
+	src, ok := api.s.debtVerifier.(shardHeights)
+	if !ok {
+		return shards
+	}
+	for _, h := range src.ShardHeights() {
+		peers := 0
+		if api.s.scdoProtocol != nil {
+			peers = api.s.scdoProtocol.peerSet.getPeerCountByShard(h.Shard)
+		}
+		shards = append(shards, downloader.ShardSync{
+			Shard:  h.Shard,
+			Height: h.Height,
+			Mode:   "headers",
+			Peers:  peers,
+		})
+	}
+	return shards
 }
 
 // GetInfo gets the account address that mining rewards will be send to.

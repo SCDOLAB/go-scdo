@@ -10,11 +10,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
@@ -61,6 +62,9 @@ var (
 
 	// dataDirFlag overrides basic.dataDir. Absolute paths are used as-is.
 	dataDirFlag string
+
+	// dbCacheFlag overrides basic.dbcache, in megabytes. 0 keeps the automatic size.
+	dbCacheFlag int
 )
 
 // startCmd represents the start command
@@ -72,7 +76,6 @@ var startCmd = &cobra.Command{
 		start a node.`,
 
 	Run: func(cmd *cobra.Command, args []string) {
-		var wg sync.WaitGroup
 		nCfg, err := LoadConfigFromFile(scdoNodeConfigFile, accountsConfig, poolAccountsConfig)
 		if err != nil {
 			fmt.Printf("failed to reading the config file: %s\n", err.Error())
@@ -135,13 +138,23 @@ var startCmd = &cobra.Command{
 		}
 
 		if lightNode {
-			lightService, err := light.NewServiceClient(ctx, nCfg, lightLog, common.LightChainDir, scdoNode.GetShardNumber(), engine)
+			fmt.Printf("Header-syncing shards 1-%d from fork genesis %d. Every header is checked with ZPoW. There is no snapshot. After verification only the last %d headers per shard are kept, plus a hash accumulator. light_getBalance, light_getTxProof and light_getDebtProof return Merkle proofs.\n",
+				common.ShardCount, common.ScdoForkHeight, light.RetainedHeaders)
+			clients, err := light.OpenShards(ctx, nCfg, engine)
 			if err != nil {
 				fmt.Println("Create light service error.", err.Error())
 				return
 			}
-
-			if err := scdoNode.Register(lightService); err != nil {
+			for _, client := range clients {
+				if client == nil {
+					continue
+				}
+				if err := scdoNode.Register(client); err != nil {
+					fmt.Println(err.Error())
+					return
+				}
+			}
+			if err := scdoNode.Register(light.NewMultiService(clients)); err != nil {
 				fmt.Println(err.Error())
 				return
 			}
@@ -158,6 +171,8 @@ var startCmd = &cobra.Command{
 				fmt.Printf("create light client manager failed. %s", err)
 				return
 			}
+			fmt.Printf("Full-syncing shard %d and header-syncing the other shards in parallel. A cross-shard debt waits until the source shard has %d confirmations. Mining needs -m start and a coinbase on shard %d.\n",
+				scdoNode.GetShardNumber(), common.ConfirmedBlockNumber, scdoNode.GetShardNumber())
 
 			// fullnode mode
 			scdoService, err := scdo.NewScdoService(ctx, nCfg, scdolog, engine, manager, startHeight, isPoolMode)
@@ -248,9 +263,54 @@ var startCmd = &cobra.Command{
 			)
 		}
 
-		wg.Add(1)
-		wg.Wait()
+		// Block until SIGINT or SIGTERM, then flush recoveryPoint, nodes.json
+		// and blockList and close the databases. systemd's default stop is
+		// SIGTERM; without this the process dies before those files are written.
+		if err := waitForSignalAndStop(scdoNode, scdolog, shutdownTimeout); err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
 	},
+}
+
+const shutdownTimeout = 20 * time.Second
+
+// waitForSignalAndStop blocks until SIGINT or SIGTERM, then stops the node.
+// stop is given timeout to flush and close. The error is a timeout.
+func waitForSignalAndStop(n *node.Node, lg *log.ScdoLog, timeout time.Duration) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	sig := <-sigCh
+	msg := fmt.Sprintf("received %s, shutting down", sig)
+	fmt.Println(msg)
+	if lg != nil {
+		lg.Info(msg)
+	}
+	err := stopWithin(timeout, n.Stop)
+	if err != nil {
+		return err
+	}
+	fmt.Println("shutdown complete")
+	if lg != nil {
+		lg.Info("shutdown complete")
+	}
+	return nil
+}
+
+// stopWithin runs stop and returns an error if it is still running after timeout.
+func stopWithin(timeout time.Duration, stop func() error) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- stop()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("shutdown timed out after %s", timeout)
+	}
 }
 
 func init() {
@@ -261,11 +321,12 @@ func init() {
 
 	startCmd.Flags().StringVarP(&miner, "miner", "m", "stop", "miner start or not, [start, stop]. Default is stop (sync only)")
 	startCmd.Flags().StringVar(&dataDirFlag, "datadir", "", "data directory. Absolute paths are used as-is; relative paths are placed under $HOME/.scdo. Overrides basic.dataDir")
+	startCmd.Flags().IntVar(&dbCacheFlag, "dbcache", 0, "chain database cache in MB. 0 uses the 64 MiB HDD and phone profile")
 	startCmd.Flags().BoolVarP(&metricsEnableFlag, "metrics", "t", false, "start metrics")
 	startCmd.Flags().StringVarP(&accountsConfig, "accounts", "", "", "init accounts info")
 	startCmd.Flags().StringVarP(&poolAccountsConfig, "poolaccounts", "", "", "init pool accounts")
 	startCmd.Flags().IntVarP(&threads, "threads", "", 1, "miner thread value")
-	startCmd.Flags().BoolVarP(&lightNode, "light", "l", false, "whether start with light mode")
+	startCmd.Flags().BoolVarP(&lightNode, "light", "l", false, "header-only sync of shards 1-4 from fork genesis, keeping the last 10000 headers per shard")
 	startCmd.Flags().BoolVar(&lightServer, "lightserver", true, "serve phone light clients (lightScdo_<shard> version 1) on this node's TCP port. On by default")
 	startCmd.Flags().Uint64VarP(&pprofPort, "port", "", 0, "which port pprof http server listen to")
 	startCmd.Flags().IntVarP(&startHeight, "startheight", "", -1, "the block height to start from")

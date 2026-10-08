@@ -130,7 +130,7 @@ func NewBlock(header *BlockHeader, txs []*Transaction, receipts []*Receipt, debt
 
 	block.Header.ReceiptHash = ReceiptMerkleRootHash(receipts)
 	block.Header.DebtHash = DebtMerkleRootHash(debts)
-	block.Header.TxDebtHash = DebtMerkleRootHash(NewDebts(txs))
+	block.Header.TxDebtHash = DebtMerkleRootHash(NewDebtsOnShard(txs, debtContextShard(header)))
 
 	// Calculate the block header hash.
 	block.HeaderHash = block.Header.Hash()
@@ -217,8 +217,9 @@ func (block *Block) Validate() error {
 		return ErrBlockTxsHashMismatch
 	}
 
-	// Validates debt root hash.
-	if h := DebtMerkleRootHash(NewDebts(block.Transactions)); !h.Equal(block.Header.TxDebtHash) {
+	// Validates debt root hash. The debt set is defined by the block creator's
+	// shard, not by whichever shard this process last configured.
+	if h := DebtMerkleRootHash(NewDebtsOnShard(block.Transactions, debtContextShard(block.Header))); !h.Equal(block.Header.TxDebtHash) {
 		return ErrBlockTxDebtHashMismatch
 	}
 
@@ -227,4 +228,16 @@ func (block *Block) Validate() error {
 	}
 
 	return nil
+}
+
+// debtContextShard is the shard that decides which transfers are debts.
+// A creator on shard 1-4 wins. An empty creator keeps common.LocalShardNumber
+// so existing tests that set the global stay valid.
+func debtContextShard(header *BlockHeader) uint {
+	if header != nil && !header.Creator.IsEmpty() {
+		if shard := header.Creator.Shard(); shard > 0 && shard <= common.ShardCount {
+			return shard
+		}
+	}
+	return common.LocalShardNumber
 }
