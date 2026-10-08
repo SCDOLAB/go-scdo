@@ -945,21 +945,78 @@ func (bc *Blockchain) GetHeadRollbackEventManager() *event.EventManager {
 	panic("Not Supported")
 }
 
+// recoverDepth is how many canonical blocks an unclean restart re-reads.
+// Index damage from a crash is near the head. Scanning back to fork height
+// (about 6.3M full blocks) is what made a Shard1 restart take hours.
+const recoverDepth = 20000
+
+// heightIndexStop is where recoverHeightIndices stops on the first pass.
+// floor comes from the index checkpoint: fork height when the file is missing
+// or the last shutdown was not clean, or the verified height after a clean
+// stop. A chain that is still within recoverDepth of the fork, including a
+// fresh sync from 2979594, is not shortened. A clean checkpoint that is
+// already inside the recent window is left alone.
+// limited is true when this stop is above floor. The walk continues down to
+// floor if it finds a missing height inside or just below the window.
+func heightIndexStop(head, floor uint64) (stopAt uint64, limited bool) {
+	stopAt = floor
+	fork := uint64(common.SecondForkHeight)
+	if head > fork+recoverDepth {
+		recent := head - recoverDepth
+		if recent > stopAt {
+			return recent, true
+		}
+	}
+	return stopAt, false
+}
+
 // recoverHeightIndices examines the previous blockchain data to make sure
 // no data is missing. floor is the last height already known to be indexed.
+// This walks the full-chain store only. Other-shard light header databases
+// are a separate store and are rewound to fork genesis on their own.
 func (bc *Blockchain) recoverHeightIndices(floor uint64) {
 	curBlock := bc.CurrentBlock()
+	if curBlock == nil || curBlock.Header == nil {
+		return
+	}
 	curHeight := curBlock.Header.Height
 	chainHeight := curHeight
 	curHash := curBlock.Header.Hash()
 	numGetBlockByHeight := 0
 	numGetBlockByHash := 0
 	numIrrecoverable := 0
-	for curHeight > floor {
+
+	stopAt, limited := heightIndexStop(curHeight, floor)
+	if limited {
+		bc.log.Info("height index scan limited to the last %d blocks (%d down to %d); full floor is %d", recoverDepth, curHeight, stopAt, floor)
+	}
+
+	for {
+		if curHeight <= stopAt {
+			// The window itself was readable. One read just below it catches
+			// a gap deeper than recoverDepth instead of skipping it.
+			if limited && stopAt > floor {
+				if _, err := bc.bcStore.GetBlockByHeight(stopAt); err != nil {
+					bc.log.Info("height index gap at %d, below the last %d blocks; continuing down to %d", stopAt, recoverDepth, floor)
+					curHeight = stopAt
+					stopAt = floor
+					limited = false
+					continue
+				}
+				bc.log.Info("height index intact for the last %d blocks; not scanning down to %d", recoverDepth, floor)
+			}
+			break
+		}
+
 		bc.log.Debug("checking blockchain database, height: %d", curHeight)
-		if curBlock, err := bc.bcStore.GetBlockByHeight(curHeight); err != nil {
+		if block, err := bc.bcStore.GetBlockByHeight(curHeight); err != nil {
 			bc.log.Error("height: %d, can't get block by height.", curHeight)
-			if curBlock, err = bc.bcStore.GetBlock(curHash); err != nil {
+			if limited {
+				bc.log.Info("height index gap at %d inside the last %d blocks; continuing down to %d", curHeight, recoverDepth, floor)
+				stopAt = floor
+				limited = false
+			}
+			if block, err = bc.bcStore.GetBlock(curHash); err != nil {
 				bc.log.Error("height: %d, can't get block by hash %v.", curHeight, curHash)
 				curHash = common.EmptyHash
 				numIrrecoverable++
@@ -967,15 +1024,15 @@ func (bc *Blockchain) recoverHeightIndices(floor uint64) {
 				// get block by hash successfully
 				// recover the heightToBlock map
 				bc.log.Info("height: %d, try to recover block by hash %v.", curHeight, curHash)
-				if err := bc.bcStore.RecoverHeightToBlockMap(curBlock); err != nil {
+				if err := bc.bcStore.RecoverHeightToBlockMap(block); err != nil {
 					bc.log.Error("height: %d, can't recover block by hash %v.", curHeight, curHash)
 				}
-				curHash = curBlock.Header.PreviousBlockHash
+				curHash = block.Header.PreviousBlockHash
 				numGetBlockByHash++
 			}
 		} else {
 			// get block by height successfully
-			curHash = curBlock.Header.PreviousBlockHash
+			curHash = block.Header.PreviousBlockHash
 			numGetBlockByHeight++
 		}
 		curHeight--

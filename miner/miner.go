@@ -65,6 +65,10 @@ type Miner struct {
 	coinbase     common.Address
 	coinbaseList []common.Address
 	engine       consensus.Engine
+	// mu guards current. prepareNewBlock builds the task locally and publishes
+	// it only when it is complete. SubmitWork and the pool clear it when a
+	// block is found; reading the field without the lock races that write.
+	mu sync.Mutex
 
 	debtVerifier types.DebtVerifier
 	msgChan      chan bool // use msgChan to receive msg setting miner to start or stop, and miner will deal with these msgs sequentially
@@ -387,24 +391,41 @@ func (miner *Miner) prepareNewBlock(recv chan *types.Block) error {
 		}
 	}
 
-	miner.current = NewTask(header, miner.coinbase, miner.debtVerifier)
-	err = miner.current.applyTransactionsAndDebts(miner.scdo, stateDB, miner.scdo.BlockChain().AccountDB(), miner.log)
+	// Keep the task local until it is fully built. A concurrent miner_start
+	// (or SubmitWork, which clears current when a block is found) used to
+	// nil miner.current between this assignment and generateBlock.
+	task := NewTask(header, miner.coinbase, miner.debtVerifier)
+	err = task.applyTransactionsAndDebts(miner.scdo, stateDB, miner.scdo.BlockChain().AccountDB(), miner.log)
 	if err != nil {
 		return fmt.Errorf("failed to apply transaction %s", err)
 	}
 
 	if miner.poolMode {
 		miner.log.Info("create a new task for the pool, height:%d, difficult:%d", header.Height, header.Difficulty)
-		preBlock := miner.current.generateBlock()
+		preBlock := task.generateBlock()
 		if preBlock == nil || preBlock.Header == nil {
 			return fmt.Errorf("pool task has no block header")
 		}
-		miner.current.header = preBlock.Header.Clone()
+		task.header = preBlock.Header.Clone()
+		miner.setCurrent(task)
 	} else {
 		miner.log.Info("committing a new task to engine, height:%d, difficult:%d", header.Height, header.Difficulty)
-		miner.commitTask(miner.current, recv)
+		miner.setCurrent(task)
+		miner.commitTask(task, recv)
 	}
 	return nil
+}
+
+func (miner *Miner) setCurrent(task *Task) {
+	miner.mu.Lock()
+	miner.current = task
+	miner.mu.Unlock()
+}
+
+func (miner *Miner) getCurrent() *Task {
+	miner.mu.Lock()
+	defer miner.mu.Unlock()
+	return miner.current
 }
 
 // saveBlock saves the block in the given result to the blockchain
@@ -424,60 +445,91 @@ func (miner *Miner) saveBlock(result *types.Block) error {
 
 // commitTask commits the given task to the miner
 func (miner *Miner) commitTask(task *Task, recv chan *types.Block) {
+	if task == nil || miner.engine == nil {
+		return
+	}
 	block := task.generateBlock()
+	if block == nil {
+		return
+	}
 	miner.engine.Seal(miner.scdo.BlockChain(), block, miner.stopChan, recv)
 }
 
 // GetWork get the current task in a printable format
 func (miner *Miner) GetWork() map[string]interface{} {
-	if miner.current == nil {
+	task := miner.getCurrent()
+	if task == nil || task.header == nil {
 		miner.log.Info("there is no task so far")
 		return nil
 	}
-	task := miner.current
 	return PrintableOutputTask(task)
 }
 
 // GetWorkTask gets the current task
 func (miner *Miner) GetWorkTask() *Task {
-	return miner.current
+	return miner.getCurrent()
 }
 
 // GetCurrentWorkHeader returns the header of current task
 func (miner *Miner) GetCurrentWorkHeader(totalDifficulty *big.Int) map[string]interface{} {
-	task := miner.GetWorkTask()
-	if task == nil {
+	miner.mu.Lock()
+	task := miner.current
+	if task == nil || task.header == nil || task.header.Difficulty == nil {
+		miner.mu.Unlock()
 		miner.log.Info("there is no task so far")
 		return nil
 	}
-	newTotalDifficulty := big.NewInt(0)
-	newTotalDifficulty.Add(totalDifficulty, task.header.Difficulty)
-	return PrintableOutputTaskHeader(task.header, newTotalDifficulty)
+	header := task.header
+	difficulty := new(big.Int).Set(header.Difficulty)
+	miner.mu.Unlock()
+	if totalDifficulty == nil {
+		totalDifficulty = big.NewInt(0)
+	}
+	newTotalDifficulty := new(big.Int).Add(totalDifficulty, difficulty)
+	return PrintableOutputTaskHeader(header, newTotalDifficulty)
 }
 
 // SubmitWork is used to submit the nonce to generate the final block
 func (miner *Miner) SubmitWork(height uint64, nonce uint64) error {
 
 	// validate nonce based on miner.current
-	// If valid, create a block and pass it into miner.recv
-	if miner.current == nil {
+	// If valid, create a block and pass it into miner.recv.
+	// The pool calls this when a block is found and clears current. That
+	// write must not land in the middle of prepareNewBlock's generateBlock.
+	miner.mu.Lock()
+	task := miner.current
+	if task == nil || task.header == nil {
+		miner.mu.Unlock()
 		return errors.New("there is no task so far")
 	}
-
-	if miner.current.header.Height != height {
+	if task.header.Height != height {
+		miner.mu.Unlock()
 		return errors.New("Height not match")
 	}
+	taskHeader := task.header.Clone()
+	miner.mu.Unlock()
 
-	taskHeader := miner.current.header.Clone()
 	taskHeader.Witness = []byte(strconv.FormatUint(nonce, 10))
 
+	if miner.engine == nil || miner.scdo == nil || miner.scdo.BlockChain() == nil {
+		return errors.New("miner has no consensus engine")
+	}
 	err := miner.engine.VerifyHeader(miner.scdo.BlockChain(), taskHeader)
 	if err != nil {
 		return err
 	}
-	miner.current.header.Witness = taskHeader.Witness
-	block := miner.current.generateBlock()
+	miner.mu.Lock()
+	if miner.current != task || task.header == nil {
+		miner.mu.Unlock()
+		return errors.New("there is no task so far")
+	}
+	task.header.Witness = taskHeader.Witness
+	block := task.generateBlock()
 	miner.current = nil
+	miner.mu.Unlock()
+	if block == nil {
+		return errors.New("there is no task so far")
+	}
 	miner.recv <- block
 	return nil
 
@@ -486,15 +538,13 @@ func (miner *Miner) SubmitWork(height uint64, nonce uint64) error {
 // GetTaskDifficulty gets the difficulty of current task
 func (miner *Miner) GetTaskDifficulty() *big.Int {
 
-	if miner.current == nil {
+	miner.mu.Lock()
+	defer miner.mu.Unlock()
+	if miner.current == nil || miner.current.header == nil || miner.current.header.Difficulty == nil {
 		miner.log.Info("there is no task so far")
 		return nil
 	}
-	difficulty := miner.current.header.Difficulty
-	if difficulty == nil {
-		return nil
-	}
-	return difficulty
+	return new(big.Int).Set(miner.current.header.Difficulty)
 }
 
 // chooseCoinBase selects the coinbase randomly from the given list
