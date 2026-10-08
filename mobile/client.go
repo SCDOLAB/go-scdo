@@ -33,6 +33,7 @@ import (
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/common/hexutil"
 	"github.com/scdoproject/go-scdo/crypto"
+	"github.com/scdoproject/go-scdo/heartbeat"
 	"github.com/scdoproject/go-scdo/light"
 	"github.com/scdoproject/go-scdo/node"
 	"github.com/scdoproject/go-scdo/p2p"
@@ -60,6 +61,8 @@ type session struct {
 	api     *light.PublicAPI
 	full    map[uint]*scdo.ScdoService
 	samples map[uint]heightSample
+	reward  *heartbeat.Service
+	tipMu   sync.RWMutex
 }
 
 func (s *session) stop() {
@@ -233,6 +236,50 @@ func SetSyncPolicy(pauseOnMetered, pauseOnLowBattery bool) error {
 		cancelFullDownloads()
 	}
 	return nil
+}
+
+// SetRewardAddress sets the Shard0 EVM address that receives node rewards.
+// An empty address turns the heartbeat off. The client also stays off until
+// SetRewardHeartbeatURL is set. Call it before or after Start.
+func SetRewardAddress(address string) error {
+	address, err := heartbeat.NormalizeAddress(address)
+	if err != nil {
+		return err
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	rewardAddress = address
+	if current != nil && current.reward != nil {
+		return current.reward.Apply(rewardAddress, rewardURL)
+	}
+	return nil
+}
+
+// SetRewardHeartbeatURL sets the heartbeat POST endpoint. An empty URL turns
+// the client off. The default is empty.
+func SetRewardHeartbeatURL(url string) error {
+	url, err := heartbeat.NormalizeURL(url)
+	if err != nil {
+		return err
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	rewardURL = url
+	if current != nil && current.reward != nil {
+		return current.reward.Apply(rewardAddress, rewardURL)
+	}
+	return nil
+}
+
+// RewardStatus returns the last heartbeat result as JSON. Share figures come
+// from the server. The phone does not calculate them.
+func RewardStatus() string {
+	mu.Lock()
+	defer mu.Unlock()
+	if current == nil || current.reward == nil {
+		return jsonOK(heartbeat.Status{Enabled: false})
+	}
+	return jsonOK(current.reward.Status())
 }
 
 // SetDeviceState reports the phone's network and battery. Go cannot read those itself.
