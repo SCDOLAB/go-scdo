@@ -6,7 +6,10 @@
 package downloader
 
 import (
+	"bytes"
 	"math/big"
+	"runtime"
+	"runtime/debug"
 	"testing"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	"github.com/scdoproject/go-scdo/common/errors"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/database"
+	"github.com/scdoproject/go-scdo/log"
 
 	"github.com/scdoproject/go-scdo/database/leveldb"
 	"github.com/stretchr/testify/assert"
@@ -273,6 +277,112 @@ func TestIsShardDataNotReady(t *testing.T) {
 	noPeers := errors.NewStackedError(types.ErrHeaderNotReady, "No peers found")
 	assert.Equal(t, true, isShardDataNotReady(errors.NewStackedError(noPeers, "failed to get tx")))
 	assert.Equal(t, false, isShardDataNotReady(errors.New("invalid parent hash")))
+}
+
+func TestTaskMgrDoesNotPreallocateSyncRange(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+
+	d := newTestDownloader(db)
+	tm := newTaskMgr(d, masterPeer, nil, 1, 6_000_000, 0, nil, nil)
+	defer tm.close()
+
+	if cap(tm.downloadInfoList) > maxBlocksWaiting {
+		t.Fatalf("download window cap %d reserves the whole sync range", cap(tm.downloadInfoList))
+	}
+}
+
+func TestSyncReleasesProcessedBlockMemory(t *testing.T) {
+	const (
+		n       = 2500
+		payload = 16 * 1024
+		batch   = 100
+	)
+	lg := log.GetLogger("download-mem")
+	d := &Downloader{log: lg, peers: make(map[string]*peerConn)}
+	tm := &taskMgr{
+		log:              lg,
+		downloader:       d,
+		fromNo:           1,
+		toNo:             uint64(n),
+		curNo:            1,
+		listBase:         1,
+		masterPeer:       masterPeer,
+		peersHeaderMap:   map[string]*peerHeadInfo{masterPeer: newPeerHeadInfo()},
+		downloadInfoList: make([]*downloadInfo, 0, 32),
+		quitCh:           make(chan struct{}),
+		procCh:           make(chan struct{}, 1),
+	}
+
+	body := bytes.Repeat([]byte("B"), payload)
+	before := heapAlloc()
+	for base := 1; base <= n; base += batch {
+		count := batch
+		if base+count-1 > n {
+			count = n - base + 1
+		}
+		headers := make([]*types.BlockHeader, 0, count)
+		blocks := make([]*types.Block, 0, count)
+		for i := 0; i < count; i++ {
+			height := uint64(base + i)
+			extra := append([]byte(nil), body...)
+			header := &types.BlockHeader{
+				Height:          height,
+				ExtraData:       extra,
+				Difficulty:      big.NewInt(1),
+				CreateTimestamp: big.NewInt(1),
+			}
+			headers = append(headers, header)
+			blocks = append(blocks, &types.Block{Header: header})
+		}
+		if err := tm.deliverHeaderMsg(masterPeer, headers); err != nil {
+			t.Fatal(err)
+		}
+		for _, info := range tm.downloadInfoList {
+			if info != nil && info.status == taskStatusIdle {
+				info.peerID = masterPeer
+			}
+		}
+		tm.deliverBlockMsg(masterPeer, blocks)
+		got := tm.getWaitProcessingBlocks()
+		if len(got) != count {
+			t.Fatalf("batch at %d processed %d, want %d", base, len(got), count)
+		}
+		for _, info := range got {
+			info.status = taskStatusProcessed
+		}
+		tm.releaseProcessed()
+		if len(tm.downloadInfoList) > maxBlocksWaiting {
+			t.Fatalf("download window grew to %d entries", len(tm.downloadInfoList))
+		}
+		if cap(tm.downloadInfoList) > maxBlocksWaiting {
+			t.Fatalf("download window cap %d", cap(tm.downloadInfoList))
+		}
+	}
+	if len(tm.downloadInfoList) != 0 {
+		t.Fatalf("retained %d processed entries", len(tm.downloadInfoList))
+	}
+	for _, info := range tm.peersHeaderMap {
+		if len(info.headers) != 0 {
+			t.Fatalf("retained %d peer headers", len(info.headers))
+		}
+	}
+
+	after := heapAlloc()
+	// 2500 blocks * 16 KiB is about 40 MiB if the window keeps them.
+	// Releasing the window must leave only a small residual.
+	const limit = uint64(8 << 20)
+	if after > before && after-before > limit {
+		t.Fatalf("heap grew %d bytes after releasing %d blocks of %d bytes", after-before, n, payload)
+	}
+}
+
+func heapAlloc() uint64 {
+	runtime.GC()
+	debug.FreeOSMemory()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
 }
 
 func newTestBlockHeaderWithHeight(height uint64) *types.BlockHeader {

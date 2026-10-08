@@ -65,15 +65,19 @@ func newPeerHeadInfo() *peerHeadInfo {
 }
 
 type taskMgr struct {
-	downloader       *Downloader
-	fromNo, toNo     uint64 // block number range [from, to]
-	curNo            uint64 // the smallest block number need to recv
-	downloadedNum    uint64
-	recoverHeight    uint64
-	recoverTD        *big.Int
-	recoverBlocks    []*types.Block
-	peersHeaderMap   map[string]*peerHeadInfo // peer's header information
-	downloadInfoList []*downloadInfo          // download process info
+	downloader     *Downloader
+	fromNo, toNo   uint64 // block number range [from, to]
+	curNo          uint64 // the smallest block number need to recv
+	downloadedNum  uint64
+	recoverHeight  uint64
+	recoverTD      *big.Int
+	recoverBlocks  []*types.Block
+	peersHeaderMap map[string]*peerHeadInfo // peer's header information
+	// downloadInfoList is a sliding window of headers and bodies still in
+	// flight. listBase is the block height of index 0. Processed entries are
+	// dropped so a multi-million-block sync does not retain every block.
+	downloadInfoList []*downloadInfo
+	listBase         uint64
 
 	masterPeer      string
 	masterConn      *peerConn
@@ -104,7 +108,8 @@ func newTaskMgr(d *Downloader, masterPeer string, conn *peerConn, from uint64, t
 		masterConn:       conn,
 		startTime:        time.Now(),
 		peersHeaderMap:   make(map[string]*peerHeadInfo),
-		downloadInfoList: make([]*downloadInfo, 0, to-from+1),
+		downloadInfoList: make([]*downloadInfo, 0, 64),
+		listBase:         from,
 		quitCh:           make(chan struct{}),
 		procCh:           make(chan struct{}, 1),
 	}
@@ -126,6 +131,11 @@ loopOut:
 				t.log.Info("source shard is not ready yet (header, peers, or confirmations); leaving blocks queued and retrying")
 				t.lastWaitLog = time.Now()
 			}
+		}
+		// Drop blocks already written, including a processed prefix left
+		// behind when a later debt is still waiting on another shard.
+		t.releaseProcessed()
+		if waiting {
 			select {
 			case <-time.After(2 * time.Second):
 			case <-t.quitCh:
@@ -151,12 +161,85 @@ func (t *taskMgr) rewindUnprocessed() {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	for i, info := range t.downloadInfoList {
-		if info.status != taskStatusProcessed {
-			t.curNo = t.fromNo + uint64(i)
+		if info != nil && info.status != taskStatusProcessed {
+			t.curNo = t.listBase + uint64(i)
 			return
 		}
 	}
-	t.curNo = t.fromNo + uint64(len(t.downloadInfoList))
+	t.curNo = t.listBase + uint64(len(t.downloadInfoList))
+}
+
+// releaseProcessed drops a prefix of blocks that are already in the chain
+// and forgets their header and body so the GC can take the RLP objects.
+func (t *taskMgr) releaseProcessed() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	t.releaseProcessedLocked()
+}
+
+func (t *taskMgr) releaseProcessedLocked() {
+	if t.curNo < t.listBase {
+		return
+	}
+	limit := int(t.curNo - t.listBase)
+	if limit > len(t.downloadInfoList) {
+		limit = len(t.downloadInfoList)
+	}
+	n := 0
+	for n < limit {
+		info := t.downloadInfoList[n]
+		if info == nil || info.status != taskStatusProcessed {
+			break
+		}
+		info.header = nil
+		info.block = nil
+		t.downloadInfoList[n] = nil
+		n++
+	}
+	if n == 0 {
+		return
+	}
+	t.listBase += uint64(n)
+	remain := t.downloadInfoList[n:]
+	// Copy into a new array. Reslicing would keep the old backing store,
+	// and that store is what held every block since the session started.
+	fresh := make([]*downloadInfo, len(remain))
+	copy(fresh, remain)
+	t.downloadInfoList = fresh
+	t.dropHeadersBeforeLocked(t.curNo)
+}
+
+func (t *taskMgr) dropHeadersBeforeLocked(height uint64) {
+	for _, headInfo := range t.peersHeaderMap {
+		if headInfo == nil {
+			continue
+		}
+		for no := range headInfo.headers {
+			if no < height {
+				delete(headInfo.headers, no)
+			}
+		}
+	}
+}
+
+// pos is the index of height in downloadInfoList, or -1 when it is below the window.
+func (t *taskMgr) pos(height uint64) int {
+	if height < t.listBase {
+		return -1
+	}
+	return int(height - t.listBase)
+}
+
+// pendingFrom returns the window starting at height.
+func (t *taskMgr) pendingFrom(height uint64) []*downloadInfo {
+	p := t.pos(height)
+	if p < 0 {
+		p = 0
+	}
+	if p >= len(t.downloadInfoList) {
+		return nil
+	}
+	return t.downloadInfoList[p:]
 }
 
 func (t *taskMgr) logProgress() {
@@ -239,9 +322,19 @@ func (t *taskMgr) getWaitProcessingBlocks() []*downloadInfo {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	startPos := int(t.curNo - t.fromNo)
+	startPos := 0
+	if t.curNo > t.listBase {
+		startPos = int(t.curNo - t.listBase)
+	}
+	if startPos > len(t.downloadInfoList) {
+		startPos = len(t.downloadInfoList)
+	}
 	num := 0
-	for (startPos+num < len(t.downloadInfoList)) && (t.downloadInfoList[startPos+num].status == taskStatusWaitProcessing) {
+	for startPos+num < len(t.downloadInfoList) {
+		info := t.downloadInfoList[startPos+num]
+		if info == nil || info.status != taskStatusWaitProcessing {
+			break
+		}
 		num = num + 1
 	}
 
@@ -281,7 +374,7 @@ func (t *taskMgr) getReqHeaderInfo(conn *peerConn) (uint64, int) {
 
 	var startNo uint64
 	if conn.peerID == t.masterPeer {
-		startNo = t.fromNo + uint64(len(t.downloadInfoList))
+		startNo = t.listBase + uint64(len(t.downloadInfoList))
 		if startNo-t.curNo > t.downloader.waitingBlocks() {
 			return 0, 0
 		}
@@ -319,8 +412,8 @@ func (t *taskMgr) getReqBlocks(conn *peerConn) (uint64, int) {
 	var startNo uint64
 	var amount int
 	// find the first block that not requested yet and exists in conn
-	for _, masterHead := range t.downloadInfoList[t.curNo-t.fromNo:] {
-		if masterHead.status != taskStatusIdle {
+	for _, masterHead := range t.pendingFrom(t.curNo) {
+		if masterHead == nil || masterHead.status != taskStatusIdle {
 			continue
 		}
 		curHeight := masterHead.header.Height
@@ -340,7 +433,10 @@ func (t *taskMgr) getReqBlocks(conn *peerConn) (uint64, int) {
 		return 0, 0
 	}
 
-	for _, masterHead := range t.downloadInfoList[startNo+1-t.fromNo:] {
+	for _, masterHead := range t.pendingFrom(startNo + 1) {
+		if masterHead == nil {
+			break
+		}
 		if masterHead.status == taskStatusIdle {
 			peerHead, ok := headInfo.headers[startNo+uint64(amount)]
 			// if block is not found in headers or hash not match, then breaks the loop
@@ -377,8 +473,8 @@ func (t *taskMgr) onPeerQuit(peerID string) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	for _, masterHead := range t.downloadInfoList[t.curNo-t.fromNo:] {
-		if masterHead.status == taskStatusDownloading && masterHead.peerID == peerID {
+	for _, masterHead := range t.pendingFrom(t.curNo) {
+		if masterHead != nil && masterHead.status == taskStatusDownloading && masterHead.peerID == peerID {
 			masterHead.peerID = ""
 			masterHead.status = taskStatusIdle
 		}
@@ -396,7 +492,7 @@ func (t *taskMgr) deliverHeaderMsg(peerID string, headers []*types.BlockHeader) 
 	}
 
 	if peerID == t.masterPeer {
-		lastNo := t.fromNo + uint64(len(t.downloadInfoList))
+		lastNo := t.listBase + uint64(len(t.downloadInfoList))
 		t.log.Debug("masterPeer deliverHeaderMsg. lastNo=%d fromNo:%d header.height:%d", lastNo, t.fromNo, headers[0].Height)
 		if lastNo != headers[0].Height {
 			return errMasterHeadersNotMatch
@@ -433,7 +529,7 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 		// An empty batch is not fatal. Return those heights to the idle queue
 		// so another peer can serve them instead of aborting the sync.
 		for _, headInfo := range t.downloadInfoList {
-			if headInfo.peerID != peerID {
+			if headInfo == nil || headInfo.peerID != peerID {
 				continue
 			}
 
@@ -448,9 +544,9 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 	toHeight := uint64(0)
 
 	for _, b := range blocks {
-		idx := int(b.Header.Height - t.fromNo)
+		idx := t.pos(b.Header.Height)
 		if idx < 0 || idx >= len(t.downloadInfoList) {
-			t.log.Warn("discard block height %d outside download range starting at %d (len %d)", b.Header.Height, t.fromNo, len(t.downloadInfoList))
+			t.log.Warn("discard block height %d outside download window starting at %d (len %d)", b.Header.Height, t.listBase, len(t.downloadInfoList))
 			continue
 		}
 		headInfo := t.downloadInfoList[idx]
@@ -472,12 +568,15 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 
 	maxLen := len(t.downloadInfoList)
 	for cur := toHeight + 1; cur <= t.toNo; cur++ {
-		idx := int(cur - t.fromNo)
-		if idx >= maxLen {
+		idx := t.pos(cur)
+		if idx < 0 || idx >= maxLen {
 			break
 		}
 
 		headInfo := t.downloadInfoList[idx]
+		if headInfo == nil {
+			break
+		}
 		if headInfo.peerID != peerID {
 			break
 		}

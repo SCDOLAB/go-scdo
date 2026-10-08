@@ -89,6 +89,11 @@ type Blockchain struct {
 	debtVerifier types.DebtVerifier
 
 	lastBlockTime time.Time // last sucessful written block time.
+
+	// indexFile records the last height whose height-to-hash map was checked.
+	indexFile     string
+	indexVerified uint64
+	indexMu       sync.Mutex
 }
 
 // NewBlockchain returns an initialized blockchain with the given store and account state DB.
@@ -154,8 +159,35 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 	bc.currentBlock.Store(currentBlock)
 	bc.log.Info("SCDO Classic chain starts at fork genesis height %d (full history after the fork, not a snapshot). current head height %d", genesisBlockHeight, currentBlock.Header.Height)
 
-	// recover height-to-block mapping
-	bc.recoverHeightIndices()
+	// recover height-to-block mapping. A clean checkpoint skips heights that
+	// were already checked. This does not skip block verification on sync.
+	bc.indexFile = indexCheckpointPath(recoveryPointFile)
+	cp := loadIndexCheckpoint(bc.indexFile)
+	floor := indexScanFloor(cp, currentBlock.Header.Height)
+	// A crash from here on is an unclean shutdown, including a crash during
+	// this scan. The previous clean height is what this scan trusts.
+	if bc.indexFile != "" && cp.Clean {
+		bc.indexMu.Lock()
+		bc.indexVerified = cp.VerifiedHeight
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: cp.VerifiedHeight, Clean: false})
+		bc.indexMu.Unlock()
+	}
+	if bc.indexFile == "" {
+		bc.log.Info("checking blockchain database from %d down to fork height %d", currentBlock.Header.Height, floor)
+	} else if floor == uint64(common.SecondForkHeight) {
+		bc.log.Info("height index checkpoint missing or last shutdown was not clean; checking blockchain database from %d down to fork height %d", currentBlock.Header.Height, floor)
+	} else if floor >= currentBlock.Header.Height {
+		bc.log.Info("height index checkpoint %d is clean; skipping the height-index scan", floor)
+	} else {
+		bc.log.Info("height index checkpoint %d is clean; checking blockchain database from %d down to %d", floor, currentBlock.Header.Height, floor)
+	}
+	bc.recoverHeightIndices(floor)
+	if bc.indexFile != "" {
+		bc.indexMu.Lock()
+		bc.indexVerified = currentBlock.Header.Height
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: bc.indexVerified, Clean: false})
+		bc.indexMu.Unlock()
+	}
 
 	td, err := bcStore.GetBlockTotalDifficulty(currentHeaderHash)
 	if err != nil {
@@ -174,7 +206,12 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 // most every recoveryFlushInterval, without an fsync. Node shutdown calls this
 // so the last marker is durable before the databases close.
 func (bc *Blockchain) FlushRecovery() {
-	if bc == nil || bc.rp == nil {
+	if bc == nil {
+		return
+	}
+	bc.log.Info("flushing recoveryPoint and height-index checkpoint")
+	bc.markIndexClean()
+	if bc.rp == nil {
 		return
 	}
 	bc.rp.flush()
@@ -446,6 +483,9 @@ func (bc *Blockchain) doWriteBlock(block *types.Block, pool *Pool) error {
 	}
 
 	bc.lastBlockTime = time.Now()
+	if isHead {
+		bc.noteIndexVerified(block.Header.Height)
+	}
 
 	return nil
 }
@@ -880,9 +920,8 @@ func (bc *Blockchain) GetHeadRollbackEventManager() *event.EventManager {
 }
 
 // recoverHeightIndices examines the previous blockchain data to make sure
-// no data is missing
-func (bc *Blockchain) recoverHeightIndices() {
-	bc.log.Info("checking blockchain database...")
+// no data is missing. floor is the last height already known to be indexed.
+func (bc *Blockchain) recoverHeightIndices(floor uint64) {
 	curBlock := bc.CurrentBlock()
 	curHeight := curBlock.Header.Height
 	chainHeight := curHeight
@@ -890,7 +929,7 @@ func (bc *Blockchain) recoverHeightIndices() {
 	numGetBlockByHeight := 0
 	numGetBlockByHash := 0
 	numIrrecoverable := 0
-	for curHeight > common.SecondForkHeight {
+	for curHeight > floor {
 		bc.log.Debug("checking blockchain database, height: %d", curHeight)
 		if curBlock, err := bc.bcStore.GetBlockByHeight(curHeight); err != nil {
 			bc.log.Error("height: %d, can't get block by height.", curHeight)
