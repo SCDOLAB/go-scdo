@@ -35,6 +35,36 @@ func TestIndexScanFloor(t *testing.T) {
 	}
 }
 
+func TestHeightIndexStopBoundsUncleanScan(t *testing.T) {
+	fork := uint64(common.SecondForkHeight)
+	head := fork + 6_000_000
+
+	// Unclean or missing checkpoint: do not walk millions of blocks.
+	stop, limited := heightIndexStop(head, fork)
+	if !limited || stop != head-recoverDepth {
+		t.Fatalf("unclean stop %d limited %v, want %d", stop, limited, head-recoverDepth)
+	}
+
+	// Clean checkpoint inside the recent window still wins.
+	stop, limited = heightIndexStop(head, head-10)
+	if limited || stop != head-10 {
+		t.Fatalf("clean checkpoint stop %d limited %v, want %d", stop, limited, head-10)
+	}
+
+	// Fresh sync still within 20_000 of fork genesis is not shortened.
+	fresh := fork + 1000
+	stop, limited = heightIndexStop(fresh, fork)
+	if limited || stop != fork {
+		t.Fatalf("fresh sync stop %d limited %v, want fork %d", stop, limited, fork)
+	}
+
+	// A chain exactly at the cap is not shortened.
+	stop, limited = heightIndexStop(fork+recoverDepth, fork)
+	if limited || stop != fork {
+		t.Fatalf("boundary stop %d limited %v, want fork %d", stop, limited, fork)
+	}
+}
+
 func TestIndexCheckpointRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, indexCheckpointFile)
