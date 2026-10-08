@@ -391,7 +391,10 @@ func (srv *Server) run() {
 	srv.log.Info("p2p start running...")
 	srv.dialKnownPeersNow()
 	go srv.doSelectNodeToConnect()
-	ticker := time.NewTicker(5 * checkConnsNumInterval)
+	// While a shard has no peer, look again every checkConnsNumInterval.
+	// The old 35s gap left a shard with nothing to sync for minutes after
+	// a restart. SeekShardPeers still refuses to flood UDP inside 15s.
+	ticker := time.NewTicker(checkConnsNumInterval)
 runloop:
 	for {
 
@@ -402,8 +405,10 @@ runloop:
 			go srv.doSelectNodeToConnect()
 			// A light client for another shard can sit at "no peer connected"
 			// while the local shard is full. Keep looking until every shard
-			// has someone to talk to.
-			for _, shard := range srv.nodeSet.shardsWithoutPeers() {
+			// has someone to talk to. The local shard is first so its sync
+			// is not stuck behind the other three.
+			missing := preferShard(srv.nodeSet.shardsWithoutPeers(), srv.localShard())
+			for _, shard := range missing {
 				srv.SeekShardPeers(shard)
 			}
 			if len(srv.nodeSet.shardsWithoutPeers()) > 0 {
@@ -433,7 +438,7 @@ func (srv *Server) dialKnownPeersNow() {
 	if srv == nil || srv.kadDB == nil {
 		return
 	}
-	chosen := groupDialList(srv.kadDB.GetCopy(), knownPeersPerShard)
+	chosen := groupDialList(srv.kadDB.GetCopy(), knownPeersPerShard, srv.localShard())
 	for _, node := range chosen {
 		srv.nodeSet.tryAdd(node)
 		go srv.connectNode(node)
@@ -444,20 +449,51 @@ func (srv *Server) dialKnownPeersNow() {
 }
 
 // groupDialList picks up to perShard nodes of each shard.
-func groupDialList(nodes map[common.Hash]*discovery.Node, perShard int) []*discovery.Node {
-	counts := make(map[uint]int)
-	out := make([]*discovery.Node, 0)
+// prefer's nodes are returned first, and twice as many of them, so a
+// restart dials the shard this process is syncing before the others.
+func groupDialList(nodes map[common.Hash]*discovery.Node, perShard int, prefer uint) []*discovery.Node {
+	buckets := make([][]*discovery.Node, common.ShardCount+1)
 	for _, node := range nodes {
 		if node == nil || node.Shard == 0 || node.Shard > uint(common.ShardCount) {
 			continue
 		}
-		if counts[node.Shard] >= perShard {
+		limit := perShard
+		if node.Shard == prefer {
+			limit = perShard * 2
+		}
+		if len(buckets[node.Shard]) >= limit {
 			continue
 		}
-		counts[node.Shard]++
-		out = append(out, node)
+		buckets[node.Shard] = append(buckets[node.Shard], node)
+	}
+	out := make([]*discovery.Node, 0)
+	if prefer > 0 && prefer <= uint(common.ShardCount) {
+		out = append(out, buckets[prefer]...)
+	}
+	for shard := uint(1); shard <= uint(common.ShardCount); shard++ {
+		if shard == prefer {
+			continue
+		}
+		out = append(out, buckets[shard]...)
 	}
 	return out
+}
+
+// preferShard moves prefer to the front of shards, leaving the rest in order.
+func preferShard(shards []uint, prefer uint) []uint {
+	if prefer == 0 || len(shards) < 2 {
+		return shards
+	}
+	out := make([]uint, 0, len(shards))
+	rest := make([]uint, 0, len(shards))
+	for _, shard := range shards {
+		if shard == prefer {
+			out = append(out, shard)
+			continue
+		}
+		rest = append(rest, shard)
+	}
+	return append(out, rest...)
 }
 
 // SeekShardPeers dials known nodes for shard and asks discovery for more.
@@ -968,6 +1004,7 @@ func (srv *Server) Stop() {
 	if !srv.running {
 		return
 	}
+	srv.log.Info("shutting down p2p, saving nodes.json and blockList.json")
 	if srv.kadDB != nil && srv.nodeDir != "" {
 		srv.kadDB.SaveNodesDurable(srv.nodeDir)
 	}

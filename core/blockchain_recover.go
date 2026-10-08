@@ -23,6 +23,14 @@ import (
 // recoveryFlushInterval is the fastest recoveryPoint.json is replaced while
 // blocks are imported. The in-memory marker still changes on every block.
 // A clean shutdown fsyncs the file once; the import path does not.
+//
+// Four shard processes each rewrite this file every 10s. That is 24 atomic
+// renames a minute. The write does not fsync, but ext4's ordered journal
+// still posts one flush per rename, which is the steady ~0.4 flush/s left
+// after per-block fsync was removed. nodes.json is once a minute and is a
+// small part of the same count. LevelDB NoSync stays on, so block import
+// does not add an fsync per block; memtable dumps are bursty, not this flat
+// rate. The 10s window is the crash rollback bound, so it stays.
 var recoveryFlushInterval = 10 * time.Second
 
 // recoveryNow is the clock for that interval. Tests advance it.

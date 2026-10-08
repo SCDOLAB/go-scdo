@@ -10,11 +10,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
@@ -75,7 +76,6 @@ var startCmd = &cobra.Command{
 		start a node.`,
 
 	Run: func(cmd *cobra.Command, args []string) {
-		var wg sync.WaitGroup
 		nCfg, err := LoadConfigFromFile(scdoNodeConfigFile, accountsConfig, poolAccountsConfig)
 		if err != nil {
 			fmt.Printf("failed to reading the config file: %s\n", err.Error())
@@ -263,9 +263,54 @@ var startCmd = &cobra.Command{
 			)
 		}
 
-		wg.Add(1)
-		wg.Wait()
+		// Block until SIGINT or SIGTERM, then flush recoveryPoint, nodes.json
+		// and blockList and close the databases. systemd's default stop is
+		// SIGTERM; without this the process dies before those files are written.
+		if err := waitForSignalAndStop(scdoNode, scdolog, shutdownTimeout); err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
 	},
+}
+
+const shutdownTimeout = 20 * time.Second
+
+// waitForSignalAndStop blocks until SIGINT or SIGTERM, then stops the node.
+// stop is given timeout to flush and close. The error is a timeout.
+func waitForSignalAndStop(n *node.Node, lg *log.ScdoLog, timeout time.Duration) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	sig := <-sigCh
+	msg := fmt.Sprintf("received %s, shutting down", sig)
+	fmt.Println(msg)
+	if lg != nil {
+		lg.Info(msg)
+	}
+	err := stopWithin(timeout, n.Stop)
+	if err != nil {
+		return err
+	}
+	fmt.Println("shutdown complete")
+	if lg != nil {
+		lg.Info("shutdown complete")
+	}
+	return nil
+}
+
+// stopWithin runs stop and returns an error if it is still running after timeout.
+func stopWithin(timeout time.Duration, stop func() error) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- stop()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("shutdown timed out after %s", timeout)
+	}
 }
 
 func init() {

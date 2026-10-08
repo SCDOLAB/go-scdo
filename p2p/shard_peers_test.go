@@ -50,13 +50,48 @@ func TestGroupDialListCapsEachShard(t *testing.T) {
 		n := discovery.NewNode(*crypto.MustGenerateRandomAddress(), net.ParseIP("10.2.0.1"), 9000+i, 2)
 		nodes[common.StringToHash(fmt.Sprintf("s2-%d", i))] = n
 	}
-	chosen := groupDialList(nodes, knownPeersPerShard)
+	chosen := groupDialList(nodes, knownPeersPerShard, 0)
 	counts := map[uint]int{}
 	for _, n := range chosen {
 		counts[n.Shard]++
 	}
 	if counts[1] != knownPeersPerShard || counts[2] != 3 {
 		t.Fatalf("dial counts = %v", counts)
+	}
+}
+
+func TestGroupDialListDialsLocalShardFirst(t *testing.T) {
+	nodes := make(map[common.Hash]*discovery.Node)
+	for i := 0; i < 20; i++ {
+		n := discovery.NewNode(*crypto.MustGenerateRandomAddress(), net.ParseIP("10.1.0.1"), 8000+i, 1)
+		nodes[common.StringToHash(fmt.Sprintf("s1-%d", i))] = n
+	}
+	for i := 0; i < 20; i++ {
+		n := discovery.NewNode(*crypto.MustGenerateRandomAddress(), net.ParseIP("10.3.0.1"), 9000+i, 3)
+		nodes[common.StringToHash(fmt.Sprintf("s3-%d", i))] = n
+	}
+	chosen := groupDialList(nodes, knownPeersPerShard, 3)
+	if len(chosen) < knownPeersPerShard*2 {
+		t.Fatalf("chosen %d", len(chosen))
+	}
+	local := 0
+	seenOther := false
+	for _, n := range chosen {
+		if n.Shard == 3 {
+			if seenOther {
+				t.Fatal("local shard peer dialed after another shard")
+			}
+			local++
+			continue
+		}
+		seenOther = true
+	}
+	if local != knownPeersPerShard*2 {
+		t.Fatalf("local shard dials = %d, want %d", local, knownPeersPerShard*2)
+	}
+	order := preferShard([]uint{1, 2, 3, 4}, 3)
+	if len(order) != 4 || order[0] != 3 {
+		t.Fatalf("prefer order %v", order)
 	}
 }
 
