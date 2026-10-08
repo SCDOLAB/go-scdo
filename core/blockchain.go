@@ -169,6 +169,17 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 	return bc, nil
 }
 
+// FlushRecovery writes recoveryPoint.json and fsyncs it.
+// Import keeps the marker in memory on every block and replaces the file at
+// most every recoveryFlushInterval, without an fsync. Node shutdown calls this
+// so the last marker is durable before the databases close.
+func (bc *Blockchain) FlushRecovery() {
+	if bc == nil || bc.rp == nil {
+		return
+	}
+	bc.rp.flush()
+}
+
 // AccountDB returns the account state database in blockchain.
 func (bc *Blockchain) AccountDB() database.Database {
 	return bc.accountStateDB

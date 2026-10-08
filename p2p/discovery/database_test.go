@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/scdoproject/go-scdo/common"
@@ -49,6 +50,29 @@ func Test_SaveNodes(t *testing.T) {
 	assert.Equal(t, err, nil)
 	assert.Equal(t, cnode[0], "snode://0000000000000000000000000000000000000000@127.0.0.1:6666[0]")
 	assert.Equal(t, len(cnode), 2)
+}
+
+func Test_SaveNodes_FsyncOnlyWhenDurable(t *testing.T) {
+	dir, err := ioutil.TempDir("", "nodes-fsync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	db := testNewDatabase()
+	before := atomic.LoadInt64(&discoveryFsyncs)
+	db.SaveNodes(dir)
+	db.SaveNodes(dir)
+	if atomic.LoadInt64(&discoveryFsyncs) != before {
+		t.Fatal("periodic nodes.json save fsynced")
+	}
+	if _, err := os.Stat(filepath.Join(dir, NodesBackupFileName+".tmp")); err == nil {
+		t.Fatal("nodes.json.tmp was left behind")
+	}
+	db.SaveNodesDurable(dir)
+	if got := atomic.LoadInt64(&discoveryFsyncs); got != before+1 {
+		t.Fatalf("shutdown nodes.json fsynced %d times, want 1", got-before)
+	}
 }
 
 func Test_Database_GetRandNodes(t *testing.T) {

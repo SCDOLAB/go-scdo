@@ -9,12 +9,30 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/common/errors"
 	"github.com/scdoproject/go-scdo/core/store"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/log"
+)
+
+// recoveryFlushInterval is the fastest recoveryPoint.json is replaced while
+// blocks are imported. The in-memory marker still changes on every block.
+// A clean shutdown fsyncs the file once; the import path does not.
+var recoveryFlushInterval = 10 * time.Second
+
+// recoveryNow is the clock for that interval. Tests advance it.
+var recoveryNow = time.Now
+
+// recoveryFsyncs and recoveryDiskWrites count durability work done for the
+// recovery file. Import must leave recoveryFsyncs unchanged.
+var (
+	recoveryFsyncs     int64
+	recoveryDiskWrites int64
 )
 
 var rpLog = log.GetLogger("recoveryPoint")
@@ -29,30 +47,41 @@ type recoveryPoint struct {
 	StaleHash                  common.Hash // Record the stale block hash for overwrite in canonical chain.
 
 	file string
+
+	// disk tracks the last snapshot. The mutex is not part of the JSON file.
+	disk *recoveryDisk
+}
+
+// recoveryDisk is the on-disk debounce state for one recovery file.
+type recoveryDisk struct {
+	mu    sync.Mutex
+	last  time.Time
+	dirty bool
 }
 
 // loadRecoveryPoint loads a recovery point from the given file
 func loadRecoveryPoint(file string) (*recoveryPoint, error) {
-	rp := recoveryPoint{
+	rp := &recoveryPoint{
 		file: file,
+		disk: &recoveryDisk{},
 	}
 
 	if len(file) == 0 || !common.FileOrFolderExists(file) {
-		return &rp, nil
+		return rp, nil
 	}
 
 	bytes, err := ioutil.ReadFile(file)
 	if err != nil {
 		rpLog.Error("Failed to read bytes from recovery point file, %v", err.Error())
-		return &rp, errors.NewStackedErrorf(err, "failed to read recovery point file %v", file)
+		return rp, errors.NewStackedErrorf(err, "failed to read recovery point file %v", file)
 	}
 
-	if err = json.Unmarshal(bytes, &rp); err != nil {
+	if err = json.Unmarshal(bytes, rp); err != nil {
 		rpLog.Warn("Failed to unmarshal encoded JSON data to recovery point info, file = %v, error = %v", file, err.Error())
-		rp.serialize()
+		rp.flush()
 	}
 
-	return &rp, nil
+	return rp, nil
 }
 
 // recover recovers the most recent chain info from the recovery point
@@ -115,43 +144,78 @@ func (rp *recoveryPoint) recover(bcStore store.BlockchainStore) error {
 
 	rp.StaleHash = common.EmptyHash
 
-	rp.serialize()
+	// The repaired marker is written once, durably, before new blocks arrive.
+	rp.flush()
 
 	return nil
 }
 
-// serialize serializes the recovery point and write it in a file
+// serialize records the current marker and rewrites the file when the
+// flush interval has elapsed. It does not fsync.
 func (rp *recoveryPoint) serialize() {
-	// do nothing if file is empty.
-	// Generally, UT could use empty file name to ignore the recovery point mechanism.
-	if len(rp.file) == 0 {
+	_ = rp.withDisk(false, nil)
+}
+
+// flush rewrites the file and fsyncs it. Clean shutdown and the one-time
+// repair at startup use this. Block import does not.
+func (rp *recoveryPoint) flush() {
+	_ = rp.withDisk(true, nil)
+}
+
+func (rp *recoveryPoint) withDisk(durable bool, fn func() error) error {
+	if rp.disk == nil {
+		rp.disk = &recoveryDisk{}
+	}
+	rp.disk.mu.Lock()
+	defer rp.disk.mu.Unlock()
+	if fn != nil {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	rp.persistLocked(durable)
+	return nil
+}
+
+func (rp *recoveryPoint) persistLocked(durable bool) {
+	// An empty path disables the file. Tests use that to skip the mechanism.
+	if rp == nil || len(rp.file) == 0 {
+		return
+	}
+	rp.disk.dirty = true
+	if !durable && !rp.disk.last.IsZero() && recoveryFlushInterval > 0 && recoveryNow().Sub(rp.disk.last) < recoveryFlushInterval {
 		return
 	}
 
 	encoded, err := json.MarshalIndent(rp, "", "\t")
 	if err != nil {
-		// just log the error so as not to block the blockchain initialization.
-		rpLog.Warn("Failed to marshal recovery point info to JSON data, rp = %+v, error = %v", *rp, err.Error())
+		rpLog.Warn("Failed to marshal recovery point info to JSON data, error = %v", err.Error())
 		return
 	}
-
-	if err := writeAtomic(rp.file, encoded); err != nil {
-		// just log the error so as not to block the blockchain initialization.
+	if err := writeAtomic(rp.file, encoded, durable); err != nil {
 		rpLog.Warn("Failed to write recovery point JSON data to file, file = %v, error = %v", rp.file, err.Error())
+		return
 	}
+	rp.disk.dirty = false
+	rp.disk.last = recoveryNow()
 }
 
-// writeAtomic replaces path by writing a temp file, fsyncing it, then renaming.
-// A kill during the write leaves the previous file intact.
-func writeAtomic(path string, data []byte) error {
+// writeAtomic replaces path by writing a temp file and renaming it.
+// doSync fsyncs that temp file first. Import passes false so a kill still
+// cannot observe a torn JSON file, and a spinning disk is not stalled once
+// per block. Shutdown passes true.
+func writeAtomic(path string, data []byte, doSync bool) error {
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
 	_, err = f.Write(data)
-	if err == nil {
+	if err == nil && doSync {
 		err = f.Sync()
+		if err == nil {
+			atomic.AddInt64(&recoveryFsyncs, 1)
+		}
 	}
 	cerr := f.Close()
 	if err == nil {
@@ -161,61 +225,70 @@ func writeAtomic(path string, data []byte) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err = os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	atomic.AddInt64(&recoveryDiskWrites, 1)
+	return nil
 }
 
 // onPutBlockStart is used before putting a block in storage; it stores the previous block info
 func (rp *recoveryPoint) onPutBlockStart(block *types.Block, bcStore store.BlockchainStore, isHead bool) error {
-	rp.WritingBlockHash = block.HeaderHash
-	rp.WritingBlockHeight = block.Header.Height
+	return rp.withDisk(false, func() error {
+		rp.WritingBlockHash = block.HeaderHash
+		rp.WritingBlockHeight = block.Header.Height
 
-	// the block of specified height may not exist in canonical chain.
-	if hash, err := bcStore.GetBlockHash(rp.WritingBlockHeight); err == nil {
-		rp.PreviousCanonicalBlockHash = hash
-	} else {
-		rp.PreviousCanonicalBlockHash = common.EmptyHash
-	}
+		// the block of specified height may not exist in canonical chain.
+		if hash, err := bcStore.GetBlockHash(rp.WritingBlockHeight); err == nil {
+			rp.PreviousCanonicalBlockHash = hash
+		} else {
+			rp.PreviousCanonicalBlockHash = common.EmptyHash
+		}
 
-	// HEAD block hash must exist
-	hash, err := bcStore.GetHeadBlockHash()
-	if err != nil {
-		rpLog.Error("Failed to get HEAD block hash onPutBlockStart, %v", err.Error())
-		return errors.NewStackedError(err, "failed to get HEAD block hash")
-	}
+		// HEAD block hash must exist
+		hash, err := bcStore.GetHeadBlockHash()
+		if err != nil {
+			rpLog.Error("Failed to get HEAD block hash onPutBlockStart, %v", err.Error())
+			return errors.NewStackedError(err, "failed to get HEAD block hash")
+		}
 
-	rp.PreviousHeadBlockHash = hash
+		rp.PreviousHeadBlockHash = hash
 
-	if isHead {
-		rp.LargerHeight = block.Header.Height + 1
-		rp.StaleHash = block.Header.PreviousBlockHash
-	} else {
-		rp.LargerHeight = 0
-		rp.StaleHash = common.EmptyHash
-	}
-
-	rp.serialize()
-
-	return nil
+		if isHead {
+			rp.LargerHeight = block.Header.Height + 1
+			rp.StaleHash = block.Header.PreviousBlockHash
+		} else {
+			rp.LargerHeight = 0
+			rp.StaleHash = common.EmptyHash
+		}
+		return nil
+	})
 }
 
 // onPutBlockEnd is used after putting a block in storage; it resets some data structures
 func (rp *recoveryPoint) onPutBlockEnd() {
-	rp.PreviousHeadBlockHash = common.EmptyHash
-	rp.WritingBlockHeight = 0
-	rp.PreviousCanonicalBlockHash = common.EmptyHash
-	rp.WritingBlockHash = common.EmptyHash
-
-	rp.serialize()
+	_ = rp.withDisk(false, func() error {
+		rp.PreviousHeadBlockHash = common.EmptyHash
+		rp.WritingBlockHeight = 0
+		rp.PreviousCanonicalBlockHash = common.EmptyHash
+		rp.WritingBlockHash = common.EmptyHash
+		return nil
+	})
 }
 
 // onDeleteLargerHeightBlocks sets the LargerHeight
 func (rp *recoveryPoint) onDeleteLargerHeightBlocks(height uint64) {
-	rp.LargerHeight = height
-	rp.serialize()
+	_ = rp.withDisk(false, func() error {
+		rp.LargerHeight = height
+		return nil
+	})
 }
 
 // onOverwriteStaleBlocks sets the StaleHash
 func (rp *recoveryPoint) onOverwriteStaleBlocks(hash common.Hash) {
-	rp.StaleHash = hash
-	rp.serialize()
+	_ = rp.withDisk(false, func() error {
+		rp.StaleHash = hash
+		return nil
+	})
 }

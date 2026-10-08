@@ -7,6 +7,7 @@ package leveldb
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,47 @@ func TestSyncOptionsFitHDD(t *testing.T) {
 	assert.True(t, o.BlockCacheCapacity >= 32*opt.MiB)
 	assert.True(t, o.CompactionTableSize >= 8*opt.MiB)
 	assert.False(t, asyncWrite.Sync)
+	assert.True(t, checkpointWrite.Sync)
+}
+
+// TestFsyncsPerImportedBlock counts sync batch commits across a run of
+// block-sized writes. The import path must stay at 0. One checkpoint commit
+// is the only call that sets Sync, and Options.NoSync still drops the journal
+// fsync while the HDD profile is on.
+func TestFsyncsPerImportedBlock(t *testing.T) {
+	db, dispose := NewTestDatabase()
+	defer dispose()
+
+	const blocks = 200
+	before := atomic.LoadUint64(&batchCommits)
+	beforeSync := atomic.LoadUint64(&batchSyncCommits)
+	body := make([]byte, 1024)
+	for i := 0; i < blocks; i++ {
+		batch := db.NewBatch().(*Batch)
+		batch.Put([]byte(fmt.Sprintf("h-%d", i)), body)
+		if err := batch.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commits := atomic.LoadUint64(&batchCommits) - before
+	syncs := atomic.LoadUint64(&batchSyncCommits) - beforeSync
+	if commits != blocks {
+		t.Fatalf("batch commits = %d, want %d", commits, blocks)
+	}
+	perBlock := float64(syncs) / float64(blocks)
+	t.Logf("leveldb sync commits per imported block: %.4f", perBlock)
+	if syncs != 0 || asyncWrite.Sync {
+		t.Fatalf("import issued %.4f sync commits per block, want 0", perBlock)
+	}
+
+	cp := db.NewBatch().(*Batch)
+	cp.Put([]byte("checkpoint"), body)
+	if err := cp.CommitCheckpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadUint64(&batchSyncCommits)-beforeSync != 1 {
+		t.Fatal("checkpoint commit was not counted separately from import")
+	}
 }
 
 // TestBlockWriteRateHolds writes block-sized batches until the database is

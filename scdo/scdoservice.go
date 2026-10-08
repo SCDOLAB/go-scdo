@@ -268,6 +268,11 @@ func (s *ScdoService) Stop() error {
 		s.scdoProtocol = nil
 	}
 
+	// One fsync of the recovery marker. Import does not fsync per block.
+	if s.chain != nil {
+		s.chain.FlushRecovery()
+	}
+
 	if s.chainDB != nil {
 		s.chainDB.Close()
 		s.chainDB = nil

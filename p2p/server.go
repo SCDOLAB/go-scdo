@@ -914,7 +914,10 @@ func (srv *Server) Stop() {
 		return
 	}
 	if srv.kadDB != nil && srv.nodeDir != "" {
-		srv.kadDB.SaveNodes(srv.nodeDir)
+		srv.kadDB.SaveNodesDurable(srv.nodeDir)
+	}
+	if srv.udp != nil {
+		srv.udp.FlushBlockList()
 	}
 	srv.running = false
 
