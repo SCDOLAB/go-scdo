@@ -46,6 +46,10 @@ var (
 	// default is full node
 	lightNode bool
 
+	// lightServer serves phone light clients on the full node's TCP port.
+	// Default on, so every newcomer node can feed phones.
+	lightServer bool
+
 	//pprofPort http server port
 	pprofPort uint64
 
@@ -173,12 +177,6 @@ var startCmd = &cobra.Command{
 				scdoService.Miner().SetStopper(1)
 			}
 
-			lightServerService, err := light.NewServiceServer(scdoService, nCfg, lightLog, scdoNode.GetShardNumber())
-			if err != nil {
-				fmt.Println("Create light server err. ", err.Error())
-				return
-			}
-
 			// monitor service
 			monitorService, err := monitor.NewMonitorService(scdoService, scdoNode, nCfg, scdolog, "Test monitor")
 			if err != nil {
@@ -187,7 +185,20 @@ var startCmd = &cobra.Command{
 			}
 
 			services := manager.GetServices()
-			services = append(services, scdoService, monitorService, lightServerService)
+			services = append(services, scdoService, monitorService)
+			shard := scdoNode.GetShardNumber()
+			if lightServer {
+				lightServerService, err := light.NewServiceServer(scdoService, nCfg, lightLog, shard)
+				if err != nil {
+					fmt.Println("Create light server err. ", err.Error())
+					return
+				}
+				services = append(services, lightServerService)
+				fmt.Printf("Light server on (default). Protocol %s_%d version %d on TCP/UDP %s, the same port as full sync. Pass --lightserver=false to disable.\n",
+					light.LightProtoName, shard, light.LightScdoVersion, nCfg.P2PConfig.ListenAddr)
+			} else {
+				fmt.Println("Light server off (--lightserver=false). Phones cannot header-sync from this node.")
+			}
 			for _, service := range services {
 				if err := scdoNode.Register(service); err != nil {
 					fmt.Println(err.Error())
@@ -205,6 +216,10 @@ var startCmd = &cobra.Command{
 			if err != nil {
 				fmt.Printf("got error when start node: %s\n", err)
 				return
+			}
+			if lightServer && scdoService.P2PServer() != nil && scdoService.P2PServer().SelfNode != nil {
+				fmt.Printf("Phone bootnode: %s\n", scdoService.P2PServer().SelfNode)
+				fmt.Println("If that host is 0.0.0.0, substitute this machine's LAN address. On the .50 test network that is 192.168.50.50.")
 			}
 
 			if minerInfo == "start" {
@@ -251,6 +266,7 @@ func init() {
 	startCmd.Flags().StringVarP(&poolAccountsConfig, "poolaccounts", "", "", "init pool accounts")
 	startCmd.Flags().IntVarP(&threads, "threads", "", 1, "miner thread value")
 	startCmd.Flags().BoolVarP(&lightNode, "light", "l", false, "whether start with light mode")
+	startCmd.Flags().BoolVar(&lightServer, "lightserver", true, "serve phone light clients (lightScdo_<shard> version 1) on this node's TCP port. On by default")
 	startCmd.Flags().Uint64VarP(&pprofPort, "port", "", 0, "which port pprof http server listen to")
 	startCmd.Flags().IntVarP(&startHeight, "startheight", "", -1, "the block height to start from")
 	startCmd.Flags().IntVarP(&maxConns, "maxConns", "", 0, "node max connections")

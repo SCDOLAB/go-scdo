@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"sort"
@@ -628,7 +629,7 @@ func (srv *Server) setupConn(fd net.Conn, flags int, dialDest *discovery.Node) (
 	sort.Sort(capsByNameAndVersion(caps))
 	recvMsg, _, err := srv.doHandShake(caps, peer, flags, dialDest)
 	if err != nil {
-		srv.log.Debug("failed to do handshake with peer %s, err info %s", dialDest, err)
+		srv.log.Warn("failed to do handshake with peer %s, err info %s", dialDest, err)
 		peer.close()
 		if peer.Node != nil {
 			srv.deleteNode(peer.Node)
@@ -696,23 +697,26 @@ func (srv *Server) SetMaxActiveConnections(maxActiveConns int) {
 	srv.maxActiveConnections = maxActiveConns
 }
 
-func (srv *Server) peerIsValidate(recvMsg *ProtoHandShake) ([]Cap, bool) {
+func (srv *Server) peerIsValidate(recvMsg *ProtoHandShake) ([]Cap, error) {
 	// if recvMsg is nil, need to check, otherwise will panic due to nil pointer
-	if recvMsg.Params == nil {
-		return nil, false
+	if recvMsg == nil || recvMsg.Params == nil {
+		return nil, errors.New("handshake has no genesis")
 	}
 	// validate hash of genesisHash without shard
 	if !bytes.Equal(srv.genesisHash.Bytes(), recvMsg.Params) {
-		return nil, false
+		return nil, errors.New("genesis mismatch")
 	}
 
 	if srv.Config.NetworkID != recvMsg.NetworkID {
-		return nil, false
+		return nil, fmt.Errorf("network id mismatch: local %s, remote %s", srv.Config.NetworkID, recvMsg.NetworkID)
 	}
 
+	localCaps := make([]Cap, 0, len(srv.Protocols))
 	localCapSet := set.New()
 	for _, proto := range srv.Protocols {
-		localCapSet.Add(proto.cap())
+		cap := proto.cap()
+		localCaps = append(localCaps, cap)
+		localCapSet.Add(cap)
 	}
 
 	var capNameList []Cap
@@ -723,10 +727,38 @@ func (srv *Server) peerIsValidate(recvMsg *ProtoHandShake) ([]Cap, bool) {
 	}
 
 	if len(capNameList) == 0 {
-		return nil, false
+		return nil, fmt.Errorf("protocol mismatch: remote caps %s, local caps %s. A phone speaks lightScdo_<shard>/1 and needs a full node with the light server on (the default, same TCP port as full sync). Public Classic nodes speak only %s/%d and have no light server", formatCaps(recvMsg.Caps), formatCaps(localCaps), common.ScdoProtoName, common.ScdoVersion)
 	}
 
-	return capNameList, true
+	return capNameList, nil
+}
+
+func formatCaps(caps []Cap) string {
+	if len(caps) == 0 {
+		return "(none)"
+	}
+	parts := make([]string, len(caps))
+	for i, cap := range caps {
+		parts[i] = cap.String()
+	}
+	return strings.Join(parts, ",")
+}
+
+// explainHandshakeRead turns a dropped TCP connection into the reason a phone
+// can log. The remote node never sends its own error: it closes, and Read
+// returns EOF.
+func explainHandshakeRead(caps []Cap, peer string, err error) error {
+	if err == nil || !handshakeClosed(err) {
+		return err
+	}
+	if peer == "" {
+		peer = "unknown"
+	}
+	return fmt.Errorf("peer %s closed the connection during handshake before any reply (%s). This node offered %s. Public Classic nodes on ports 8057, 8058, 8059 and 8056 speak only %s/%d and have no light server, so a phone offering lightScdo_<shard>/1 gets EOF instead of a version error. Use a full node built from this tree; --lightserver is on by default and serves lightScdo_<shard>/1 on that node's TCP port", peer, err.Error(), formatCaps(caps), common.ScdoProtoName, common.ScdoVersion)
+}
+
+func handshakeClosed(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed)
 }
 
 func (srv *Server) getProtocolsByCaps(capList []Cap) (proList []Protocol) {
@@ -767,7 +799,7 @@ func (srv *Server) doHandShake(caps []Cap, peer *Peer, flags int, dialDest *disc
 
 		recvWrapMsg, err := peer.rw.ReadMsg()
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, explainHandshakeRead(caps, dialLabel(dialDest), err)
 		}
 
 		recvMsg, renounceCnt, err = srv.unPackWrapHSMsg(recvWrapMsg)
@@ -779,9 +811,9 @@ func (srv *Server) doHandShake(caps []Cap, peer *Peer, flags int, dialDest *disc
 			return nil, 0, errors.New("client nounceCnt is changed")
 		}
 
-		capList, bValid := srv.peerIsValidate(recvMsg)
-		if !bValid {
-			return nil, 0, errors.New("node is not consistent with groups")
+		capList, verr := srv.peerIsValidate(recvMsg)
+		if verr != nil {
+			return nil, 0, verr
 		}
 
 		sort.Sort(capsByNameAndVersion(capList))
@@ -799,9 +831,15 @@ func (srv *Server) doHandShake(caps []Cap, peer *Peer, flags int, dialDest *disc
 			return nil, 0, err
 		}
 
-		capList, bValid := srv.peerIsValidate(recvMsg)
-		if !bValid {
-			return nil, 0, errors.New("node is not consistent with groups")
+		capList, verr := srv.peerIsValidate(recvMsg)
+		if verr != nil {
+			// Reply with our caps, then fail. A matching wire peer can then
+			// log the protocol mismatch. A node that only hangs up still
+			// looks like EOF to the dialer, which explainHandshakeRead names.
+			if wrapMsg, werr := srv.packWrapHSMsg(handshakeMsg, recvMsg.NodeID[0:], nounceCnt); werr == nil {
+				_ = peer.rw.WriteMsg(wrapMsg)
+			}
+			return nil, 0, verr
 		}
 
 		sort.Sort(capsByNameAndVersion(capList))
@@ -817,6 +855,13 @@ func (srv *Server) doHandShake(caps []Cap, peer *Peer, flags int, dialDest *disc
 		}
 	}
 	return
+}
+
+func dialLabel(n *discovery.Node) string {
+	if n == nil {
+		return ""
+	}
+	return n.String()
 }
 
 // packWrapHSMsg compose the wrapped send msg.
