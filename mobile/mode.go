@@ -17,8 +17,13 @@ import (
 	"github.com/scdoproject/go-scdo/light"
 	"github.com/scdoproject/go-scdo/node"
 	"github.com/scdoproject/go-scdo/p2p"
+	"github.com/scdoproject/go-scdo/p2p/discovery"
 	"github.com/scdoproject/go-scdo/scdo"
 )
+
+// bootnodeOverride replaces the public Classic seeds when non-empty.
+// SetBootnodes writes it before Start.
+var bootnodeOverride string
 
 const (
 	// ModeLite is the header-only client.
@@ -128,7 +133,7 @@ func proRPCAddr(shard, primary uint) string {
 	return fmt.Sprintf("127.0.0.1:%d", 18037+int(shard))
 }
 
-func baseConfig(dataDir string) *node.Config {
+func baseConfig(dataDir string) (*node.Config, error) {
 	conf := &node.Config{}
 	conf.BasicConfig.Name = "SCDO Mobile"
 	conf.BasicConfig.Version = common.ScdoNodeVersion
@@ -138,8 +143,45 @@ func baseConfig(dataDir string) *node.Config {
 	conf.HTTPServer.HTTPWhiteHost = []string{"*"}
 	conf.P2PConfig.NetworkID = "net1"
 	conf.ScdoConfig.GenesisConfig.Difficult = 1900000
-	p2p.MergeBootnodes(&conf.P2PConfig)
-	return conf
+	if err := applyBootnodes(&conf.P2PConfig); err != nil {
+		return nil, err
+	}
+	return conf, nil
+}
+
+// applyBootnodes uses SetBootnodes when the wallet passed LAN peers.
+// Otherwise the public Classic seeds are used, and those nodes have no light server.
+func applyBootnodes(cfg *p2p.Config) error {
+	raw := strings.TrimSpace(bootnodeOverride)
+	if raw == "" {
+		p2p.MergeBootnodes(cfg)
+		return nil
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == ';'
+	})
+	cfg.StaticNodes = nil
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		var node *discovery.Node
+		var err error
+		if strings.HasPrefix(part, "snode://") {
+			node, err = discovery.NewNodeFromString(part)
+		} else {
+			node, err = discovery.NewNodeFromIP(part)
+		}
+		if err != nil {
+			return fmt.Errorf("bootnode %q: %s", part, err.Error())
+		}
+		cfg.StaticNodes = append(cfg.StaticNodes, node)
+	}
+	if len(cfg.StaticNodes) == 0 {
+		return fmt.Errorf("no bootnodes in %q", raw)
+	}
+	return nil
 }
 
 type heightSample struct {

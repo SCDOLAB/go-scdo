@@ -124,3 +124,26 @@ func TestETAFromHeightSamples(t *testing.T) {
 		t.Fatal(common.ScdoForkHeight)
 	}
 }
+
+func TestSetBootnodesReplacesPublicSeeds(t *testing.T) {
+	const url = "snode://0101f3c956d0a320b153a097c3d04efa488d43d1@192.168.50.50:10057[1]"
+	if err := SetBootnodes(url); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = SetBootnodes("") })
+
+	conf, err := baseConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conf.P2PConfig.StaticNodes) != 1 {
+		t.Fatalf("bootnodes %d, want 1", len(conf.P2PConfig.StaticNodes))
+	}
+	node := conf.P2PConfig.StaticNodes[0]
+	if node.UDPPort != 10057 || node.Shard != 1 || node.IP.String() != "192.168.50.50" {
+		t.Fatalf("bootnode %+v", node)
+	}
+	if !strings.Contains(node.String(), "192.168.50.50:10057") {
+		t.Fatal(node.String())
+	}
+}

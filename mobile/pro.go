@@ -19,7 +19,10 @@ import (
 )
 
 func startLite(dataDir string, shards []uint) (*session, error) {
-	conf := baseConfig(dataDir)
+	conf, err := baseConfig(dataDir)
+	if err != nil {
+		return nil, err
+	}
 	conf.BasicConfig.Name = "SCDO Light"
 	conf.HTTPServer.HTTPAddr = RPCAddress
 	conf.P2PConfig.ListenAddr = P2PAddress
@@ -78,7 +81,11 @@ func startPro(dataDir string, shards []uint) (*session, error) {
 	// Debt checks reuse the lite header databases under dataDir/db.
 	// One manager owns each database. The full shards share it.
 	liteCtx := serviceContext(dataDir)
-	manager, err := lightclients.NewLightClientManager(0, liteCtx, baseConfig(dataDir), engine)
+	liteConf, err := baseConfig(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	manager, err := lightclients.NewLightClientManager(0, liteCtx, liteConf, engine)
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +118,10 @@ func startPro(dataDir string, shards []uint) (*session, error) {
 	}
 	for i, shard := range shards {
 		dir := ProShardDir(dataDir, shard)
-		conf := baseConfig(dir)
+		conf, err := baseConfig(dir)
+		if err != nil {
+			return fail(err)
+		}
 		conf.BasicConfig.Name = fmt.Sprintf("SCDO Pro %d", shard)
 		conf.BasicConfig.DbCache = cacheMB
 		conf.ScdoConfig.GenesisConfig.ShardNumber = shard

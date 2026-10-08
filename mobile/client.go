@@ -4,6 +4,9 @@
 //
 // The bind needs a C compiler because the node id uses libsecp256k1.
 //
+// SetBootnodes, called before Start, replaces the public seeds with LAN
+// snode URLs. The public Classic nodes have no light server.
+//
 // Start(dataDir, mode, shards) runs one of two modes. Lite header-syncs the
 // selected shards from fork genesis and checks every header with ZPoW. There
 // is no snapshot. After a header checks out, older ones are pruned down to
@@ -68,6 +71,20 @@ func (s *session) stop() {
 			s.nodes[i].Stop()
 		}
 	}
+}
+
+// SetBootnodes replaces the public Classic seeds for the next Start.
+// nodes is a comma-separated list of snode URLs or host:port values.
+// Call it before Start. An empty string restores the public seeds
+// (ports 8057, 8058, 8059, 8056). Those public nodes have no light server.
+func SetBootnodes(nodes string) error {
+	mu.Lock()
+	defer mu.Unlock()
+	if current != nil {
+		return fmt.Errorf("node is already started")
+	}
+	bootnodeOverride = strings.TrimSpace(nodes)
+	return nil
 }
 
 // Start runs lite or pro for the selected Classic shards.
