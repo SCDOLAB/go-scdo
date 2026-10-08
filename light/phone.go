@@ -31,8 +31,14 @@ type ShardStatus struct {
 	ForkGenesis uint64 `json:"forkGenesis"`
 	Paused      bool   `json:"paused"`
 	PauseReason string `json:"pauseReason,omitempty"`
-	Retained    uint64 `json:"retained"`
-	MMRLeaves   uint64 `json:"mmrLeaves"`
+	Network     string `json:"network"`
+	ETA         string `json:"eta"`
+	DiskBytes   uint64 `json:"diskBytes"`
+	// HeaderDiskBytes is the verified header database. Pro mode leaves it in
+	// place when the full shard database is separate.
+	HeaderDiskBytes uint64 `json:"headerDiskBytes,omitempty"`
+	Retained        uint64 `json:"retained"`
+	MMRLeaves       uint64 `json:"mmrLeaves"`
 }
 
 // Status reports this shard's header tip. Mode is always headers.
@@ -43,6 +49,8 @@ func (s *ServiceClient) Status() ShardStatus {
 		ForkGenesis: common.ScdoForkHeight,
 		Paused:      paused,
 		PauseReason: reason,
+		Network:     NetworkLabel(),
+		ETA:         "unknown",
 		Retained:    RetainedHeaders,
 	}
 	if s == nil {
@@ -73,18 +81,23 @@ func (s *ServiceClient) Status() ShardStatus {
 // Only the home shard publishes the scdo RPC namespace. Callers register every
 // client plus NewMultiService.
 func OpenShards(ctx context.Context, conf *node.Config, engine consensus.Engine) ([]*ServiceClient, error) {
+	return OpenShardSet(ctx, conf, engine, nil)
+}
+
+// OpenShardSet is OpenShards limited to shards. An empty list opens shards 1-4.
+// The folder is db/lightchainforshard_N under the context data directory.
+func OpenShardSet(ctx context.Context, conf *node.Config, engine consensus.Engine, shards []uint) ([]*ServiceClient, error) {
 	if conf == nil {
 		return nil, fmt.Errorf("config is nil")
 	}
-	home := conf.ScdoConfig.GenesisConfig.ShardNumber
-	if home == 0 {
-		home = common.LocalShardNumber
+	if len(shards) == 0 {
+		for shard := uint(1); shard <= uint(common.ShardCount); shard++ {
+			shards = append(shards, shard)
+		}
 	}
-	if home == 0 {
-		home = 1
-	}
+	home := shards[0]
 	clients := make([]*ServiceClient, common.ShardCount+1)
-	for shard := uint(1); shard <= uint(common.ShardCount); shard++ {
+	for _, shard := range shards {
 		copyConf := conf.Clone()
 		copyConf.ScdoConfig.GenesisConfig.ShardNumber = shard
 		folder := filepath.Join("db", fmt.Sprintf("lightchainforshard_%d", shard))
@@ -101,6 +114,23 @@ func OpenShards(ctx context.Context, conf *node.Config, engine consensus.Engine)
 		clients[shard] = client
 	}
 	return clients, nil
+}
+
+// NetworkLabel is what the wallet should show for the sync gate.
+// A metered network is allowed unless the policy says to pause, because
+// the phone syncs on 5G in real time.
+func NetworkLabel() string {
+	paused, reason := SyncPause()
+	if paused {
+		if reason == "" {
+			return "paused"
+		}
+		return "paused:" + reason
+	}
+	if DeviceMetered() {
+		return "metered-allowed"
+	}
+	return "unmetered"
 }
 
 // PublicAPI is the light RPC namespace for a wallet on the phone.

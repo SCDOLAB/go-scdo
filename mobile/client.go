@@ -1,21 +1,25 @@
-// Package mobile is the SCDO Classic light client for an Android wallet.
+// Package mobile is the SCDO Classic node embedded in an Android wallet.
 //
 // gomobile bind -target=android -o scdo.aar github.com/scdoproject/go-scdo/mobile
 //
 // The bind needs a C compiler because the node id uses libsecp256k1.
-// Start header-syncs shards 1-4 from fork genesis and checks every header
-// with ZPoW. There is no snapshot. After a header checks out, older ones
-// are pruned down to the last 10_000 per shard. A hash accumulator keeps
-// older transaction proofs checkable. Balance, transaction and debt calls
-// return Merkle proofs the node has already checked. Sync pauses when the
-// app reports a metered network or a low battery.
 //
-// The same process also serves JSON-RPC on 127.0.0.1:18037 under the light
-// namespace. See docs/mobile-light-client.md.
+// Start(dataDir, mode, shards) runs one of two modes. Lite header-syncs the
+// selected shards from fork genesis and checks every header with ZPoW. There
+// is no snapshot. After a header checks out, older ones are pruned down to
+// the last 10_000 per shard. A hash accumulator keeps older transaction
+// proofs checkable. Pro downloads full blocks and state for the selected
+// shards and validates them from fork genesis, again with no snapshot.
+// Switching lite to pro leaves the verified header databases in place.
+//
+// The default sync policy allows a metered network (5G) and pauses on a low
+// battery. The app reports that state through SetDeviceState.
+//
+// The process serves JSON-RPC on 127.0.0.1:18037 under the light namespace.
+// See docs/mobile-light-client.md.
 package mobile
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,7 +29,6 @@ import (
 
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/common/hexutil"
-	"github.com/scdoproject/go-scdo/consensus/factory"
 	"github.com/scdoproject/go-scdo/crypto"
 	"github.com/scdoproject/go-scdo/light"
 	"github.com/scdoproject/go-scdo/node"
@@ -47,96 +50,91 @@ var (
 )
 
 type session struct {
-	n   *node.Node
-	api *light.PublicAPI
+	mode    string
+	shards  []uint
+	dataDir string
+	nodes   []*node.Node
+	api     *light.PublicAPI
+	full    map[uint]*scdo.ScdoService
+	samples map[uint]heightSample
 }
 
-// Start header-syncs all four Classic shards into dataDir.
+func (s *session) stop() {
+	if s == nil {
+		return
+	}
+	for i := len(s.nodes) - 1; i >= 0; i-- {
+		if s.nodes[i] != nil {
+			s.nodes[i].Stop()
+		}
+	}
+}
+
+// Start runs lite or pro for the selected Classic shards.
+// mode is "lite" or "pro". shards is "1,2,3,4" (empty means all four).
 // A relative dataDir is placed under $HOME/.scdo. An empty dataDir uses $HOME/.scdo.
-func Start(dataDir string) error {
+// Calling Start again after Stop resumes from the databases already on disk.
+// Pro does not delete the lite header databases.
+func Start(dataDir, mode, shards string) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if current != nil {
-		return fmt.Errorf("light node is already started")
+		return fmt.Errorf("node is already started")
+	}
+	parsedMode, err := ParseMode(mode)
+	if err != nil {
+		return err
+	}
+	parsedShards, err := ParseShards(shards)
+	if err != nil {
+		return err
 	}
 	dataDir = common.ResolveDataDir(dataDir)
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
+	if err = os.MkdirAll(dataDir, 0700); err != nil {
 		return err
 	}
-	conf := &node.Config{}
-	conf.BasicConfig.Name = "SCDO Light"
-	conf.BasicConfig.Version = common.ScdoNodeVersion
-	conf.BasicConfig.DataDir = dataDir
-	conf.BasicConfig.MinerAlgorithm = common.ZpowAlgorithm
-	conf.HTTPServer.HTTPAddr = RPCAddress
-	conf.HTTPServer.HTTPCors = []string{"*"}
-	conf.HTTPServer.HTTPWhiteHost = []string{"*"}
-	conf.P2PConfig.NetworkID = "net1"
-	conf.P2PConfig.ListenAddr = P2PAddress
-	conf.ScdoConfig.GenesisConfig.ShardNumber = 1
-	conf.ScdoConfig.GenesisConfig.Difficult = 1900000
-	p2p.MergeBootnodes(&conf.P2PConfig)
-	if err := loadP2PKey(&conf.P2PConfig, dataDir); err != nil {
-		return err
-	}
+	metered, battery := DefaultSyncPolicy()
+	light.SetSyncPolicy(metered, battery)
+	scdo.ExternalSyncPause = light.SyncPause
 
-	engine, err := factory.GetConsensusEngine(common.ZpowAlgorithm)
+	var sess *session
+	if parsedMode == ModePro {
+		sess, err = startPro(dataDir, parsedShards)
+	} else {
+		sess, err = startLite(dataDir, parsedShards)
+	}
 	if err != nil {
 		return err
 	}
-	ctx := context.WithValue(context.Background(), "ServiceContext", scdo.ServiceContext{DataDir: dataDir})
-	n, err := node.New(conf)
-	if err != nil {
-		return err
-	}
-	clients, err := light.OpenShards(ctx, conf, engine)
-	if err != nil {
-		return err
-	}
-	for _, client := range clients {
-		if client == nil {
-			continue
-		}
-		if err = n.Register(client); err != nil {
-			return err
-		}
-	}
-	service, api := light.Bind(clients)
-	if err = n.Register(service); err != nil {
-		return err
-	}
-	// The desktop -l node leaves this off. A phone opts in, then reports
-	// the OS state through SetDeviceState.
-	light.SetSyncPolicy(true, true)
-	if err = n.Start(); err != nil {
-		return err
-	}
-	current = &session{n: n, api: api}
+	current = sess
 	return nil
 }
 
-// Stop shuts the light node down.
+// Stop shuts the node down. Header and full databases stay on disk.
 func Stop() {
 	mu.Lock()
 	defer mu.Unlock()
 	if current == nil {
 		return
 	}
-	current.n.Stop()
+	current.stop()
 	current = nil
 }
 
-// Syncing returns JSON header progress for shards 1-4.
+// Status returns a JSON array, one object per running shard: height, peer
+// height, peers, network, ETA, and disk used.
+func Status() string {
+	mu.Lock()
+	defer mu.Unlock()
+	if current == nil {
+		return jsonErr("node is not started")
+	}
+	return jsonOK(current.statuses())
+}
+
+// Syncing is Status. The wallet can call either name.
 func Syncing() string {
-	api := api()
-	if api == nil {
-		return jsonErr("light node is not started")
-	}
-	status, err := api.Syncing()
-	if err != nil {
-		return jsonErr(err.Error())
-	}
-	return jsonOK(status)
+	return Status()
 }
 
 // Balance returns the JSON account proof for address. The proof is checked
@@ -144,7 +142,7 @@ func Syncing() string {
 func Balance(address string) string {
 	api := api()
 	if api == nil {
-		return jsonErr("light node is not started")
+		return jsonErr("node is not started")
 	}
 	account, err := common.HexToAddress(address)
 	if err != nil {
@@ -161,7 +159,7 @@ func Balance(address string) string {
 func TxProof(txHash string) string {
 	api := api()
 	if api == nil {
-		return jsonErr("light node is not started")
+		return jsonErr("node is not started")
 	}
 	proof, err := api.GetTxProof(txHash)
 	if err != nil {
@@ -174,7 +172,7 @@ func TxProof(txHash string) string {
 func DebtProof(debtHash string) string {
 	api := api()
 	if api == nil {
-		return jsonErr("light node is not started")
+		return jsonErr("node is not started")
 	}
 	proof, err := api.GetDebtProof(debtHash)
 	if err != nil {
@@ -197,28 +195,50 @@ func Estimate(head int64) string {
 	return jsonOK(est)
 }
 
-// Pause stops header downloads. The verified tip stays on disk.
+// Pause stops downloads. The verified tip stays on disk.
 func Pause(reason string) error {
 	light.Pause(reason)
+	cancelFullDownloads()
 	return nil
 }
 
-// Resume clears a manual pause. A metered network or low battery can still hold sync.
+// Resume clears a manual pause. A low battery can still hold sync.
 func Resume() error {
 	light.Resume()
 	return nil
 }
 
 // SetSyncPolicy chooses whether a metered network or a low battery pauses sync.
+// The Start default is metered=false (5G allowed) and low battery=true.
 func SetSyncPolicy(pauseOnMetered, pauseOnLowBattery bool) error {
 	light.SetSyncPolicy(pauseOnMetered, pauseOnLowBattery)
+	if paused, _ := light.SyncPause(); paused {
+		cancelFullDownloads()
+	}
 	return nil
 }
 
 // SetDeviceState reports the phone's network and battery. Go cannot read those itself.
 func SetDeviceState(metered, lowBattery bool) error {
 	light.SetDeviceState(metered, lowBattery)
+	if paused, _ := light.SyncPause(); paused {
+		cancelFullDownloads()
+	}
 	return nil
+}
+
+func cancelFullDownloads() {
+	mu.Lock()
+	defer mu.Unlock()
+	if current == nil {
+		return
+	}
+	for _, svc := range current.full {
+		if svc == nil || svc.Downloader() == nil {
+			continue
+		}
+		svc.Downloader().Cancel()
+	}
 }
 
 // VerifyHeader checks headerHex (RLP hex) and siblingsJSON (hex hash array)
@@ -226,7 +246,7 @@ func SetDeviceState(metered, lowBattery bool) error {
 func VerifyHeader(shard int, headerHex, siblingsJSON string) string {
 	api := api()
 	if api == nil {
-		return jsonErr("light node is not started")
+		return jsonErr("node is not started")
 	}
 	var siblings []string
 	if err := json.Unmarshal([]byte(siblingsJSON), &siblings); err != nil {
@@ -251,7 +271,7 @@ func VerifyDebt(shard int, headerHex, siblingsJSON, debtHash, proofJSON string) 
 func verifyTrie(shard int, headerHex, siblingsJSON, itemHash, proofJSON string, tx bool) string {
 	api := api()
 	if api == nil {
-		return jsonErr("light node is not started")
+		return jsonErr("node is not started")
 	}
 	var siblings []string
 	if err := json.Unmarshal([]byte(siblingsJSON), &siblings); err != nil {

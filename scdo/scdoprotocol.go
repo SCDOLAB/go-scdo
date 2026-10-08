@@ -85,10 +85,20 @@ type ScdoProtocol struct {
 	log    *log.ScdoLog
 
 	debtManager *DebtManager
+
+	// shard is this chain's genesis shard. Zero falls back to the process global.
+	shard uint
 }
 
 // Downloader return a pointer of the downloader
 func (s *ScdoProtocol) Downloader() *downloader.Downloader { return s.downloader }
+
+func (sp *ScdoProtocol) localShard() uint {
+	if sp != nil && sp.shard > 0 {
+		return sp.shard
+	}
+	return common.LocalShardNumber
+}
 
 // NewScdoProtocol create ScdoProtocol
 func NewScdoProtocol(scdo *ScdoService, log *log.ScdoLog) (s *ScdoProtocol, err error) {
@@ -108,6 +118,11 @@ func NewScdoProtocol(scdo *ScdoService, log *log.ScdoLog) (s *ScdoProtocol, err 
 		syncCh:     make(chan struct{}),
 
 		peerSet: newPeerSet(),
+	}
+	if s.chain != nil {
+		if n, err := s.chain.GetShardNumber(); err == nil {
+			s.shard = n
+		}
 	}
 
 	s.Protocol.AddPeer = s.handleAddPeer
@@ -160,7 +175,7 @@ func (sp *ScdoProtocol) syncer() {
 				continue
 			}
 			sp.wg.Add(1)
-			go sp.synchronise(sp.peerSet.bestPeers(common.LocalShardNumber, localTD))
+			go sp.synchronise(sp.peerSet.bestPeers(sp.localShard(), localTD))
 		case <-forceSync.C:
 			if !sp.downloader.IsSyncStatusNone() {
 				continue
@@ -173,7 +188,7 @@ func (sp *ScdoProtocol) syncer() {
 				continue
 			}
 			sp.wg.Add(1)
-			go sp.synchronise(sp.peerSet.bestPeers(common.LocalShardNumber, localTD))
+			go sp.synchronise(sp.peerSet.bestPeers(sp.localShard(), localTD))
 		case <-sp.quitCh:
 			return
 		}
@@ -182,6 +197,9 @@ func (sp *ScdoProtocol) syncer() {
 
 func (sp *ScdoProtocol) synchronise(peers []*peer) {
 	defer sp.wg.Done()
+	if syncPaused() {
+		return
+	}
 	now := time.Now()
 	// entrance
 	memory.Print(sp.log, "ScdoProtocol synchronise entrance", now, false)
@@ -375,6 +393,9 @@ func (p *ScdoProtocol) propagateDebtMap(debtsMap [][]*types.Debt, filter bool) {
 
 func (p *ScdoProtocol) handleNewBlock(e event.Event) {
 	block := e.(*types.Block)
+	if p.chain != nil && p.chain.ChainShard() > 0 && block.GetShardNumber() > 0 && block.GetShardNumber() != p.chain.ChainShard() {
+		return
+	}
 
 	// propagate confirmed block
 	if block.Header.Height > common.ConfirmedBlockNumber {
@@ -392,7 +413,7 @@ func (p *ScdoProtocol) handleNewBlock(e event.Event) {
 			// entrance
 			memory.Print(p.log, "ScdoProtocol handleNewBlock entrance", now, false)
 
-			debts := types.NewDebtMap(confirmedBlock.Transactions)
+			debts := types.NewDebtMapOnShard(confirmedBlock.Transactions, p.localShard())
 			size := 0
 			for i := 0; i < len(debts); i++ {
 				size += len(debts[i])
@@ -414,6 +435,9 @@ func (p *ScdoProtocol) handleNewMinedBlock(e event.Event) {
 	// entrance
 	memory.Print(p.log, "ScdoProtocol handleNewMinedBlock entrance", now, false)
 	block := e.(*types.Block)
+	if p.chain != nil && p.chain.ChainShard() > 0 && block.GetShardNumber() > 0 && block.GetShardNumber() != p.chain.ChainShard() {
+		return
+	}
 
 	p.log.Debug("handleNewMinedBlock broadcast chainhead changed. new block: %d %s <- %s ",
 		block.Header.Height, block.HeaderHash.Hex(), block.Header.PreviousBlockHash.Hex())
@@ -444,7 +468,7 @@ func (p *ScdoProtocol) handleAddPeer(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) bo
 		return false
 	}
 
-	if err := newPeer.handShake(p.networkID, localTD, head, genesisBlock.HeaderHash, genesisBlock.Header.Difficulty.Uint64()); err != nil {
+	if err := newPeer.handShake(p.networkID, localTD, head, genesisBlock.HeaderHash, genesisBlock.Header.Difficulty.Uint64(), p.localShard()); err != nil {
 		p.log.Debug("handleAddPeer err. %s", err)
 		newPeer.Disconnect(DiscHandShakeErr)
 		return false
@@ -452,7 +476,7 @@ func (p *ScdoProtocol) handleAddPeer(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) bo
 
 	p.log.Debug("add peer %s -> %s to ScdoProtocol. nodeid=%s", p2pPeer.LocalAddr(), p2pPeer.RemoteAddr(), newPeer.peerStrID)
 	p.peerSet.Add(newPeer)
-	if newPeer.Node.Shard == common.LocalShardNumber {
+	if newPeer.Node.Shard == p.localShard() {
 		p.downloader.RegisterPeer(newPeer.peerStrID, newPeer)
 
 	}
@@ -472,7 +496,7 @@ func (s *ScdoProtocol) handleDelPeer(peer *p2p.Peer) {
 	s.log.Debug("delete peer from peer set. %s", peer.Node)
 	s.peerSet.Remove(peer.Node.ID)
 
-	if peer.Node.Shard == common.LocalShardNumber {
+	if peer.Node.Shard == s.localShard() {
 		s.downloader.UnRegisterPeer(idToStr(peer.Node.ID))
 	}
 }
@@ -510,7 +534,7 @@ handler:
 		}
 
 		// skip unsupported message from different shard peer
-		if peer.Node.Shard != common.LocalShardNumber {
+		if peer.Node.Shard != p.localShard() {
 			if msg.Code != transactionsMsgCode && msg.Code != debtMsgCode && msg.Code != statusChainHeadMsgCode {
 				continue
 			}
@@ -591,7 +615,7 @@ handler:
 				for _, tx := range txs {
 					peer.knownTxs.Add(tx.Hash, nil)
 					shard := tx.Data.From.Shard()
-					if shard != common.LocalShardNumber {
+					if shard != p.localShard() {
 						p.SendDifferentShardTx(tx, shard)
 						continue
 					} else {
@@ -667,7 +691,7 @@ handler:
 
 			p.log.Info("got block message and save it. height:%d, hash:%s, time: %d", block.Header.Height, block.HeaderHash.Hex(), time.Now().UnixNano())
 			peer.knownBlocks.Add(block.HeaderHash, nil)
-			if block.GetShardNumber() == common.LocalShardNumber {
+			if block.GetShardNumber() == p.localShard() {
 				// @todo need to make sure WriteBlock handle block fork
 				go p.chain.WriteBlock(&block, p.txPool.Pool)
 			}
@@ -855,7 +879,7 @@ func (p *ScdoProtocol) GetProtocolVersion() (uint, error) {
 
 func (sp *ScdoProtocol) FindPeers(targets map[common.Address]bool) map[common.Address]consensus.Peer {
 	m := make(map[common.Address]consensus.Peer)
-	for _, p := range sp.peerSet.getPeerByShard(common.LocalShardNumber) {
+	for _, p := range sp.peerSet.getPeerByShard(sp.localShard()) {
 		addr := p.Node.ID
 		if targets[addr] {
 			m[addr] = p

@@ -149,7 +149,7 @@ func (s *ScdoService) initBlockchainDB(serviceContext *ServiceContext) (err erro
 	if cacheMB <= 0 {
 		cacheMB = leveldb.AutoCacheMB(s.chainDBPath)
 	}
-	s.log.Info("chain db cache %d MB (larger while the chain directory is still small)", cacheMB)
+	s.log.Info("chain db cache %d MB", cacheMB)
 	if s.chainDB, err = leveldb.NewLevelDBWithCache(s.chainDBPath, cacheMB); err != nil {
 		s.log.Error("NewScdoService Create BlockChain err. %s", err)
 		return err
@@ -223,6 +223,9 @@ func (s *ScdoService) initPool(conf *node.Config) (err error) {
 
 	s.chainHeaderChangeChannel = make(chan common.Hash, chainHeaderChangeBuffSize)
 	s.debtPool = core.NewDebtPool(s.chain, s.debtVerifier)
+	if n, err := s.chain.GetShardNumber(); err == nil {
+		s.debtPool.SetShard(n)
+	}
 	s.txPool = core.NewTransactionPool(conf.ScdoConfig.TxConf, s.chain)
 
 	event.ChainHeaderChangedEventMananger.AddAsyncListener(s.chainHeaderChanged)
@@ -237,6 +240,12 @@ func (s *ScdoService) initPool(conf *node.Config) (err error) {
 func (s *ScdoService) chainHeaderChanged(e event.Event) {
 	newBlock := e.(*types.Block)
 	if newBlock == nil || newBlock.HeaderHash.IsEmpty() {
+		return
+	}
+	// Several full shards share one header-changed bus. Ignore a block that
+	// belongs to a different genesis shard. A test chain with shard 0 keeps
+	// the old behaviour.
+	if s.chain != nil && s.chain.ChainShard() > 0 && newBlock.GetShardNumber() > 0 && newBlock.GetShardNumber() != s.chain.ChainShard() {
 		return
 	}
 

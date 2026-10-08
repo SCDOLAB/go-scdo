@@ -140,6 +140,14 @@ func (manager *LightClientsManager) ShardHeights() []types.ShardHeight {
 	return out
 }
 
+// Clients returns the header clients, indexed by shard. Index 0 is unused.
+func (manager *LightClientsManager) Clients() []*light.ServiceClient {
+	if manager == nil {
+		return nil
+	}
+	return manager.lightClients
+}
+
 // GetServices get node service
 func (manager *LightClientsManager) GetServices() []node.Service {
 	services := make([]node.Service, 0)

@@ -19,7 +19,7 @@ import (
 )
 
 func TestCallsBeforeStart(t *testing.T) {
-	if !strings.Contains(Syncing(), "light node is not started") {
+	if !strings.Contains(Syncing(), "node is not started") {
 		t.Fatalf("syncing: %s", Syncing())
 	}
 	if !strings.Contains(Balance("1S01dfdbe4d921d507032cb83ee04bb7efc4fd9a51"), "error") {
@@ -54,6 +54,19 @@ func TestEstimateJSON(t *testing.T) {
 	if est.RetainedPerShard != light.RetainedHeaders {
 		t.Fatalf("%+v", est)
 	}
+	if est.Pro.DiskBytes <= est.PhoneStorageBytes {
+		t.Fatalf("pro disk %d should exceed lite budget %d", est.Pro.DiskBytes, est.PhoneStorageBytes)
+	}
+	if est.Pro.MemoryPerShardBytes == 0 || est.Pro.AllShardsDiskBytes < est.Pro.DiskBytes*4 {
+		t.Fatalf("%+v", est.Pro)
+	}
+	if est.Pro.BodyBytesPerBlock != 2048 || est.Pro.StateBytes != 512<<20 {
+		t.Fatalf("%+v", est.Pro)
+	}
+	t.Logf("lite phone bytes %d download %d", est.PhoneStorageBytes, est.DownloadBytes)
+	t.Logf("pro per shard raw %d budget %d memory %d four-shard budget %d four-shard memory %d scaled memory %d",
+		est.Pro.RawDiskBytes, est.Pro.DiskBytes, est.Pro.MemoryPerShardBytes,
+		est.Pro.AllShardsDiskBytes, est.Pro.MemoryAllShardsBytes, est.Pro.ScaledMemoryAllShards)
 }
 
 func TestSyncPolicyPausesOnMetered(t *testing.T) {
@@ -96,7 +109,7 @@ func TestSyncPolicyPausesOnMetered(t *testing.T) {
 	if paused {
 		t.Fatal("expected sync to resume")
 	}
-	if !strings.Contains(VerifyHeader(1, "0x", "[]"), "light node is not started") {
+	if !strings.Contains(VerifyHeader(1, "0x", "[]"), "node is not started") {
 		t.Fatal(VerifyHeader(1, "0x", "[]"))
 	}
 }

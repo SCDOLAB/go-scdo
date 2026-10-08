@@ -77,3 +77,26 @@ func Test_DebtSize(t *testing.T) {
 	fmt.Println(len(buff) / 5)
 	assert.Equal(t, len(buff)/5, DebtSize-2)
 }
+
+// A same-shard transfer is not a debt on that shard. The process-wide shard
+// must not decide the debt root when several full nodes share a process.
+func TestNewDebtsFollowsBlockShard(t *testing.T) {
+	prev := common.LocalShardNumber
+	common.LocalShardNumber = 1
+	t.Cleanup(func() { common.LocalShardNumber = prev })
+
+	from, key := crypto.MustGenerateShardKeyPair(2)
+	to := crypto.MustGenerateShardAddress(2)
+	tx, err := NewMessageTransaction(*from, *to, big.NewInt(1), big.NewInt(1), 30000, 0, []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Sign(key)
+
+	if got := len(NewDebts([]*Transaction{tx})); got != 1 {
+		t.Fatalf("global shard 1 should count a shard-2 transfer as a debt, got %d", got)
+	}
+	if got := len(NewDebtsOnShard([]*Transaction{tx}, 2)); got != 0 {
+		t.Fatalf("shard 2 should not count a same-shard transfer as a debt, got %d", got)
+	}
+}

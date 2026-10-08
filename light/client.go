@@ -56,8 +56,10 @@ func NewServiceClient(ctx context.Context, conf *node.Config, log *log.ScdoLog, 
 	chainDBPath := filepath.Join(serviceContext.DataDir, dbFolder)
 	log.Info("NewServiceClient BlockChain datadir is %s", chainDBPath)
 	cacheMB := leveldb.AutoCacheMB(chainDBPath)
-	if cacheMB > 128 {
-		cacheMB = 128
+	// Four header databases share a phone. 32 MiB of block cache each is
+	// enough for the retained window; the old 128–512 MiB cap is not.
+	if cacheMB > 32 {
+		cacheMB = 32
 	}
 	log.Info("light chain shard %d db cache %d MB", shard, cacheMB)
 	s.lightDB, err = leveldb.NewLevelDBWithCache(chainDBPath, cacheMB)

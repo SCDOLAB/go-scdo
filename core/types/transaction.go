@@ -211,6 +211,10 @@ func newTx(from common.Address, to common.Address, amount *big.Int, price *big.I
 
 // ValidateWithoutState validates state independent fields in tx.
 func (tx *Transaction) ValidateWithoutState(signNeeded bool, shardNeeded bool) error {
+	return tx.validateWithoutState(signNeeded, shardNeeded, common.LocalShardNumber)
+}
+
+func (tx *Transaction) validateWithoutState(signNeeded bool, shardNeeded bool, shard uint) error {
 	// validate from/to address
 	if err := tx.Data.From.Validate(); err != nil {
 		return err
@@ -254,8 +258,11 @@ func (tx *Transaction) ValidateWithoutState(signNeeded bool, shardNeeded bool) e
 
 	// validate shard of from address
 	if shardNeeded && common.IsShardEnabled() {
-		if fromShardNum := tx.Data.From.Shard(); fromShardNum != common.LocalShardNumber {
-			return fmt.Errorf("invalid from address, shard number is [%v], but coinbase shard number is [%v]", fromShardNum, common.LocalShardNumber)
+		if shard == 0 {
+			shard = common.LocalShardNumber
+		}
+		if fromShardNum := tx.Data.From.Shard(); fromShardNum != shard {
+			return fmt.Errorf("invalid from address, shard number is [%v], but coinbase shard number is [%v]", fromShardNum, shard)
 		}
 	}
 
@@ -381,8 +388,17 @@ func GetTxTrie(txs []*Transaction) *trie.Trie {
 // Because the signature verification is time consuming (see test Benchmark_Transaction_ValidateWithoutState),
 // once a block includes too many txs (e.g. 5000), the txs validation will consume too much time.
 func BatchValidateTxs(txs []*Transaction) error {
+	return BatchValidateTxsOnShard(txs, common.LocalShardNumber)
+}
+
+// BatchValidateTxsOnShard checks signatures against shard. Several full
+// shards in one process each pass their own genesis shard.
+func BatchValidateTxsOnShard(txs []*Transaction, shard uint) error {
+	if shard == 0 {
+		shard = common.LocalShardNumber
+	}
 	return BatchValidate(func(index int) error {
-		return txs[index].ValidateWithoutState(true, true)
+		return txs[index].validateWithoutState(true, true, shard)
 	}, len(txs))
 }
 

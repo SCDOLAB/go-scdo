@@ -296,14 +296,17 @@ func (p *peer) sendHeadStatus(msg *chainHeadStatus, wg *sync.WaitGroup) error {
 }
 
 // handShake exchange networkid td etc between two connected peers.
-func (p *peer) handShake(networkID string, td *big.Int, head common.Hash, genesis common.Hash, difficult uint64) error {
+func (p *peer) handShake(networkID string, td *big.Int, head common.Hash, genesis common.Hash, difficult uint64, shard uint) error {
+	if shard == 0 {
+		shard = common.LocalShardNumber
+	}
 	msg := &statusData{
 		ProtocolVersion: uint32(common.ScdoVersion),
 		NetworkID:       networkID,
 		TD:              td,
 		CurrentBlock:    head,
 		GenesisBlock:    genesis,
-		Shard:           common.LocalShardNumber,
+		Shard:           shard,
 		Difficult:       difficult,
 	}
 
@@ -325,7 +328,7 @@ func (p *peer) handShake(networkID string, td *big.Int, head common.Hash, genesi
 		return err
 	}
 
-	if err = verifyGenesisAndNetworkID(retStatusMsg, genesis, networkID, common.LocalShardNumber, difficult); err != nil {
+	if err = verifyGenesisAndNetworkID(retStatusMsg, genesis, networkID, shard, difficult); err != nil {
 		return err
 	}
 

@@ -62,7 +62,7 @@ func newTestStateDB(address common.Address, nonce, balance uint64) *mockStateDB 
 func Test_Transaction_Validate_NoDataChange(t *testing.T) {
 	tx := newTestTxWithSign(100, 2, 38, true)
 	statedb := newTestStateDB(tx.Data.From, 38, 200000)
-	err := tx.Validate(statedb)
+	err := tx.Validate(statedb, 0)
 	assert.Equal(t, err, error(nil))
 }
 
@@ -71,7 +71,7 @@ func Benchmark_Transaction_ValidateWithState(b *testing.B) {
 	statedb := newTestStateDB(tx.Data.From, 38, 200)
 
 	for i := 0; i < b.N; i++ {
-		tx.Validate(statedb)
+		tx.Validate(statedb, 0)
 	}
 }
 
@@ -127,7 +127,7 @@ func Benchmark_Transaction_MerkleRootHash(b *testing.B) {
 func Test_Transaction_Validate_NotSigned(t *testing.T) {
 	tx := newTestTxWithSign(100, 2, 38, false)
 	statedb := newTestStateDB(tx.Data.From, 38, 200)
-	err := tx.Validate(statedb)
+	err := tx.Validate(statedb, 0)
 	assert.Equal(t, err, ErrSigMissing)
 }
 
@@ -136,7 +136,7 @@ func Test_Transaction_Validate_HashChanged(t *testing.T) {
 	tx := newTestTxWithSign(100, 2, 38, true)
 	tx.Hash = crypto.HashBytes([]byte("test"))
 	statedb := newTestStateDB(tx.Data.From, 38, 200)
-	err := tx.Validate(statedb)
+	err := tx.Validate(statedb, 0)
 	assert.Equal(t, err, ErrHashMismatch)
 }
 
@@ -145,7 +145,7 @@ func Test_Transaction_Validate_TxDataChanged(t *testing.T) {
 	tx := newTestTxWithSign(100, 2, 38, true)
 	tx.Data.Amount.SetInt64(200)
 	statedb := newTestStateDB(tx.Data.From, 38, 200)
-	err := tx.Validate(statedb)
+	err := tx.Validate(statedb, 0)
 	assert.Equal(t, err, ErrHashMismatch)
 }
 
@@ -158,7 +158,7 @@ func Test_Transaction_Validate_SignInvalid(t *testing.T) {
 	tx.Hash = crypto.MustHash(tx.Data)
 
 	statedb := newTestStateDB(tx.Data.From, 38, 200)
-	err := tx.Validate(statedb)
+	err := tx.Validate(statedb, 0)
 
 	assert.Equal(t, err, ErrSigInvalid)
 }
@@ -171,14 +171,14 @@ func Test_MerkleRootHash_Empty(t *testing.T) {
 func Test_Transaction_Validate_BalanceNotEnough(t *testing.T) {
 	tx := newTestTxWithSign(100, 2, 38, true)
 	statedb := newTestStateDB(tx.Data.From, 38, 101)
-	err := tx.Validate(statedb)
+	err := tx.Validate(statedb, 0)
 	assert.Equal(t, err != nil, true)
 }
 
 func Test_Transaction_Validate_NonceTooLow(t *testing.T) {
 	tx := newTestTxWithSign(100, 2, 38, true)
 	statedb := newTestStateDB(tx.Data.From, 40, 200)
-	err := tx.Validate(statedb)
+	err := tx.Validate(statedb, 0)
 	assert.Equal(t, err != nil, true)
 }
 
@@ -197,7 +197,7 @@ func Test_Transaction_Validate_PayloadOversized(t *testing.T) {
 
 	statedb := newTestStateDB(tx.Data.From, 38, 200)
 
-	err = tx.Validate(statedb)
+	err = tx.Validate(statedb, 0)
 	assert.Equal(t, err, ErrPayloadOversized)
 }
 
@@ -278,7 +278,7 @@ func Test_Transaction_Validate_EmptyPayloadError(t *testing.T) {
 	tx.Sign(fromPrivKey)
 
 	statedb := newTestStateDB(tx.Data.From, 38, 200)
-	assert.Equal(t, tx.Validate(statedb), ErrPayloadEmpty)
+	assert.Equal(t, tx.Validate(statedb, 0), ErrPayloadEmpty)
 }
 
 func assertTxRlp(t *testing.T, tx *Transaction) {

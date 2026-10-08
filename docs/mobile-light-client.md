@@ -1,6 +1,10 @@
-# Mobile light client (Classic shards 1–4)
+# Mobile node (Classic shards 1–4)
 
-This is the API for the Android wallet [SCDOLAB/scdo-wallet-mobile](https://github.com/SCDOLAB/scdo-wallet-mobile). The phone header-syncs all four shards from fork genesis height **2979594**, checks every header with ZPoW, and loads accounts, transactions and cross-shard debts with Merkle proofs. There is no snapshot, checkpoint, or assumevalid shortcut.
+This is the API for the Android wallet [SCDOLAB/scdo-wallet-mobile](https://github.com/SCDOLAB/scdo-wallet-mobile). The phone runs one of two modes. Both start at fork genesis height **2979594**, check every header with ZPoW, and do not use a snapshot, checkpoint, or assumevalid shortcut.
+
+**Lite** is the simple UI. It header-syncs the selected shards, keeps the last 10,000 headers plus an accumulator, and loads accounts, transactions and cross-shard debts with Merkle proofs. The steady store stays under 1 GB.
+
+**Pro** downloads full blocks and state for the shards the user picks and validates them from fork genesis. Lite header databases are left in place, so a switch from Lite to Pro does not throw away headers that already checked out.
 
 ## Embed the Go package
 
@@ -10,24 +14,24 @@ The process the app embeds is package `mobile`.
 gomobile bind -target=android -o scdo.aar github.com/scdoproject/go-scdo/mobile
 ```
 
-The bind needs the Android NDK and a C compiler. Peer identity uses libsecp256k1. The rest of the light database is pure Go (LevelDB).
+The bind needs the Android NDK and a C compiler. Peer identity uses libsecp256k1. The database is pure Go (LevelDB).
 
 | Call | What the wallet gets |
 | --- | --- |
-| `Start(dataDir)` | Header-sync shards 1–4 into `dataDir`. A relative path is placed under `$HOME/.scdo`. Sync pauses on a metered network or a low battery once the app reports that state. |
-| `Stop()` | Shut the node down. |
-| `Syncing()` | JSON array, one object per shard. |
+| `Start(dataDir, mode, shards)` | `mode` is `lite` or `pro`. `shards` is `1,2,3,4` (empty means all four). A relative `dataDir` is placed under `$HOME/.scdo`. |
+| `Stop()` | Shut the node down. Databases stay on disk. |
+| `Status()` / `Syncing()` | JSON array, one object per running shard: height, peer height, peers, network, ETA, disk used. |
 | `Balance(address)` | JSON account proof for that address's shard. |
 | `TxProof(txHash)` | JSON transaction inclusion proof. |
 | `DebtProof(debtHash)` | JSON cross-shard debt proof. |
-| `Estimate(head)` | JSON storage and bandwidth. `head` 0 uses the sample below. |
-| `Pause(reason)` / `Resume()` | Stop or continue header downloads. The verified tip stays on disk. |
-| `SetSyncPolicy(metered, lowBattery)` | Choose which device states pause sync. `Start` turns both on. |
+| `Estimate(head)` | JSON storage and bandwidth, including the Pro estimate. `head` 0 uses the sample below. |
+| `Pause(reason)` / `Resume()` | Stop or continue downloads. The verified tip stays on disk. |
+| `SetSyncPolicy(metered, lowBattery)` | Choose which device states pause sync. `Start` allows 5G and pauses on a low battery. |
 | `SetDeviceState(metered, lowBattery)` | Tell the node what Android reported. Go cannot read the battery or the metered flag itself. |
 | `VerifyHeader` / `VerifyTx` / `VerifyDebt` | Check an older proof against the hash accumulator this phone built. |
 | `VerifyAccount(stateRoot, accountKey, proofJSON)` | Re-check a balance proof in-process. No network. |
 
-`Start` also opens JSON-RPC on `127.0.0.1:18037` and listens for peers on `0.0.0.0:18057`. The same methods are available as `light_*` if the app talks HTTP instead of the AAR. A desktop node serves them too:
+`Start` in lite mode opens JSON-RPC on `127.0.0.1:18037` and listens for peers on `0.0.0.0:18057`. Pro gives each shard its own peer port (`18057` plus the shard index, so shard 1 is `18057` and shard 4 is `18060`). The first selected shard keeps `127.0.0.1:18037`. The others use `127.0.0.1:(18037+shard)`. The same light methods are available as `light_*` if the app talks HTTP instead of the AAR. A desktop node serves them too:
 
 ```bash
 ./build/node start -c cmd/node/config/node1.json -l
@@ -48,6 +52,9 @@ The bind needs the Android NDK and a C compiler. Peer identity uses libsecp256k1
     "mode": "headers",
     "forkGenesis": 2979594,
     "paused": false,
+    "network": "metered-allowed",
+    "eta": "unknown",
+    "diskBytes": 0,
     "retained": 10000,
     "mmrLeaves": 1
   }
@@ -58,7 +65,9 @@ The bind needs the Android NDK and a C compiler. Peer identity uses libsecp256k1
 
 When a peer announces a higher head, the client starts a sync immediately. A 13 second poll is the backup. If a session starts and then dies while the phone is still behind, it retries after 2 seconds. A dropped session does not roll the verified tip backwards. After the phone has caught up, a new block (about every 20 seconds) is the real-time path. 5G delay is the peer round trip, not a multi-block wait.
 
-`light_pause`, `light_resume`, `light_setSyncPolicy` and `light_setDeviceState` control the same gate as the AAR methods. Pausing cancels the download in progress and leaves the stored tip where it is. `Start` on the phone opts into pausing for a metered network and a low battery. A desktop `node start -l` does not, until something calls `SetSyncPolicy`. Low battery wins over a metered network when both are set.
+`network` is `unmetered`, `metered-allowed`, or `paused:` plus the reason (`low-battery`, `metered`, or the text passed to `Pause`). `eta` is `paused`, `0s` once the phone has caught the peer, a duration once two `Status` samples show a rate, or `unknown` until then. In pro mode a running full download also reports the downloader's own ETA. `diskBytes` is the size of that shard's directory. Pro adds `headerDiskBytes` for the lite database, which is not deleted.
+
+`light_pause`, `light_resume`, `light_setSyncPolicy` and `light_setDeviceState` control the same gate as the AAR methods. Pausing cancels the download in progress and leaves the stored tip where it is. `Start` on the phone allows a metered network, because 5G is the real-time path, and pauses when the app reports a low battery. Call `SetSyncPolicy(true, true)` if a metered network should pause too. A desktop `node start -l` does not pause for either until something calls `SetSyncPolicy`. Low battery wins over a metered network when both are set.
 
 ## `light_getBalance`
 
@@ -141,12 +150,38 @@ The ×2 budget is room for LevelDB indexes and compaction. The exact byte counts
 
 On 5G, 6.5 GB at 20–50 Mbps is roughly 20–45 minutes of download, and a dropped transfer resumes from the verified tip. The ZPoW step that dominates verification is a 30×30 determinant, about 17 µs on a server core (`BenchmarkMatrixDet` in `consensus/zpow`). One shard's history is a couple of minutes of that work on that CPU. A phone core is slower, and the four shards verify side by side. Once the phone is caught up, one new header per shard per 20 seconds stays real-time. Steady storage does not grow with the chain: a new verified header pushes the oldest retained header out.
 
+Each light peer keeps at most 2048 header hashes. The full chain of hashes is not retained in memory.
+
+## Pro mode (full blocks and state)
+
+`Start(dataDir, "pro", "1,2")` full-syncs only those shards. Data goes to `dataDir/pro/shardN`. The lite files stay at `dataDir/db/lightchainforshard_N`. Call `Stop` before switching mode. The next `Start` does not delete the other tree, so verified headers survive a move from lite to pro.
+
+Pro validates every block from fork genesis. It does not install a snapshot. Cross-shard debts use the lite header clients, which reopen the same header databases. A shard that is not selected for pro still header-syncs so those debts can be checked. The full nodes do not mine.
+
+LevelDB uses the HDD profile from the desktop sync work: 64 MiB block cache, 32 MiB write buffer, 8 MiB tables, a bloom filter, and no per-table fsync. One shard keeps that profile. Starting more than one full shard scales the chain cache down (16 MiB floor) so four shards do not allocate 512 MiB of cache each. A power loss can drop the tail of a write; the recovery point rebuilds it.
+
+These sizes are estimates for the public head on 2026-10-07, not a measurement from a phone or from a 5400 rpm disk. `Estimate` returns the same numbers in `pro`. Each block body is assumed to be 2048 bytes past the header record (a reward plus a few transfers). Account state is assumed to be 512 MiB per shard. The phone budget multiplies the raw sum by 2 for LevelDB compaction. A chain of reward-only blocks is closer to the header figure plus state.
+
+| | One shard | Four shards |
+| --- | --- | --- |
+| Headers kept (every header after the fork) | 6,295,586 | 25,182,344 |
+| Header records | 2,348,253,578 bytes (2.19 GiB) | 9,393,014,312 bytes |
+| Assumed block bodies (2048 bytes each) | 12,893,360,128 bytes (12.01 GiB) | 51,573,440,512 bytes |
+| Assumed account state | 536,870,912 bytes (512 MiB) | 2,147,483,648 bytes |
+| Raw disk | 15,778,484,618 bytes (14.70 GiB) | 63,113,938,472 bytes (58.78 GiB) |
+| Phone disk budget (raw × 2) | 31,556,969,236 bytes (29.39 GiB) | 126,227,876,944 bytes (117.56 GiB) |
+| LevelDB memory, full 64 MiB profile | 402,653,184 bytes (384 MiB) | 1,610,612,736 bytes (1.50 GiB) |
+| LevelDB memory, cache scaled for four shards |  | 671,088,640 bytes (640 MiB) |
+
+384 MiB is three databases × (64 MiB block cache + two 32 MiB memtables). The scaled figure is what `Start` actually allocates when all four shards are selected: a smaller chain cache and 32 MiB side databases. Lite header databases add up to 32 MiB of block cache each. Pro does not fit a phone that only has a few gigabytes free. Lite is the mode that stays under 1 GB.
+
 ## What the wallet should do
 
-1. Call `Start` once with an app-private directory.
-2. Show `Syncing` until each shard's `height` is near `peerHeight`.
+1. Call `Start(dir, "lite", "1,2,3,4")` once with an app-private directory. Use `"pro"` and a shard list when the user asks for a full node.
+2. Show `Status` until each shard's `height` is near `peerHeight`. Read `network`, `eta` and `diskBytes` from the same objects.
 3. Show balance from `Balance`. Keep `headerHash` and `proof` if you want `VerifyAccount` to check them again later.
 4. Track a payment with `TxProof`. Treat `confirmed` as the 120-block finality.
 5. Track a cross-shard incoming payment with `DebtProof` the same way.
-6. Call `SetDeviceState` when the network is metered or the battery is low. Call `Pause` when the app leaves the foreground if you need to release the radio. Call `Resume` and `SetDeviceState(false, false)` to continue. The header databases stay on disk, so the next `Start` resumes from the stored tip rather than from genesis.
-7. For a payment older than the retained window, ask a full node for `light_getHeaderProof` at that height and this phone's `height`, then `VerifyTx` or `VerifyDebt`.
+6. Call `SetDeviceState` when the network is metered or the battery is low. The default keeps syncing on 5G and pauses on a low battery. Call `SetSyncPolicy(true, true)` to pause on a metered network as well. Call `Pause` when the app leaves the foreground if you need to release the radio. Call `Resume` and `SetDeviceState(false, false)` to continue. The databases stay on disk, so the next `Start` resumes from the stored tip rather than from genesis.
+7. To switch lite to pro, call `Stop`, then `Start(dir, "pro", shards)` with the same directory. Do not delete `db/lightchainforshard_*`.
+8. For a payment older than the retained window, ask a full node for `light_getHeaderProof` at that height and this phone's `height`, then `VerifyTx` or `VerifyDebt`.

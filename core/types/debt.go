@@ -175,8 +175,15 @@ func NewDebtWithoutContext(tx *Transaction) *Debt {
 	return newDebt(tx, false)
 }
 
-// newDebt creates and returns a new debt from the given tx
+// newDebt creates and returns a new debt from the given tx.
+// Same-shard transfers are not debts on common.LocalShardNumber.
 func newDebt(tx *Transaction, withContext bool) *Debt {
+	return newDebtOnShard(tx, withContext, common.LocalShardNumber)
+}
+
+// newDebtOnShard is newDebt for an explicit shard. A phone running several
+// full shards cannot share common.LocalShardNumber.
+func newDebtOnShard(tx *Transaction, withContext bool, shard uint) *Debt {
 	if tx == nil || tx.Data.To.IsEmpty() || tx.Data.To.IsReserved() {
 		return nil
 	}
@@ -187,7 +194,7 @@ func newDebt(tx *Transaction, withContext bool) *Debt {
 	}
 
 	toShard := tx.Data.To.Shard()
-	if withContext && toShard == common.LocalShardNumber {
+	if withContext && toShard == shard {
 		return nil
 	}
 
@@ -220,10 +227,19 @@ func newDebt(tx *Transaction, withContext bool) *Debt {
 
 // NewDebts new debts
 func NewDebts(txs []*Transaction) []*Debt {
+	return NewDebtsOnShard(txs, common.LocalShardNumber)
+}
+
+// NewDebtsOnShard builds the debt list the way a miner on shard would.
+// shard 0 uses common.LocalShardNumber.
+func NewDebtsOnShard(txs []*Transaction, shard uint) []*Debt {
+	if shard == 0 {
+		shard = common.LocalShardNumber
+	}
 	debts := make([]*Debt, 0)
 
 	for _, tx := range txs {
-		d := NewDebtWithContext(tx)
+		d := newDebtOnShard(tx, true, shard)
 		if d != nil {
 			debts = append(debts, d)
 		}
@@ -234,13 +250,21 @@ func NewDebts(txs []*Transaction) []*Debt {
 
 // NewDebtMap new debt map
 func NewDebtMap(txs []*Transaction) [][]*Debt {
+	return NewDebtMapOnShard(txs, common.LocalShardNumber)
+}
+
+// NewDebtMapOnShard is NewDebtMap for an explicit shard.
+func NewDebtMapOnShard(txs []*Transaction, shard uint) [][]*Debt {
+	if shard == 0 {
+		shard = common.LocalShardNumber
+	}
 	debts := make([][]*Debt, common.ShardCount+1)
 
 	for _, tx := range txs {
-		d := NewDebtWithContext(tx)
+		d := newDebtOnShard(tx, true, shard)
 		if d != nil {
-			shard := d.Data.Account.Shard()
-			debts[shard] = append(debts[shard], d)
+			accountShard := d.Data.Account.Shard()
+			debts[accountShard] = append(debts[accountShard], d)
 		}
 	}
 
@@ -261,8 +285,17 @@ func DebtArrayToMap(debts []*Debt) [][]*Debt {
 
 // BatchValidateDebt validates a batch of debts
 func BatchValidateDebt(debts []*Debt, verifier DebtVerifier) error {
+	return BatchValidateDebtOnShard(debts, verifier, common.LocalShardNumber)
+}
+
+// BatchValidateDebtOnShard validates debts against shard instead of the
+// process-wide common.LocalShardNumber.
+func BatchValidateDebtOnShard(debts []*Debt, verifier DebtVerifier, shard uint) error {
+	if shard == 0 {
+		shard = common.LocalShardNumber
+	}
 	return BatchValidate(func(index int) error {
-		_, err := debts[index].Validate(verifier, false, common.LocalShardNumber)
+		_, err := debts[index].Validate(verifier, false, shard)
 		return err
 	}, len(debts))
 }

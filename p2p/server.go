@@ -177,6 +177,16 @@ func (srv *Server) PeerCount() int {
 	return srv.peerSet.count()
 }
 
+// localShard is the shard this server was started with. Several full nodes
+// in one process each have their own server, so the process-wide
+// common.LocalShardNumber is only the fallback.
+func (srv *Server) localShard() uint {
+	if srv != nil && srv.SelfNode != nil && srv.SelfNode.Shard > 0 {
+		return srv.SelfNode.Shard
+	}
+	return common.LocalShardNumber
+}
+
 // Start starts the server.
 func (srv *Server) Start(nodeDir string, shard uint) (err error) {
 	srv.lock.Lock()
@@ -525,7 +535,7 @@ func (srv *Server) doSelectLocalNodeToConnect() {
 	for i := 0; i < len(selectNodeSet); i++ {
 		node := selectNodeSet[i]
 		if node != nil {
-			if node.Shard == common.LocalShardNumber {
+			if node.Shard == srv.localShard() {
 				srv.log.Info("p2p.server doSelectLocalNodeToConnect. Node=%s ,%d", selectNodeSet[i].IP.String(), selectNodeSet[i].UDPPort)
 				srv.connectNode(selectNodeSet[i])
 			}

@@ -82,12 +82,20 @@ func Resume() {
 }
 
 // SetSyncPolicy chooses which device states pause header sync.
-// Both flags default to false. The mobile package turns them on.
+// Both flags default to false. The mobile package pauses on a low battery
+// and leaves a metered network (5G) running.
 func SetSyncPolicy(pauseOnMetered, pauseOnLowBattery bool) {
 	gate.apply(func() {
 		gate.pauseOnMetered = pauseOnMetered
 		gate.pauseOnLowBattery = pauseOnLowBattery
 	})
+}
+
+// DeviceMetered reports the last network state from SetDeviceState.
+func DeviceMetered() bool {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	return gate.metered
 }
 
 // SetDeviceState is how the Android app reports a metered network or a low battery.
