@@ -79,8 +79,12 @@ type ScdoProtocol struct {
 	debtPool   *core.DebtPool
 	chain      *core.Blockchain
 
-	wg     sync.WaitGroup
-	quitCh chan struct{}
+	wg       sync.WaitGroup
+	quitOnce sync.Once
+	quitCh   chan struct{}
+	// syncCh stays open for the life of the protocol. Closing it panics a
+	// peer handler that is still delivering a head, and it also makes the
+	// syncer spin on the closed channel so it never cancels a stuck download.
 	syncCh chan struct{}
 	log    *log.ScdoLog
 
@@ -145,13 +149,36 @@ func (sp *ScdoProtocol) Start() {
 }
 
 // Stop stops protocol, called when scdoService quits.
+// The downloader is terminated first. A sync that has stopped making progress
+// otherwise sits in Synchronise, wg.Wait never returns, and the height-index
+// checkpoint is left clean=false because shutdown times out before the flush.
+// syncCh is left open so a peer handler cannot send on a closed channel.
 func (sp *ScdoProtocol) Stop() {
 	event.BlockMinedEventManager.RemoveListener(sp.handleNewMinedBlock)
 	event.TransactionInsertedEventManager.RemoveListener(sp.handleNewTx)
 	event.DebtsInsertedEventManager.RemoveListener(sp.handleNewDebt)
-	close(sp.quitCh)
-	close(sp.syncCh)
+	sp.quitOnce.Do(func() { close(sp.quitCh) })
+	if sp.downloader != nil {
+		sp.downloader.Terminate()
+	}
 	sp.wg.Wait()
+}
+
+// requestSync wakes the syncer. The send never blocks and never touches a
+// closed channel, including after Stop.
+func (sp *ScdoProtocol) requestSync() {
+	if sp == nil || sp.syncCh == nil {
+		return
+	}
+	select {
+	case <-sp.quitCh:
+		return
+	default:
+	}
+	select {
+	case sp.syncCh <- struct{}{}:
+	default:
+	}
 }
 
 // syncer try to synchronise with remote peer
@@ -161,8 +188,16 @@ func (sp *ScdoProtocol) syncer() {
 	//sp.wg.Add(1)
 
 	forceSync := time.NewTicker(forceSyncInterval)
+	defer forceSync.Stop()
 	for {
 		select {
+		case <-sp.quitCh:
+			return
+		default:
+		}
+		select {
+		case <-sp.quitCh:
+			return
 		case <-sp.syncCh:
 			if !sp.downloader.IsSyncStatusNone() {
 				continue
@@ -189,14 +224,17 @@ func (sp *ScdoProtocol) syncer() {
 			}
 			sp.wg.Add(1)
 			go sp.synchronise(sp.peerSet.bestPeers(sp.localShard(), localTD))
-		case <-sp.quitCh:
-			return
 		}
 	}
 }
 
 func (sp *ScdoProtocol) synchronise(peers []*peer) {
 	defer sp.wg.Done()
+	select {
+	case <-sp.quitCh:
+		return
+	default:
+	}
 	if syncPaused() {
 		return
 	}
@@ -857,7 +895,7 @@ handler:
 
 			p.log.Debug("Received statusChainHeadMsgCode. peer=%s, ip=%s, remoteTD=%d", peer.peerStrID, peer.Peer.RemoteAddr(), status.TD)
 			peer.SetHead(status.CurrentBlock, status.TD)
-			p.syncCh <- struct{}{}
+			p.requestSync()
 
 			// exit
 			memory.Print(p.log, "handleMsg statusChainHeadMsgCode exit", now, true)

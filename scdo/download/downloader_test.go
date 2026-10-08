@@ -582,6 +582,38 @@ func Test_isAncenstorFound_missingHashIsError(t *testing.T) {
 	assert.NotNil(t, err)
 }
 
+func TestCancelUnblocksPeerDownload(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	dl := newTestDownloader(db)
+	pc := newPeerConn(newTestPeer(), "peer", dl.log)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go dl.peerDownload(pc, dl.tm, &wg)
+	time.Sleep(50 * time.Millisecond)
+	dl.Cancel()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("peer download still running after Cancel")
+	}
+}
+
+func TestTerminateRejectsNewSession(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	dl := newTestDownloader(db)
+	dl.Terminate()
+	dl.Terminate()
+	err := dl.Synchronise("missing", common.EmptyHash)
+	assert.Equal(t, errReceivedQuitMsg, err)
+}
+
 func Test_findCommonAncestorHeight_peerHeightZero(t *testing.T) {
 	db, dispose := leveldb.NewTestDatabase()
 	defer dispose()

@@ -387,6 +387,90 @@ func heapAlloc() uint64 {
 	return m.HeapAlloc
 }
 
+func TestWindowReanchorsWhenItPassesTheChainHead(t *testing.T) {
+	tm := newWindowTask(110, 110, 1000)
+	tm.downloadInfoList = []*downloadInfo{newDownloadInfo(110, taskStatusIdle)}
+	tm.repairWindowLocked(101, false, time.Now())
+	if tm.listBase != 101 || tm.curNo != 101 {
+		t.Fatalf("window base %d cursor %d, want 101", tm.listBase, tm.curNo)
+	}
+	if len(tm.downloadInfoList) != 0 {
+		t.Fatalf("headers past the chain were kept (%d)", len(tm.downloadInfoList))
+	}
+	if tm.pos(100) >= 0 {
+		t.Fatal("chain head is still inside the window")
+	}
+}
+
+func TestCursorReturnsToTheUnwrittenBlock(t *testing.T) {
+	tm := newWindowTask(101, 105, 1000)
+	tm.downloadInfoList = []*downloadInfo{
+		newDownloadInfo(101, taskStatusIdle),
+		newDownloadInfo(102, taskStatusIdle),
+	}
+	tm.repairWindowLocked(101, false, time.Now())
+	if tm.listBase != 101 {
+		t.Fatalf("window base %d, want 101", tm.listBase)
+	}
+	if tm.curNo != 101 {
+		t.Fatalf("cursor %d stayed past the unwritten block", tm.curNo)
+	}
+	if len(tm.downloadInfoList) != 2 {
+		t.Fatalf("in-range headers were dropped (%d)", len(tm.downloadInfoList))
+	}
+}
+
+func TestStallResetsTheWindowToHeadPlusOne(t *testing.T) {
+	tm := newWindowTask(101, 104, 1000)
+	tm.masterPeer = masterPeer
+	tm.downloader = &Downloader{log: tm.log, peers: map[string]*peerConn{}}
+	tm.downloadInfoList = []*downloadInfo{newDownloadInfo(101, taskStatusDownloading)}
+	tm.peersHeaderMap = map[string]*peerHeadInfo{masterPeer: newPeerHeadInfo()}
+	tm.repairWindowLocked(101, true, time.Now())
+	if tm.listBase != 101 || tm.curNo != 101 || len(tm.downloadInfoList) != 0 {
+		t.Fatalf("stall left window base %d cursor %d len %d", tm.listBase, tm.curNo, len(tm.downloadInfoList))
+	}
+	tm.peersHeaderMap = map[string]*peerHeadInfo{masterPeer: newPeerHeadInfo()}
+	header := newTestBlockHeaderWithHeight(101)
+	if err := tm.deliverHeaderMsg(masterPeer, []*types.BlockHeader{header}); err != nil {
+		t.Fatal(err)
+	}
+	if tm.pos(101) != 0 || len(tm.downloadInfoList) != 1 {
+		t.Fatalf("head+1 is outside the window after re-anchor, pos %d len %d", tm.pos(101), len(tm.downloadInfoList))
+	}
+	startNo, amount := tm.getReqHeaderInfo(testTaskMgrPeerConn(masterPeer))
+	if startNo != 102 || amount <= 0 {
+		t.Fatalf("next header request %d x %d, want start 102", startNo, amount)
+	}
+}
+
+func TestMasterHeaderBelowTheWindowIsIgnored(t *testing.T) {
+	tm := newWindowTask(3584143, 3584143, 9000000)
+	err := tm.deliverHeaderMsg(masterPeer, []*types.BlockHeader{newTestBlockHeaderWithHeight(3584142)})
+	if err != nil {
+		t.Fatalf("stale header aborted the session: %v", err)
+	}
+	if len(tm.downloadInfoList) != 0 {
+		t.Fatal("stale header was appended")
+	}
+}
+
+func newWindowTask(base, cur, to uint64) *taskMgr {
+	return &taskMgr{
+		log:              log.GetLogger("download-window"),
+		fromNo:           base,
+		toNo:             to,
+		curNo:            cur,
+		listBase:         base,
+		masterPeer:       masterPeer,
+		peersHeaderMap:   map[string]*peerHeadInfo{},
+		downloadInfoList: nil,
+		quitCh:           make(chan struct{}),
+		procCh:           make(chan struct{}, 1),
+		lastChainAdvance: time.Now(),
+	}
+}
+
 func newTestBlockHeaderWithHeight(height uint64) *types.BlockHeader {
 	return &types.BlockHeader{
 		PreviousBlockHash: common.StringToHash("PreviousBlockHash"),

@@ -99,7 +99,10 @@ type Downloader struct {
 	peers      map[string]*peerConn // peers map. peerID=>peer
 
 	syncStatus int
-	tm         *taskMgr
+	// stopped is set by Terminate. Cancel only ends the current session;
+	// a shutdown must also refuse the session that is about to start.
+	stopped bool
+	tm      *taskMgr
 
 	scdo        ScdoBackend
 	chain       *core.Blockchain
@@ -108,8 +111,8 @@ type Downloader struct {
 	activeWG    *sync.WaitGroup
 	log         *log.ScdoLog
 	lock        sync.RWMutex
-	writeNS int64 // smoothed nanoseconds spent in the last block writes
-	scores  map[string]*peerStat
+	writeNS     int64 // smoothed nanoseconds spent in the last block writes
+	scores      map[string]*peerStat
 
 	// Cross-shard dependency wait. Alephium keeps a block queued until its
 	// group dependencies exist; QuarkChain will not spend a cross-shard
@@ -281,6 +284,10 @@ func (d *Downloader) Synchronise(id string, head common.Hash) error {
 	// Make sure only one routine can pass at once
 	d.lock.Lock()
 
+	if d.stopped {
+		d.lock.Unlock()
+		return errReceivedQuitMsg
+	}
 	if d.syncStatus != statusNone {
 		d.lock.Unlock()
 		return ErrIsSynchronising
@@ -552,21 +559,50 @@ func (d *Downloader) DeliverMsg(peerID string, msg *p2p.Message) {
 func (d *Downloader) Cancel() {
 	d.lock.Lock()
 	defer d.lock.Unlock()
-	d.log.Debug("Downloader.Cancel called")
-	if d.cancelCh != nil {
-		select {
-		case <-d.cancelCh:
-		default:
-			close(d.cancelCh)
-		}
+	d.closeCancelLocked()
+}
+
+// Terminate ends the current session and refuses any session that starts later.
+// Shutdown calls this so a stuck sync cannot hold the process open.
+func (d *Downloader) Terminate() {
+	d.lock.Lock()
+	d.stopped = true
+	d.closeCancelLocked()
+	d.lock.Unlock()
+	d.sessionWG.Wait()
+}
+
+func (d *Downloader) closeCancelLocked() {
+	if d.log != nil {
+		d.log.Debug("Downloader.Cancel called")
+	}
+	if d.cancelCh == nil {
+		return
+	}
+	select {
+	case <-d.cancelCh:
+	default:
+		close(d.cancelCh)
 	}
 }
 
-// Terminate close Downloader, cannot called anymore.
-func (d *Downloader) Terminate() {
-	d.Cancel()
-	d.sessionWG.Wait()
-	// TODO release variables if needed
+// cancelled reports that the current session was asked to stop.
+func (d *Downloader) cancelled() bool {
+	if d == nil {
+		return false
+	}
+	d.lock.RLock()
+	ch := d.cancelCh
+	d.lock.RUnlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 // peerDownload runs a header fetcher and a body fetcher for one peer.
@@ -742,6 +778,9 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 		d.log.Debug(" [%d] blocks will be processed into local database", len(headInfos))
 	}
 	for _, h := range headInfos {
+		if d.cancelled() {
+			return false
+		}
 		d.log.Debug("got block message and save it. height=%d, hash=%s", h.block.Header.Height, h.block.HeaderHash.Hex())
 		// writeblock
 		var txPool *core.Pool

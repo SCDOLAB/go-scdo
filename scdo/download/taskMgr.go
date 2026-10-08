@@ -33,6 +33,11 @@ const (
 	progressMinSpan = 45 * time.Second
 	// slowBlockWrite is one block taking longer than 1/50s.
 	slowBlockWrite = 20 * time.Millisecond
+
+	// windowStallTimeout re-anchors a session that has stopped writing blocks.
+	// The chain head is the source of truth: the window must start at head+1,
+	// and a stuck cursor has to clear itself without a process restart.
+	windowStallTimeout = 60 * time.Second
 )
 
 // heightSample is one sync-progress observation.
@@ -95,6 +100,11 @@ type taskMgr struct {
 	progressSamples []heightSample
 	smoothBPM       float64
 	slowNote        []string
+
+	// lastHead is the canonical height at lastChainAdvance. A stall is
+	// "this height has not moved for windowStallTimeout".
+	lastHead         uint64
+	lastChainAdvance time.Time
 }
 
 func newTaskMgr(d *Downloader, masterPeer string, conn *peerConn, from uint64, to uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block) *taskMgr {
@@ -116,6 +126,8 @@ func newTaskMgr(d *Downloader, masterPeer string, conn *peerConn, from uint64, t
 		listBase:         from,
 		quitCh:           make(chan struct{}),
 		procCh:           make(chan struct{}, 1),
+		lastHead:         localHeight,
+		lastChainAdvance: time.Now(),
 	}
 	t.wg.Add(1)
 	go t.run()
@@ -127,10 +139,17 @@ func (t *taskMgr) run() {
 
 loopOut:
 	for {
+		// The canonical head wins over the in-memory cursor. A discarded
+		// body or a cursor that stepped past an unwritten height used to
+		// leave the window one past the block the chain still needs.
+		t.reanchorWindow(time.Now())
 		results := t.getWaitProcessingBlocks()
 		waiting := t.downloader.processBlocks(results, t.fromNo-1, t.recoverHeight, t.recoverTD, t.recoverBlocks, t.masterConn)
+		// getWaitProcessingBlocks moves curNo before the write. Pull it
+		// back to the first block that is still not in the chain, including
+		// a hard write error that does not end the session.
+		t.rewindUnprocessed()
 		if waiting {
-			t.rewindUnprocessed()
 			if time.Since(t.lastWaitLog) > 10*time.Second {
 				detail := t.downloader.WaitDetail()
 				if detail == "" {
@@ -139,11 +158,6 @@ loopOut:
 				t.log.Info("%s; leaving blocks queued and retrying", detail)
 				t.lastWaitLog = time.Now()
 			}
-		}
-		// Drop blocks already written, including a processed prefix left
-		// behind when a later debt is still waiting on another shard.
-		t.releaseProcessed()
-		if waiting {
 			select {
 			case <-time.After(2 * time.Second):
 			case <-t.quitCh:
@@ -151,6 +165,9 @@ loopOut:
 			}
 			continue
 		}
+		// Drop blocks already written, including a processed prefix left
+		// behind when a later debt is still waiting on another shard.
+		t.releaseProcessed()
 		t.logProgress()
 		if t.isDone() {
 			t.downloader.Cancel()
@@ -171,6 +188,133 @@ loopOut:
 func (t *taskMgr) rewindUnprocessed() {
 	t.lock.Lock()
 	defer t.lock.Unlock()
+	t.pullCursorToUnwrittenLocked()
+	if len(t.downloadInfoList) == 0 {
+		return
+	}
+	// The cursor walked off the end of an unwritten list. Park it on the
+	// first height that still needs a body.
+	if t.curNo > t.listBase+uint64(len(t.downloadInfoList)) {
+		t.curNo = t.listBase
+		t.pullCursorToUnwrittenLocked()
+	}
+}
+
+// headHeight is the canonical chain height, when this session has a chain.
+func (t *taskMgr) headHeight() (uint64, bool) {
+	if t == nil || t.downloader == nil || t.downloader.chain == nil {
+		return 0, false
+	}
+	block := t.downloader.chain.CurrentBlock()
+	if block == nil || block.Header == nil {
+		return 0, false
+	}
+	return block.Header.Height, true
+}
+
+// reanchorWindow keeps the download window on the next canonical block.
+// listBase and curNo both move back to head+1 when the window has stepped
+// past the chain, and a session with no new canonical block for
+// windowStallTimeout drops its in-flight headers and bodies and asks again.
+func (t *taskMgr) reanchorWindow(now time.Time) {
+	head, ok := t.headHeight()
+	if !ok {
+		return
+	}
+	anchor := head + 1
+	shardWait := t.downloader != nil && t.downloader.WaitDetail() != ""
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	// A test chain, or a session whose peer range does not cover the head,
+	// must not have its cursor rewritten.
+	if anchor < t.fromNo || anchor > t.toNo+1 {
+		return
+	}
+	stalled := false
+	if t.lastChainAdvance.IsZero() || head != t.lastHead {
+		t.lastHead = head
+		t.lastChainAdvance = now
+	} else if now.Sub(t.lastChainAdvance) >= windowStallTimeout {
+		stalled = !shardWait
+		if shardWait {
+			// The block is queued on another shard. Re-arm the timer so a
+			// dependency wait does not wipe the window every minute.
+			t.lastChainAdvance = now
+		}
+	}
+	t.repairWindowLocked(anchor, stalled, now)
+}
+
+// repairWindowLocked applies anchor (canonical head+1). stalled clears the
+// in-flight window even when the base is already on that height.
+func (t *taskMgr) repairWindowLocked(anchor uint64, stalled bool, now time.Time) {
+	if stalled || t.listBase > anchor {
+		if t.log != nil {
+			t.log.Warn("re-anchor download window to height %d (window was %d, cursor %d, chain %d)", anchor, t.listBase, t.curNo, anchor-1)
+		}
+		for _, info := range t.downloadInfoList {
+			if info == nil {
+				continue
+			}
+			info.header = nil
+			info.block = nil
+		}
+		t.downloadInfoList = nil
+		t.listBase = anchor
+		t.curNo = anchor
+		t.peersHeaderMap = make(map[string]*peerHeadInfo)
+		if anchor < t.fromNo {
+			t.fromNo = anchor
+		}
+		t.lastHead = anchor - 1
+		t.lastChainAdvance = now
+		return
+	}
+	if t.listBase < anchor {
+		t.dropBeforeAnchorLocked(anchor)
+	}
+	if t.curNo < anchor {
+		t.curNo = anchor
+	}
+	t.pullCursorToUnwrittenLocked()
+}
+
+// dropBeforeAnchorLocked forgets headers below the next canonical block.
+func (t *taskMgr) dropBeforeAnchorLocked(anchor uint64) {
+	if anchor <= t.listBase {
+		return
+	}
+	skip := anchor - t.listBase
+	if skip > uint64(len(t.downloadInfoList)) {
+		skip = uint64(len(t.downloadInfoList))
+	}
+	n := int(skip)
+	for i := 0; i < n; i++ {
+		if info := t.downloadInfoList[i]; info != nil {
+			info.header = nil
+			info.block = nil
+			t.downloadInfoList[i] = nil
+		}
+	}
+	t.listBase += uint64(n)
+	if n > 0 {
+		remain := t.downloadInfoList[n:]
+		fresh := make([]*downloadInfo, len(remain))
+		copy(fresh, remain)
+		t.downloadInfoList = fresh
+	}
+	if t.listBase < anchor {
+		t.listBase = anchor
+	}
+	if t.curNo < t.listBase {
+		t.curNo = t.listBase
+	}
+	t.dropHeadersBeforeLocked(t.listBase)
+}
+
+// pullCursorToUnwrittenLocked sets curNo to the first height in the window
+// that has not been written. Heights below curNo are otherwise never requested.
+func (t *taskMgr) pullCursorToUnwrittenLocked() {
 	for i, info := range t.downloadInfoList {
 		if info != nil && info.status != taskStatusProcessed {
 			t.curNo = t.listBase + uint64(i)
@@ -406,7 +550,9 @@ func (t *taskMgr) getReqHeaderInfo(conn *peerConn) (uint64, int) {
 	var startNo uint64
 	if conn.peerID == t.masterPeer {
 		startNo = t.listBase + uint64(len(t.downloadInfoList))
-		if startNo-t.curNo > t.downloader.waitingBlocks() {
+		// A cursor past the window end used to underflow this subtraction
+		// and look like a full window, so no headers were ever requested again.
+		if startNo > t.curNo && startNo-t.curNo > t.downloader.waitingBlocks() {
 			return 0, 0
 		}
 	} else {
@@ -417,7 +563,7 @@ func (t *taskMgr) getReqHeaderInfo(conn *peerConn) (uint64, int) {
 		}
 	}
 
-	if startNo == t.toNo+1 || startNo-t.curNo >= uint64(MaxHeaderFetch) {
+	if startNo == t.toNo+1 || (startNo > t.curNo && startNo-t.curNo >= uint64(MaxHeaderFetch)) {
 		// do not need to recv headers now.
 		return 0, 0
 	}
@@ -531,6 +677,14 @@ func (t *taskMgr) deliverHeaderMsg(peerID string, headers []*types.BlockHeader) 
 		lastNo := t.listBase + uint64(len(t.downloadInfoList))
 		t.log.Debug("masterPeer deliverHeaderMsg. lastNo=%d fromNo:%d header.height:%d", lastNo, t.fromNo, headers[0].Height)
 		if lastNo != headers[0].Height {
+			// A body or header requested before the window moved is not a
+			// bad peer. Drop it and let the fetcher ask from the new base.
+			// Aborting here cancelled the session and the next request never
+			// recovered while the cursor sat past the chain head.
+			if headers[0].Height < t.listBase {
+				t.log.Debug("ignore master headers at %d, window starts at %d", headers[0].Height, t.listBase)
+				return nil
+			}
 			return errMasterHeadersNotMatch
 		}
 		for _, h := range headers {
@@ -579,6 +733,7 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 	}
 
 	toHeight := uint64(0)
+	accepted := false
 
 	for _, b := range blocks {
 		idx := t.pos(b.Header.Height)
@@ -608,6 +763,15 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 		headInfo.assignedAt = time.Time{}
 		t.downloadedNum++
 		toHeight = b.Header.Height
+		accepted = true
+	}
+
+	if !accepted {
+		// Every block in the batch was outside the window. Those heights
+		// were already assigned; put them back so the next needed block
+		// is requested instead of sitting in "downloading" forever.
+		t.releasePeerDownloadsLocked(peerID)
+		return
 	}
 
 	if toHeight == t.toNo {
@@ -629,11 +793,29 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 		if headInfo.peerID != peerID {
 			break
 		}
+		// A block already written or queued for write must stay that way.
+		// Demoting it to idle left a hole below curNo, and every later
+		// delivery of that height was discarded as outside the window.
+		if headInfo.status != taskStatusDownloading {
+			break
+		}
 
 		headInfo.status = taskStatusIdle
 		headInfo.assignedAt = time.Time{}
 	}
 	t.notify()
+}
+
+// releasePeerDownloadsLocked returns this peer's in-flight bodies to the idle queue.
+func (t *taskMgr) releasePeerDownloadsLocked(peerID string) {
+	for _, headInfo := range t.downloadInfoList {
+		if headInfo == nil || headInfo.peerID != peerID || headInfo.status != taskStatusDownloading {
+			continue
+		}
+		headInfo.status = taskStatusIdle
+		headInfo.peerID = ""
+		headInfo.assignedAt = time.Time{}
+	}
 }
 
 func (t *taskMgr) reclaimSlowLocked(now time.Time) {
