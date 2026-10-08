@@ -232,7 +232,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 func TestHeaderProofMatchesPhoneAccumulator(t *testing.T) {
 	lc, dispose := buildVerifiedChain(t, 4)
 	defer dispose()
-	api := &headerProofAPI{chain: lc}
+	api := &HeaderProofAPI{chain: lc}
 	proof, err := api.GetHeaderProof(common.ScdoForkHeight+1, lc.CurrentHeader().Height)
 	assert.Nil(t, err)
 	assert.Nil(t, lc.verifyCanonicalHeader(mustHeader(t, proof.Header), mustSiblings(t, proof.Siblings)))

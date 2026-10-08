@@ -75,7 +75,7 @@ func (s *ServiceServer) APIs() []rpc.API {
 	return []rpc.API{{
 		Namespace: "light",
 		Version:   "1.0",
-		Service:   &headerProofAPI{chain: s.scdoProtocol.chain},
+		Service:   &HeaderProofAPI{chain: s.scdoProtocol.chain},
 		Public:    true,
 	}}
 }

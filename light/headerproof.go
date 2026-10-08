@@ -26,10 +26,10 @@ type HeaderInclusion struct {
 	LeafCount uint64   `json:"leafCount"`
 }
 
-// headerProofAPI serves proofs from a full node, which still has every header.
+// HeaderProofAPI serves proofs from a full node, which still has every header.
 // A pruned light client does not: it verifies proofs, it does not create them
 // for heights it has deleted.
-type headerProofAPI struct {
+type HeaderProofAPI struct {
 	mu     sync.Mutex
 	chain  BlockChain
 	leaves []common.Hash
@@ -38,7 +38,7 @@ type headerProofAPI struct {
 // GetHeaderProof proves header height inside the MMR of headers from fork
 // genesis through accumulatorHead. Pass the phone's verified height as
 // accumulatorHead. Zero uses this node's own canonical head.
-func (a *headerProofAPI) GetHeaderProof(height, accumulatorHead uint64) (*HeaderInclusion, error) {
+func (a *HeaderProofAPI) GetHeaderProof(height, accumulatorHead uint64) (*HeaderInclusion, error) {
 	if a == nil || a.chain == nil {
 		return nil, fmt.Errorf("header chain is not available")
 	}
@@ -82,7 +82,7 @@ func (a *headerProofAPI) GetHeaderProof(height, accumulatorHead uint64) (*Header
 	return out, nil
 }
 
-func (a *headerProofAPI) leavesThrough(last uint64) ([]common.Hash, error) {
+func (a *HeaderProofAPI) leavesThrough(last uint64) ([]common.Hash, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	want := last - common.ScdoForkHeight + 1
