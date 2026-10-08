@@ -114,6 +114,7 @@ type LightProtocol struct {
 	odrBackend          *odrBackend
 	downloader          *Downloader
 	wg                  sync.WaitGroup
+	syncWG              sync.WaitGroup
 	handlerWg           sync.WaitGroup
 	handlerMu           sync.Mutex
 	quitOnce            sync.Once
@@ -171,15 +172,16 @@ func (lp *LightProtocol) Start() {
 }
 
 // Stop stops protocol, called when scdoService quits.
-// Handlers are waited out before the caller closes the ODR backend, and
-// syncCh is left open so a retry cannot send on a closed channel.
+// Downloaders and peer handlers exit before this returns. The caller then
+// closes the ODR backend and the header database. syncCh is left open so a
+// retry cannot send on a closed channel.
 func (lp *LightProtocol) Stop() {
 	unregisterClientProtocol(lp)
 	lp.handlerMu.Lock()
 	lp.quitOnce.Do(func() { close(lp.quitCh) })
 	lp.handlerMu.Unlock()
 	if lp.downloader != nil {
-		lp.downloader.cancel()
+		lp.downloader.Terminate()
 	}
 	if lp.peerSet != nil {
 		for _, p := range lp.peerSet.getPeers() {
@@ -194,6 +196,16 @@ func (lp *LightProtocol) Stop() {
 	}
 	lp.handlerWg.Wait()
 	lp.wg.Wait()
+	lp.syncWG.Wait()
+}
+
+func (lp *LightProtocol) quitting() bool {
+	select {
+	case <-lp.quitCh:
+		return true
+	default:
+		return false
+	}
 }
 
 func (lp *LightProtocol) onDownloadDone(started bool, local, peer uint64) {
@@ -243,20 +255,39 @@ func (lp *LightProtocol) syncer() {
 	// Each shard header-syncs on its own. Poll on the base interval so a shard
 	// that aborted a session retries quickly instead of waiting a minute.
 	forceSync := time.NewTicker(forceSyncInterval)
+	defer forceSync.Stop()
 	lp.log.Debug("lp with peerset size %d", len(lp.peerSet.getPeers()))
 	for {
 		select {
 		case <-lp.syncCh:
-			go lp.synchronise(lp.peerSet.bestPeers())
+			lp.spawnSync(lp.peerSet.bestPeers())
 		case <-forceSync.C:
-			go lp.synchronise(lp.peerSet.bestPeers())
+			lp.spawnSync(lp.peerSet.bestPeers())
 		case <-lp.quitCh:
 			return
 		}
 	}
 }
 
+// spawnSync runs one header-sync attempt on the wait group Stop waits for.
+func (lp *LightProtocol) spawnSync(peers []*peer) {
+	lp.handlerMu.Lock()
+	select {
+	case <-lp.quitCh:
+		lp.handlerMu.Unlock()
+		return
+	default:
+	}
+	lp.syncWG.Add(1)
+	lp.handlerMu.Unlock()
+	go lp.synchronise(peers)
+}
+
 func (lp *LightProtocol) synchronise(peers []*peer) {
+	defer lp.syncWG.Done()
+	if lp.quitting() {
+		return
+	}
 	if paused, reason := SyncPause(); paused {
 		height := uint64(0)
 		if header := lp.chain.CurrentHeader(); header != nil {
@@ -266,6 +297,9 @@ func (lp *LightProtocol) synchronise(peers []*peer) {
 		return
 	}
 
+	if lp.quitting() {
+		return
+	}
 	hash, err := lp.chain.GetStore().GetHeadBlockHash()
 	if err != nil {
 		lp.log.Error("lp.synchronise GetHeadBlockHash err.[%s]", err)
@@ -304,6 +338,9 @@ func (lp *LightProtocol) synchronise(peers []*peer) {
 			continue
 		}
 
+		if lp.quitting() {
+			return
+		}
 		err = lp.downloader.synchronise(p)
 		if err != nil {
 			if err == ErrIsSynchronising {
@@ -319,6 +356,11 @@ func (lp *LightProtocol) synchronise(peers []*peer) {
 }
 
 func (lp *LightProtocol) handleAddPeer(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) bool {
+	// p2p is still accepting connections after this protocol stops. Reading
+	// the header database here is what logged "leveldb: closed".
+	if lp.quitting() {
+		return false
+	}
 	if lp.peerSet.Find(p2pPeer.Node.ID) != nil {
 		lp.log.Error("handleAddPeer called, but peer of this public-key has already existed, so need quit!")
 		return false
@@ -471,7 +513,11 @@ handler:
 			}
 
 			if err := peer.handleSyncHashRequest(&query); err != nil {
-				lp.log.Error("failed to handleSyncHashRequest, quit! %s", err)
+				if lp.quitting() {
+					lp.log.Debug("failed to handleSyncHashRequest during shutdown: %s", err)
+				} else {
+					lp.log.Error("failed to handleSyncHashRequest, quit! %s", err)
+				}
 				break handler
 			}
 
@@ -484,7 +530,11 @@ handler:
 			}
 
 			if err := peer.handleSyncHash(&query); err != nil {
-				lp.log.Error("failed to syncHashResponseCode, quit! %s", err)
+				if lp.quitting() {
+					lp.log.Debug("failed to syncHashResponseCode during shutdown: %s", err)
+				} else {
+					lp.log.Error("failed to syncHashResponseCode, quit! %s", err)
+				}
 				break handler
 			}
 

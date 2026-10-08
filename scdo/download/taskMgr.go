@@ -105,7 +105,16 @@ type taskMgr struct {
 	// "this height has not moved for windowStallTimeout".
 	lastHead         uint64
 	lastChainAdvance time.Time
+
+	// Discards outside the window are one summary per minute, not one line per block.
+	discardLogAt time.Time
+	discardCount int
+	discardMin   uint64
+	discardMax   uint64
+	discardLogs  int
 }
+
+const discardLogEvery = time.Minute
 
 func newTaskMgr(d *Downloader, masterPeer string, conn *peerConn, from uint64, to uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block) *taskMgr {
 	t := &taskMgr{
@@ -139,6 +148,9 @@ func (t *taskMgr) run() {
 
 loopOut:
 	for {
+		if t.downloader != nil && t.downloader.isStopped() {
+			break
+		}
 		// The canonical head wins over the in-memory cursor. A discarded
 		// body or a cursor that stepped past an unwritten height used to
 		// leave the window one past the block the chain still needs.
@@ -168,6 +180,7 @@ loopOut:
 		// Drop blocks already written, including a processed prefix left
 		// behind when a later debt is still waiting on another shard.
 		t.releaseProcessed()
+		t.maybeFlushDiscard(time.Now())
 		t.logProgress()
 		if t.isDone() {
 			t.downloader.Cancel()
@@ -519,13 +532,68 @@ func (t *taskMgr) getWaitProcessingBlocks() []*downloadInfo {
 	return results
 }
 
-func (t *taskMgr) close() {
+func (t *taskMgr) signalQuit() {
+	if t == nil {
+		return
+	}
 	select {
 	case <-t.quitCh:
 	default:
 		close(t.quitCh)
 	}
+}
+
+func (t *taskMgr) close() {
+	t.maybeFlushDiscard(time.Now().Add(discardLogEvery))
+	t.signalQuit()
 	t.wg.Wait()
+}
+
+// noteDiscardLocked counts a body that fell outside the window.
+// The per-block line is debug. A warning with the count and height range
+// is written at most once a minute.
+func (t *taskMgr) noteDiscardLocked(height uint64, now time.Time) {
+	if t.log != nil {
+		t.log.Debug("discard block height %d outside download window starting at %d (len %d)", height, t.listBase, len(t.downloadInfoList))
+	}
+	if t.discardCount == 0 {
+		t.discardMin = height
+		t.discardMax = height
+		t.discardLogAt = now
+	} else {
+		if height < t.discardMin {
+			t.discardMin = height
+		}
+		if height > t.discardMax {
+			t.discardMax = height
+		}
+	}
+	t.discardCount++
+	if t.discardCount > 1 && now.Sub(t.discardLogAt) >= discardLogEvery {
+		t.flushDiscardLocked()
+	}
+}
+
+func (t *taskMgr) maybeFlushDiscard(now time.Time) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if t.discardCount == 0 || now.Sub(t.discardLogAt) < discardLogEvery {
+		return
+	}
+	t.flushDiscardLocked()
+}
+
+func (t *taskMgr) flushDiscardLocked() {
+	if t.discardCount == 0 {
+		return
+	}
+	if t.log != nil {
+		t.log.Warn("discarded %d blocks outside the download window, heights %d-%d, window starts at %d", t.discardCount, t.discardMin, t.discardMax, t.listBase)
+	}
+	t.discardLogs++
+	t.discardCount = 0
+	t.discardMin = 0
+	t.discardMax = 0
 }
 
 // getReqHeaderInfo gets header request information, returns the start block number and amount of headers.
@@ -738,7 +806,7 @@ func (t *taskMgr) deliverBlockMsg(peerID string, blocks []*types.Block) {
 	for _, b := range blocks {
 		idx := t.pos(b.Header.Height)
 		if idx < 0 || idx >= len(t.downloadInfoList) {
-			t.log.Warn("discard block height %d outside download window starting at %d (len %d)", b.Header.Height, t.listBase, len(t.downloadInfoList))
+			t.noteDiscardLocked(b.Header.Height, time.Now())
 			continue
 		}
 		headInfo := t.downloadInfoList[idx]

@@ -604,6 +604,38 @@ func TestCancelUnblocksPeerDownload(t *testing.T) {
 	}
 }
 
+func TestTerminateDuringHeaderWait(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	dl := newTestDownloader(db)
+	dl.RegisterPeer("stall", newTestPeer())
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_ = dl.Synchronise("stall", common.EmptyHash)
+	}()
+	<-started
+	time.Sleep(50 * time.Millisecond)
+
+	done := make(chan struct{})
+	begin := time.Now()
+	go func() {
+		dl.Terminate()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Terminate did not return while a header request was in flight")
+	}
+	if time.Since(begin) > 2*time.Second {
+		t.Fatal("Terminate took longer than 2s")
+	}
+	if err := dl.Synchronise("stall", common.EmptyHash); err != errReceivedQuitMsg {
+		t.Fatalf("Synchronise after Terminate: %v", err)
+	}
+}
+
 func TestTerminateRejectsNewSession(t *testing.T) {
 	db, dispose := leveldb.NewTestDatabase()
 	defer dispose()

@@ -303,7 +303,12 @@ func (d *Downloader) Synchronise(id string, head common.Hash) error {
 		d.lock.Unlock()
 		return errPeerNotFound
 	}
+	// Count this session before releasing the lock. Terminate sets stopped
+	// under the same lock and then waits, so it cannot miss a session that
+	// is about to start, and it cannot return while this one is still running.
+	d.sessionWG.Add(1)
 	d.lock.Unlock()
+	defer d.sessionWG.Done()
 
 	err := d.doSynchronise(p, head)
 
@@ -423,6 +428,9 @@ func (d *Downloader) findCommonAncestorHeight(conn *peerConn, height uint64) (ui
 	var cmpCount uint64
 	maxFetchAncestry := getMaxFetchAncestry(top)
 	for {
+		if d.cancelled() {
+			return 0, errReceivedQuitMsg
+		}
 		localTop := top - uint64(cmpCount)
 
 		fetchCount := getFetchCount(maxFetchAncestry, cmpCount)
@@ -567,8 +575,24 @@ func (d *Downloader) Cancel() {
 func (d *Downloader) Terminate() {
 	d.lock.Lock()
 	d.stopped = true
+	d.acceptPeers = false
 	d.closeCancelLocked()
+	peers := make([]*peerConn, 0, len(d.peers))
+	for _, p := range d.peers {
+		peers = append(peers, p)
+	}
+	tm := d.tm
 	d.lock.Unlock()
+	for _, p := range peers {
+		if p == nil {
+			continue
+		}
+		p.stopSession()
+		p.close()
+	}
+	if tm != nil {
+		tm.signalQuit()
+	}
 	d.sessionWG.Wait()
 }
 
@@ -587,13 +611,27 @@ func (d *Downloader) closeCancelLocked() {
 }
 
 // cancelled reports that the current session was asked to stop.
+func (d *Downloader) isStopped() bool {
+	if d == nil {
+		return false
+	}
+	d.lock.RLock()
+	stopped := d.stopped
+	d.lock.RUnlock()
+	return stopped
+}
+
 func (d *Downloader) cancelled() bool {
 	if d == nil {
 		return false
 	}
 	d.lock.RLock()
+	stopped := d.stopped
 	ch := d.cancelCh
 	d.lock.RUnlock()
+	if stopped {
+		return true
+	}
 	if ch == nil {
 		return false
 	}
@@ -774,6 +812,9 @@ func (d *Downloader) idlePeer(conn *peerConn, tm *taskMgr) error {
 // waiting is true when a cross-shard debt needs a source-shard header or more
 // confirmations on that shard. The task manager leaves those blocks queued and retries.
 func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block, conn *peerConn) (waiting bool) {
+	if d.cancelled() {
+		return false
+	}
 	if len(headInfos) > 0 {
 		d.log.Debug(" [%d] blocks will be processed into local database", len(headInfos))
 	}

@@ -471,6 +471,26 @@ func newWindowTask(base, cur, to uint64) *taskMgr {
 	}
 }
 
+func TestDiscardSummaryOnceAMinute(t *testing.T) {
+	tm := &taskMgr{log: log.GetLogger("discard-test"), listBase: 3584143}
+	start := time.Now()
+	tm.noteDiscardLocked(3584142, start)
+	tm.noteDiscardLocked(3584000, start.Add(time.Second))
+	tm.noteDiscardLocked(3585000, start.Add(2*time.Second))
+	if tm.discardLogs != 0 || tm.discardCount != 3 || tm.discardMin != 3584000 || tm.discardMax != 3585000 {
+		t.Fatalf("discards before a minute: count %d min %d max %d logs %d", tm.discardCount, tm.discardMin, tm.discardMax, tm.discardLogs)
+	}
+	tm.noteDiscardLocked(3583000, start.Add(discardLogEvery))
+	if tm.discardLogs != 1 || tm.discardCount != 0 {
+		t.Fatalf("summary after a minute: count %d logs %d", tm.discardCount, tm.discardLogs)
+	}
+	// The next block starts a new window instead of logging again.
+	tm.noteDiscardLocked(10, start.Add(discardLogEvery+time.Second))
+	if tm.discardLogs != 1 || tm.discardCount != 1 || tm.discardMin != 10 {
+		t.Fatalf("new window: count %d min %d logs %d", tm.discardCount, tm.discardMin, tm.discardLogs)
+	}
+}
+
 func newTestBlockHeaderWithHeight(height uint64) *types.BlockHeader {
 	return &types.BlockHeader{
 		PreviousBlockHash: common.StringToHash("PreviousBlockHash"),

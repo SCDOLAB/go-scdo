@@ -30,6 +30,7 @@ type Downloader struct {
 	cancelCh      chan struct{} // Cancel current synchronising session
 	msgCh         chan *p2p.Message
 	syncStatus    int32
+	stopped       bool
 	chain         BlockChain
 	wg            sync.WaitGroup
 	log           *log.ScdoLog
@@ -52,6 +53,10 @@ func newDownloader(chain BlockChain) *Downloader {
 func (d *Downloader) synchronise(p *peer) error {
 	// Make sure only one routine can run at once
 	d.lock.Lock()
+	if d.stopped {
+		d.lock.Unlock()
+		return nil
+	}
 	if d.syncStatus == statusDownloading {
 		d.lock.Unlock()
 		return ErrIsSynchronising
@@ -78,22 +83,32 @@ func (d *Downloader) doSynchronise(p *peer) {
 	}
 	defer func() {
 		d.cancel()
-		d.wg.Done()
+		// Read the chain before Done. Terminate waits on wg and the caller
+		// then closes the database. A chain read after Done races that close.
+		if d.chain != nil {
+			if header := d.chain.CurrentHeader(); header != nil {
+				localH = header.Height
+			}
+		}
 		d.lock.Lock()
-		close(d.msgCh)
+		if d.msgCh != nil {
+			close(d.msgCh)
+			d.msgCh = nil
+		}
 		d.syncStatus = statusNotDownloading
 		done := d.onSessionDone
 		d.lock.Unlock()
-		if header := d.chain.CurrentHeader(); header != nil {
-			localH = header.Height
-		}
 		if done != nil {
 			done(started, localH, peerH)
 		}
+		d.wg.Done()
 	}()
 
 	if paused, reason := SyncPause(); paused {
 		d.log.Info("light sync paused (%s); verified height %d kept", reason, localH)
+		return
+	}
+	if d.stopping() {
 		return
 	}
 	started = true
@@ -157,6 +172,9 @@ needQuit:
 			curHeight := uint64(0)
 			counter := 0
 			for _, head := range headMsg.Hearders[1:] {
+				if d.stopping() {
+					break needQuit
+				}
 				// WriteHeader checks the parent link and ZPoW. There is no
 				// checkpoint: every header from fork genesis is verified.
 				if err = d.chain.WriteHeader(head); err != nil && !errors.IsOrContains(err, core.ErrBlockAlreadyExists) {
@@ -206,14 +224,31 @@ needQuit:
 	return
 }
 
-// DeliverMsg called by lightprotocol to deliver received msg from network
+// DeliverMsg called by lightprotocol to deliver received msg from network.
+// Shutdown closes cancelCh. The send must not block the peer handler after
+// that, or Stop waits on the handler while the handler waits on this send.
 func (d *Downloader) deliverMsg(p *peer, msg *p2p.Message) {
 	defer func() {
 		if r := recover(); r != nil {
 			d.log.Error("Downloader paniced. %s", r)
 		}
 	}()
-	d.msgCh <- msg
+	d.lock.RLock()
+	ch := d.msgCh
+	cancel := d.cancelCh
+	stopped := d.stopped
+	d.lock.RUnlock()
+	if stopped || ch == nil {
+		return
+	}
+	if cancel == nil {
+		ch <- msg
+		return
+	}
+	select {
+	case <-cancel:
+	case ch <- msg:
+	}
 	return
 }
 
@@ -230,8 +265,34 @@ func (d *Downloader) cancel() {
 	}
 }
 
+// stopping reports that this session should leave the header write loop.
+func (d *Downloader) stopping() bool {
+	if d == nil {
+		return false
+	}
+	d.lock.RLock()
+	stopped := d.stopped
+	ch := d.cancelCh
+	d.lock.RUnlock()
+	if stopped {
+		return true
+	}
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 // Terminate close Downloader, cannot called anymore.
 func (d *Downloader) Terminate() {
+	d.lock.Lock()
+	d.stopped = true
+	d.lock.Unlock()
 	d.cancel()
 	d.wg.Wait()
 }
@@ -268,6 +329,9 @@ func (d *Downloader) reverseLightBCstore(ancestor uint64) error {
 	localHashes := make([]common.Hash, 0)
 
 	for curHeight > ancestor {
+		if d.stopping() {
+			return errors.New("light downloader stopped")
+		}
 		hash, err := bcStore.GetBlockHash(curHeight)
 		d.log.Debug("light reverse curHeight: %d, hash: %v", curHeight, hash)
 		if err != nil {

@@ -99,6 +99,11 @@ type Blockchain struct {
 	indexFile     string
 	indexVerified uint64
 	indexMu       sync.Mutex
+	// indexClamped is the last time a rewind rewrote the checkpoint file.
+	// The in-memory height follows the head on every rewind. The file is
+	// rewritten at most once a second so a long reverse does not rename it
+	// on every block. Shutdown writes it immediately.
+	indexClamped time.Time
 }
 
 // NewBlockchain returns an initialized blockchain with the given store and account state DB.
@@ -175,9 +180,13 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 	// A crash from here on is an unclean shutdown, including a crash during
 	// this scan. The previous clean height is what this scan trusts.
 	if bc.indexFile != "" && cp.Clean {
+		verified := cp.VerifiedHeight
+		if verified > currentBlock.Header.Height {
+			verified = currentBlock.Header.Height
+		}
 		bc.indexMu.Lock()
-		bc.indexVerified = cp.VerifiedHeight
-		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: cp.VerifiedHeight, Clean: false})
+		bc.indexVerified = verified
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: verified, Clean: false})
 		bc.indexMu.Unlock()
 	}
 	if bc.indexFile == "" {
@@ -238,6 +247,12 @@ func (bc *Blockchain) CurrentBlock() *types.Block {
 // UpdateCurrentBlock updates the HEAD block of the blockchain.
 func (bc *Blockchain) UpdateCurrentBlock(block *types.Block) {
 	bc.currentBlock.Store(block)
+	if block == nil || block.Header == nil {
+		return
+	}
+	// A rewind moves the committed head backwards. The checkpoint must follow
+	// or the next restart trusts a height the canonical chain no longer has.
+	bc.noteHeadLower(block.Header.Height)
 }
 
 // AddBlockLeaves adds a new block leaf
