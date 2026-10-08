@@ -23,7 +23,7 @@ func newEventPool() (*EventPool, error, func()) {
 }
 
 func getRandomTx() *types.Transaction {
-	fromAddress, fromPrivateKey, err := crypto.GenerateKeyPair()
+	fromAddress, fromPrivateKey, err := crypto.GenerateKeyPair(1)
 	if err != nil {
 		panic(err)
 	}

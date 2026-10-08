@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
+	"github.com/scdoproject/go-scdo/common/errors"
 	"github.com/scdoproject/go-scdo/core/state"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/event"
@@ -89,7 +90,13 @@ func (dp *DebtPool) loopCheckingDebt() {
 		} else {
 			err := dp.DoMulCheckingDebt()
 			if err != nil {
-				dp.log.Warn("multiple threads checking error: %s", err)
+				// A source header that is not synced yet is the queued-retry
+				// path. Log it at debug so a syncing node is not flooded.
+				if errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations) {
+					dp.log.Debug("debts waiting on source shard: %s", err)
+				} else {
+					dp.log.Warn("multiple threads checking error: %s", err)
+				}
 				// need to sleep some time
 				time.Sleep(5 * time.Second)
 			}
@@ -139,8 +146,8 @@ func (dp *DebtPool) DoMulCheckingDebt() error {
 func (dp *DebtPool) DoMulCheckingDebtHandler(d *types.Debt) error {
 	recoverable, err := d.Validate(dp.verifier, false, common.LocalShardNumber)
 	if err != nil {
-		if recoverable {
-			dp.log.Debug("check debt with recoverable error %s", err)
+		if recoverable || debtSourceNotReady(err) {
+			dp.log.Debug("check debt waiting on source shard: %s", err)
 		} else {
 			dp.log.Info("check debt with unrecoverable error %s", err)
 			dp.toConfirmedDebts.removeByValue(d)
@@ -159,14 +166,20 @@ func (dp *DebtPool) DoMulCheckingDebtHandler(d *types.Debt) error {
 	}
 }
 
+// debtSourceNotReady reports a cross-shard check that should be retried.
+// The debt stays in the pool. A real validation failure does not match.
+func debtSourceNotReady(err error) bool {
+	return errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations)
+}
+
 // DoCheckingDebt is a legecy rountine
 func (dp *DebtPool) DoCheckingDebt() {
 	tmp := dp.toConfirmedDebts.items()
 	for h, d := range tmp {
 		recoverable, err := d.Validate(dp.verifier, false, common.LocalShardNumber)
 		if err != nil {
-			if recoverable {
-				dp.log.Debug("check debt with recoverable error %s", err)
+			if recoverable || debtSourceNotReady(err) {
+				dp.log.Debug("check debt waiting on source shard: %s", err)
 			} else {
 				dp.log.Info("check debt with unrecoverable error %s", err)
 				dp.toConfirmedDebts.remove(h)

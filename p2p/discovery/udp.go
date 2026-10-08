@@ -12,8 +12,8 @@ import (
 	"io/ioutil"
 	rand2 "math/rand"
 	"net"
-	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	cmap "github.com/orcaman/concurrent-map"
@@ -62,6 +62,9 @@ type udp struct {
 
 	timeoutNodesCount cmap.ConcurrentMap //node id -> count
 	blockList         cmap.ConcurrentMap //blockList for ip, key is IP  and value is last (ping) message unix-timestamp
+	nodeDir           string
+	lastBlockList     time.Time
+	persist           *sync.Mutex
 }
 
 type pending struct {
@@ -114,6 +117,7 @@ func newUDP(id common.Address, addr *net.UDPAddr, shard uint) *udp {
 		log:               discoverylog,
 		timeoutNodesCount: cmap.New(),
 		blockList:         cmap.New(),
+		persist:           new(sync.Mutex),
 		// toTrustNodes:      make([]*Node, 0),
 	}
 
@@ -408,7 +412,36 @@ func (u *udp) loopReply() {
 	}
 }
 
+// SeekShard asks a known node for peers of shard. A light client uses this
+// when that shard still has no TCP peer.
+func (u *udp) SeekShard(shard uint) {
+	if u == nil || u.table == nil || shard == 0 || int(shard) >= len(u.table.shardBuckets) {
+		return
+	}
+	var to *Node
+	if b := u.table.shardBuckets[shard]; b != nil && b.size() > 0 {
+		to = b.get(0)
+	}
+	if to == nil && u.db != nil {
+		to = u.db.getRandNode()
+	}
+	if to == nil && len(u.trustNodes) > 0 {
+		to = u.trustNodes[0]
+	}
+	if to == nil {
+		u.log.Debug("no discovery node yet to ask for shard %d", shard)
+		return
+	}
+	u.log.Info("discovery looking for shard %d peers via %s", shard, to.GetUDPAddr())
+	sendFindShardNodeRequest(u, shard, to)
+}
+
 func (u *udp) discovery() {
+	// Ask every shard once before the paced loop. The paced loop sleeps
+	// 25s between batches, which left a restarted node with no peers.
+	for shard := uint(1); shard <= uint(common.ShardCount); shard++ {
+		u.SeekShard(shard)
+	}
 	for {
 		id, err := crypto.GenerateRandomAddress()
 		if err != nil {
@@ -527,6 +560,7 @@ func (u *udp) ping(value *Node) {
 }
 
 func (u *udp) StartServe(nodeDir string) {
+	u.nodeDir = nodeDir
 	go u.checkBlockList()
 	go u.readLoop()
 	go u.loopReply()
@@ -558,33 +592,57 @@ func (u *udp) checkBlockList() {
 }
 
 func (u *udp) saveBlockList(nodeDir string) {
-	ticker := time.NewTicker(blockListSaveInterval)
+	if u.nodeDir == "" {
+		u.nodeDir = nodeDir
+	}
+	interval := blockListSaveInterval
+	if interval < minDiskSnapshotInterval {
+		interval = minDiskSnapshotInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			nodeByte, err := json.MarshalIndent(u.blockList, "", "\t")
-			if err != nil {
-				u.log.Error("json marshal occur error, for:[%s]", err.Error())
-				return
-			}
-			u.log.Info("%s", nodeByte)
-			fileFullPath := filepath.Join(nodeDir, blockListBackupFile)
-			if !common.FileOrFolderExists(fileFullPath) {
-				if err := os.MkdirAll(nodeDir, os.ModePerm); err != nil {
-					u.log.Error("filePath:[%s], failed to create folder, for:[%s]", nodeDir, err.Error())
-					return
-				}
-			}
-			u.log.Debug("backups block list. size %d", u.blockList.Count())
-			if err = ioutil.WriteFile(fileFullPath, nodeByte, 0666); err != nil {
+			if err := u.writeBlockList(false); err != nil {
 				u.log.Error("block list backup failed, for:[%s]", err.Error())
-				return
 			}
-
-			u.log.Debug("blockList:%s backup success\n", string(nodeByte))
 		}
 	}
+}
+
+// FlushBlockList writes blockList.json and fsyncs it. Clean shutdown only.
+func (u *udp) FlushBlockList() {
+	if u == nil || u.nodeDir == "" {
+		return
+	}
+	if err := u.writeBlockList(true); err != nil && u.log != nil {
+		u.log.Error("block list backup failed, for:[%s]", err.Error())
+	}
+}
+
+func (u *udp) writeBlockList(durable bool) error {
+	if u.persist == nil {
+		u.persist = new(sync.Mutex)
+	}
+	u.persist.Lock()
+	defer u.persist.Unlock()
+	if !durable && !u.lastBlockList.IsZero() && time.Since(u.lastBlockList) < minDiskSnapshotInterval {
+		return nil
+	}
+	nodeByte, err := json.MarshalIndent(u.blockList, "", "\t")
+	if err != nil {
+		return err
+	}
+	u.log.Info("%s", nodeByte)
+	fileFullPath := filepath.Join(u.nodeDir, blockListBackupFile)
+	u.log.Debug("backups block list. size %d", u.blockList.Count())
+	if err = replaceFile(fileFullPath, nodeByte, durable); err != nil {
+		return err
+	}
+	u.lastBlockList = time.Now()
+	u.log.Debug("blockList:%s backup success\n", string(nodeByte))
+	return nil
 }
 
 // printPeers print log during 60 minutes, note this is in debug
@@ -684,6 +742,8 @@ func (u *udp) loadNodes(nodeDir string) {
 			continue
 		}
 		u.bootstrapNodes = append(u.bootstrapNodes, n)
+		u.db.add(n, false)
+		u.table.addNode(n)
 	}
 
 	u.log.Debug("load %d nodes from back file", len(u.bootstrapNodes))

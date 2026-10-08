@@ -6,11 +6,14 @@
 package core
 
 import (
+	"encoding/json"
 	"io/ioutil"
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/common/errors"
@@ -21,6 +24,22 @@ import (
 	"github.com/scdoproject/go-scdo/database/leveldb"
 	"github.com/stretchr/testify/assert"
 )
+
+func assertSameRecovery(t *testing.T, got, want recoveryPoint) {
+	t.Helper()
+	got.disk = nil
+	want.disk = nil
+	assert.Equal(t, want, got)
+}
+
+// withImmediateRecovery makes every marker change hit disk. Production import
+// waits recoveryFlushInterval and does not fsync.
+func withImmediateRecovery(t *testing.T) {
+	t.Helper()
+	prev := recoveryFlushInterval
+	recoveryFlushInterval = 0
+	t.Cleanup(func() { recoveryFlushInterval = prev })
+}
 
 func newTestRecoveryPointFile() (string, func()) {
 	dir, err := ioutil.TempDir("", "SeeleCoreRecoveryPoint")
@@ -50,7 +69,7 @@ func newTestRecoverableBlockchain(bcStore store.BlockchainStore, stateDB databas
 func Test_RecoveryPoint_FileNotSet(t *testing.T) {
 	rp, err := loadRecoveryPoint("")
 	assert.Equal(t, err, nil)
-	assert.Equal(t, *rp, recoveryPoint{})
+	assertSameRecovery(t, *rp, recoveryPoint{})
 }
 
 func Test_RecoveryPoint_FileSet(t *testing.T) {
@@ -59,10 +78,11 @@ func Test_RecoveryPoint_FileSet(t *testing.T) {
 
 	rp, err := loadRecoveryPoint(rpFile)
 	assert.Equal(t, err, nil)
-	assert.Equal(t, *rp, recoveryPoint{file: rpFile})
+	assertSameRecovery(t, *rp, recoveryPoint{file: rpFile})
 }
 
 func Test_RecoveryPoint_Serialization(t *testing.T) {
+	withImmediateRecovery(t)
 	rpFile, dispose := newTestRecoveryPointFile()
 	defer dispose()
 	rp, _ := loadRecoveryPoint(rpFile)
@@ -77,26 +97,160 @@ func Test_RecoveryPoint_Serialization(t *testing.T) {
 	rp.serialize()
 
 	rp2, _ := loadRecoveryPoint(rpFile)
-	assert.Equal(t, *rp, *rp2)
+	assertSameRecovery(t, *rp, *rp2)
 
 	// after put block
 	rp.onPutBlockEnd()
 	rp2, _ = loadRecoveryPoint(rpFile)
-	assert.Equal(t, *rp2, recoveryPoint{LargerHeight: 6, StaleHash: common.StringToHash("stale block hash"), file: rpFile})
+	assertSameRecovery(t, *rp2, recoveryPoint{LargerHeight: 6, StaleHash: common.StringToHash("stale block hash"), file: rpFile})
 
 	//delete larger height blocks
 	rp.onDeleteLargerHeightBlocks(9)
 	rp2, _ = loadRecoveryPoint(rpFile)
-	assert.Equal(t, *rp2, recoveryPoint{LargerHeight: 9, StaleHash: common.StringToHash("stale block hash"), file: rpFile})
+	assertSameRecovery(t, *rp2, recoveryPoint{LargerHeight: 9, StaleHash: common.StringToHash("stale block hash"), file: rpFile})
 
 	// overwrite stale blocks in canonical chain
 	rp.onDeleteLargerHeightBlocks(0)
 	rp.onOverwriteStaleBlocks(common.StringToHash("stale block hash 2"))
 	rp2, _ = loadRecoveryPoint(rpFile)
-	assert.Equal(t, *rp2, recoveryPoint{StaleHash: common.StringToHash("stale block hash 2"), file: rpFile})
+	assertSameRecovery(t, *rp2, recoveryPoint{StaleHash: common.StringToHash("stale block hash 2"), file: rpFile})
+}
+
+func Test_RecoveryPoint_AtomicWrite(t *testing.T) {
+	rpFile, dispose := newTestRecoveryPointFile()
+	defer dispose()
+
+	original := []byte("{\"LargerHeight\":1}\n")
+	assert.Nil(t, ioutil.WriteFile(rpFile, original, 0644))
+
+	rp, err := loadRecoveryPoint(rpFile)
+	assert.Nil(t, err)
+	rp.LargerHeight = 9
+	rp.StaleHash = common.StringToHash("stale block hash")
+	rp.serialize()
+
+	if _, err := os.Stat(rpFile + ".tmp"); err == nil {
+		t.Fatal("temp recovery file was left behind")
+	}
+	loaded, err := loadRecoveryPoint(rpFile)
+	assert.Nil(t, err)
+	assert.Equal(t, uint64(9), loaded.LargerHeight)
+	assert.Equal(t, rp.StaleHash, loaded.StaleHash)
+
+	// A failed replace must leave the previous file readable.
+	assert.NotNil(t, writeAtomic(rpFile+"/missing", []byte("{}"), false))
+	again, err := ioutil.ReadFile(rpFile)
+	assert.Nil(t, err)
+	assert.True(t, len(again) > 0)
+	var parsed recoveryPoint
+	assert.Nil(t, json.Unmarshal(again, &parsed))
+}
+
+// Test_RecoveryPoint_FsyncsPerImportedBlock is the HDD regression check.
+// a0a0423 fsynced recoveryPoint.json on both sides of every block write
+// (about 6 flush requests per block on a 4-shard node). Import may replace
+// the file at most once per interval and must not fsync. Shutdown fsyncs once.
+func Test_RecoveryPoint_FsyncsPerImportedBlock(t *testing.T) {
+	prevInterval := recoveryFlushInterval
+	prevNow := recoveryNow
+	recoveryFlushInterval = 10 * time.Second
+	clock := time.Unix(1_700_000_000, 0)
+	recoveryNow = func() time.Time { return clock }
+	t.Cleanup(func() {
+		recoveryFlushInterval = prevInterval
+		recoveryNow = prevNow
+	})
+
+	rpFile, dispose := newTestRecoveryPointFile()
+	defer dispose()
+	rp, err := loadRecoveryPoint(rpFile)
+	assert.Nil(t, err)
+
+	const blocks = 200
+	writesBefore := atomic.LoadInt64(&recoveryDiskWrites)
+	syncsBefore := atomic.LoadInt64(&recoveryFsyncs)
+	for i := 0; i < blocks; i++ {
+		var hash common.Hash
+		hash[0] = byte(i)
+		hash[1] = byte(i >> 8)
+		rp.WritingBlockHash = hash
+		rp.WritingBlockHeight = uint64(i + 1)
+		rp.PreviousHeadBlockHash = common.StringToHash("head")
+		rp.serialize()
+		rp.onPutBlockEnd()
+	}
+
+	writes := atomic.LoadInt64(&recoveryDiskWrites) - writesBefore
+	syncs := atomic.LoadInt64(&recoveryFsyncs) - syncsBefore
+	t.Logf("fsyncs per imported block during sync: %.4f (atomic renames %d / %d blocks)", float64(syncs)/float64(blocks), writes, blocks)
+	if writes > 1 {
+		t.Fatalf("recoveryPoint rewrote %d times inside one interval, want at most 1", writes)
+	}
+	if syncs != 0 {
+		t.Fatalf("hot path fsynced %d times (%.4f per block), want 0", syncs, float64(syncs)/float64(blocks))
+	}
+	if rp.WritingBlockHeight != 0 || !rp.WritingBlockHash.IsEmpty() {
+		t.Fatal("in-memory marker was not updated when the disk write was skipped")
+	}
+
+	clock = clock.Add(11 * time.Second)
+	rp.LargerHeight = 42
+	rp.serialize()
+	writes = atomic.LoadInt64(&recoveryDiskWrites) - writesBefore
+	syncs = atomic.LoadInt64(&recoveryFsyncs) - syncsBefore
+	if writes != 2 {
+		t.Fatalf("crossing the interval rewrote the file %d times, want 2", writes)
+	}
+	if syncs != 0 {
+		t.Fatal("interval flush fsynced; want an atomic rename only")
+	}
+
+	rp.flush()
+	writes = atomic.LoadInt64(&recoveryDiskWrites) - writesBefore
+	syncs = atomic.LoadInt64(&recoveryFsyncs) - syncsBefore
+	if syncs != 1 {
+		t.Fatalf("clean shutdown fsynced %d times, want 1", syncs)
+	}
+	if writes != 3 {
+		t.Fatalf("shutdown write count %d, want 3", writes)
+	}
+	loaded, err := loadRecoveryPoint(rpFile)
+	assert.Nil(t, err)
+	assert.Equal(t, uint64(42), loaded.LargerHeight)
+	t.Logf("fsyncs per imported block including one shutdown flush: %.4f", float64(syncs)/float64(blocks))
+}
+
+func BenchmarkRecoveryPointPerImportedBlock(b *testing.B) {
+	prevInterval := recoveryFlushInterval
+	recoveryFlushInterval = 10 * time.Second
+	b.Cleanup(func() { recoveryFlushInterval = prevInterval })
+
+	dir, err := ioutil.TempDir("", "rp-bench")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	rp, err := loadRecoveryPoint(filepath.Join(dir, "recoveryPoint.json"))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	syncsBefore := atomic.LoadInt64(&recoveryFsyncs)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rp.WritingBlockHeight = uint64(i + 1)
+		rp.serialize()
+		rp.onPutBlockEnd()
+	}
+	b.StopTimer()
+	syncs := atomic.LoadInt64(&recoveryFsyncs) - syncsBefore
+	if b.N > 0 {
+		b.ReportMetric(float64(syncs)/float64(b.N), "fsyncs/block")
+	}
 }
 
 func Test_RecoveryPoint_PutBlockCorrupted(t *testing.T) {
+	withImmediateRecovery(t)
 	rpFile, dispose1 := newTestRecoveryPointFile()
 	defer dispose1()
 
@@ -111,7 +265,7 @@ func Test_RecoveryPoint_PutBlockCorrupted(t *testing.T) {
 	// and the inserted block exists in DB
 	bc := newTestRecoverableBlockchain(bcStore, db, rpFile)
 	newBlock := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, 3, 0)
-	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock), store.ErrDBCorrupt))
+	assert.True(t, errors.IsOrContains(bc.WriteBlock(newBlock, nil), store.ErrDBCorrupt))
 
 	// the inserted block exists in DB after corruption
 	_, err := bcStore.GetBlock(newBlock.HeaderHash)

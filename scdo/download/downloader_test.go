@@ -9,6 +9,7 @@ import (
 	"crypto/ecdsa"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,7 +64,7 @@ func newTestDownloader(db database.Database) *Downloader {
 	bc := core.NewTestBlockchain()
 	scdo := NewTestSeeleBackend()
 	d := NewDownloader(bc, scdo)
-	d.tm = newTaskMgr(d, d.masterPeer, nil, 1, 2, 1, nil)
+	d.tm = newTaskMgr(d, d.masterPeer, nil, 1, 2, 1, nil, nil)
 
 	return d
 }
@@ -181,25 +182,23 @@ func Test_Downloader_Synchronise(t *testing.T) {
 
 	peerID := "peerID"
 	head := common.EmptyHash
-	td := big.NewInt(0)
-	localTD := big.NewInt(0)
 
 	// case 1: ErrIsSynchronising
 	dl.syncStatus = statusPreparing
-	err := dl.Synchronise(peerID, head, td, localTD)
+	err := dl.Synchronise(peerID, head)
 	assert.Equal(t, err, ErrIsSynchronising)
 
 	dl.syncStatus = statusFetching
-	err = dl.Synchronise(peerID, head, td, localTD)
+	err = dl.Synchronise(peerID, head)
 	assert.Equal(t, err, ErrIsSynchronising)
 
 	dl.syncStatus = statusCleaning
-	err = dl.Synchronise(peerID, head, td, localTD)
+	err = dl.Synchronise(peerID, head)
 	assert.Equal(t, err, ErrIsSynchronising)
 
 	// case 2: peer not found
 	dl.syncStatus = statusNone
-	err = dl.Synchronise(peerID, head, td, localTD)
+	err = dl.Synchronise(peerID, head)
 	assert.Equal(t, err, errPeerNotFound)
 }
 
@@ -259,7 +258,9 @@ func Test_Downloader_FindCommonAncestorHeight(t *testing.T) {
 
 	//findCommonAncestorHeight(conn *peerConn, height uint64) (uint64, error)
 	pc := testTaskMgrPeerConn("peerID")
-	height := uint64(1)
+	// Peer height 0 returns immediately. A fresh chain's head is the fork genesis,
+	// so a non-zero peer height would query the peer.
+	height := uint64(0)
 
 	aHeight, err := dl.findCommonAncestorHeight(pc, height)
 	assert.Equal(t, err, nil)
@@ -272,8 +273,8 @@ func Test_Downloader_FindCommonAncestorHeight(t *testing.T) {
 	assert.Equal(t, err, nil)
 	assert.Equal(t, aHeight, uint64(0))
 
-	// case 2: one block
-	genesisHash, err := dl.chain.GetStore().GetBlockHash(0)
+	// case 2: one block at the fork genesis height
+	genesisHash, err := dl.chain.GetStore().GetBlockHash(common.ScdoForkHeight)
 	assert.Equal(t, err, nil)
 	_, err = dl.chain.GetStore().GetBlock(genesisHash)
 	assert.Equal(t, err, nil)
@@ -421,7 +422,8 @@ func Test_Downloader_IsAncenstorFound(t *testing.T) {
 
 	headers := newTestBlockHeaders()
 	found, cmpHeight, err := dl.isAncenstorFound(headers)
-	assert.Equal(t, found, true)
+	// A missing local hash is an error, not ancestor height 0.
+	assert.Equal(t, found, false)
 	assert.Equal(t, cmpHeight, uint64(0))
 	assert.Equal(t, strings.Contains(err.Error(), "leveldb: not found"), true)
 
@@ -522,8 +524,9 @@ func Test_Downloader_PeerDownload(t *testing.T) {
 	testPeer1 := newTestPeer()
 	pc1 := newPeerConn(testPeer1, "test", nil)
 	go func() {
-		dl.sessionWG.Add(1)
-		dl.peerDownload(pc1, taskMgr)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		dl.peerDownload(pc1, taskMgr, &wg)
 	}()
 
 	time.Sleep(300 * time.Millisecond)
@@ -534,9 +537,10 @@ func Test_Downloader_PeerDownload(t *testing.T) {
 	testPeer2 := newTestPeer()
 	pc2 := newPeerConn(testPeer2, "masterPeer", nil)
 	go func() {
-		dl.sessionWG.Add(1)
+		var wg sync.WaitGroup
+		wg.Add(1)
 		dl.cancelCh = make(chan struct{})
-		dl.peerDownload(pc2, taskMgr)
+		dl.peerDownload(pc2, taskMgr, &wg)
 	}()
 	time.Sleep(300 * time.Millisecond)
 
@@ -545,9 +549,10 @@ func Test_Downloader_PeerDownload(t *testing.T) {
 	pc3 := newPeerConn(testPeer3, "masterPeer", nil)
 	pc3.peer = testPeer3
 	go func() {
-		dl.sessionWG.Add(1)
+		var wg sync.WaitGroup
+		wg.Add(1)
 		dl.cancelCh = make(chan struct{})
-		dl.peerDownload(pc3, taskMgr)
+		dl.peerDownload(pc3, taskMgr, &wg)
 	}()
 	time.Sleep(100 * time.Millisecond)
 
@@ -564,15 +569,28 @@ func Test_Downloader_ProcessBlocks(t *testing.T) {
 	dl := newTestDownloader(db)
 
 	headInfos := []*downloadInfo{newDownloadInfo(1, taskStatusWaitProcessing)}
-	dl.processBlocks(headInfos, 0, 0, nil, nil)
+	dl.processBlocks(headInfos, 0, 0, nil, nil, nil)
 	assert.Equal(t, headInfos[0].status, taskStatusWaitProcessing)
 }
 
-func Test_findCommonAncestorHeight_localHeightIsZero(t *testing.T) {
+func Test_isAncenstorFound_missingHashIsError(t *testing.T) {
 	db, dispose := leveldb.NewTestDatabase()
 	defer dispose()
 	dl := newTestDownloader(db)
-	height := uint64(1000)
+	headers := []*types.BlockHeader{newTestBlockHeaderWithHeight(1)}
+	found, height, err := dl.isAncenstorFound(headers)
+	assert.Equal(t, false, found)
+	assert.Equal(t, uint64(0), height)
+	assert.NotNil(t, err)
+}
+
+func Test_findCommonAncestorHeight_peerHeightZero(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	dl := newTestDownloader(db)
+	// A fresh chain head is the fork genesis. Peer height 0 still returns
+	// before any header request, including when the peer value is unset.
+	height := uint64(0)
 	var testPeer *TestPeer
 	p := newPeerConn(testPeer, "test", nil)
 	ancestorHeight, err := dl.findCommonAncestorHeight(p, height)

@@ -80,7 +80,7 @@ func Test_GetReinjectTransaction(t *testing.T) {
 	}
 
 	b1 := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, state.GetNonce(types.TestGenesisAccount.Addr), 4*types.TransactionPreSize)
-	bc.WriteBlock(b1)
+	bc.WriteBlock(b1, nil)
 
 	state, err = bc.GetCurrentState()
 	if err != nil {
@@ -88,7 +88,7 @@ func Test_GetReinjectTransaction(t *testing.T) {
 	}
 
 	b2 := newTestBlock(bc, bc.genesisBlock.HeaderHash, 1, state.GetNonce(types.TestGenesisAccount.Addr), 3*types.TransactionPreSize)
-	bc.WriteBlock(b2)
+	bc.WriteBlock(b2, nil)
 
 	reinject := pool.getReinjectObject(b1.HeaderHash, b2.HeaderHash)
 

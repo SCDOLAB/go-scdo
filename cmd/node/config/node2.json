@@ -1,7 +1,7 @@
 {
     "basic": {
         "name": "SCDO Node2",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "dataDir": "Snode2",
         "address": "0.0.0.0:8028",
         "coinbase": "",
@@ -9,7 +9,7 @@
     },
     "p2p": {
         "address": "0.0.0.0:8058",
-        "privateKey": "P2P_PRIVATE_KEY",
+        "privateKey": "",
         "staticNodes": [
             "74.208.207.184:8058",
             "82.223.19.88:8058",

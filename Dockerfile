@@ -1,25 +1,24 @@
-# Go builder container
-FROM golang:alpine as builder
-# ENV GOLANG_VERSION 1.10.6
+# Go builder container. Default image is Scdo_V2.0.0 (no GPU library required).
+FROM golang:1.22-bookworm AS builder
 
-RUN apk add --no-cache make gcc musl-dev linux-headers
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev make \
+    && rm -rf /var/lib/apt/lists/*
 
-ADD . /go/src/github.com/scdoproject/go-scdo
+WORKDIR /src
+COPY . .
 
-WORKDIR /go/src/github.com/scdoproject/go-scdo
+RUN make node client
 
-RUN make all
+FROM debian:bookworm-slim
 
-# Alpine container
-FROM alpine:latest
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apk add --no-cache ca-certificates
-
-COPY --from=builder /go/src/github.com/scdoproject/go-scdo/build /scdo
+COPY --from=builder /src/build /scdo
 
 ENV PATH /scdo:$PATH
 
-RUN chmod +x /scdo/node
+RUN chmod +x /scdo/node /scdo/client
 
 EXPOSE 8027 8037 8057
 

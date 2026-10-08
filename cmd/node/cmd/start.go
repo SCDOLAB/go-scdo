@@ -10,11 +10,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
@@ -46,6 +47,10 @@ var (
 	// default is full node
 	lightNode bool
 
+	// lightServer serves phone light clients on the full node's TCP port.
+	// Default on, so every newcomer node can feed phones.
+	lightServer bool
+
 	//pprofPort http server port
 	pprofPort uint64
 
@@ -54,6 +59,9 @@ var (
 
 	maxConns       = int(0)
 	maxActiveConns = int(0)
+
+	// dataDirFlag overrides basic.dataDir. Absolute paths are used as-is.
+	dataDirFlag string
 )
 
 // startCmd represents the start command
@@ -65,13 +73,23 @@ var startCmd = &cobra.Command{
 		start a node.`,
 
 	Run: func(cmd *cobra.Command, args []string) {
-		var wg sync.WaitGroup
 		nCfg, err := LoadConfigFromFile(scdoNodeConfigFile, accountsConfig, poolAccountsConfig)
 		if err != nil {
 			fmt.Printf("failed to reading the config file: %s\n", err.Error())
 			return
 		}
 		Cast(nCfg)
+		minerInfo := strings.ToLower(miner)
+		if len(nCfg.BasicConfig.Coinbase) == 0 {
+			if minerInfo == "start" {
+				fmt.Println("Mining needs a coinbase. Create a wallet key, then put the address in basic.coinbase:")
+				fmt.Println("  node key --shard N")
+				fmt.Println("N is 1, 2, 3 or 4. Keep the private key safe. Mining rewards go to that address.")
+				fmt.Println("To sync without mining, omit -m start.")
+				return
+			}
+			fmt.Println("No coinbase is set. Syncing without mining. Set basic.coinbase before -m start.")
+		}
 		if !comm.LogConfiguration.PrintLog {
 			fmt.Printf("log folder: %s\n", filepath.Join(log.LogFolder, comm.LogConfiguration.DataDir))
 		}
@@ -152,10 +170,11 @@ var startCmd = &cobra.Command{
 
 			scdoService.Miner().SetGpuBlocksThreads(threadblocks, blockthreads)
 
-			lightServerService, err := light.NewServiceServer(scdoService, nCfg, lightLog, scdoNode.GetShardNumber())
-			if err != nil {
-				fmt.Println("Create light server err. ", err.Error())
-				return
+			// Disable mining before the node starts syncing. Otherwise every
+			// downloader and tx event tries to start the miner and logs
+			// "cannot start miner,stopper:1".
+			if minerInfo == "" || minerInfo == "stop" {
+				scdoService.Miner().SetStopper(1)
 			}
 
 			// monitor service
@@ -166,7 +185,20 @@ var startCmd = &cobra.Command{
 			}
 
 			services := manager.GetServices()
-			services = append(services, scdoService, monitorService, lightServerService)
+			services = append(services, scdoService, monitorService)
+			shard := scdoNode.GetShardNumber()
+			if lightServer {
+				lightServerService, err := light.NewServiceServer(scdoService, nCfg, lightLog, shard)
+				if err != nil {
+					fmt.Println("Create light server err. ", err.Error())
+					return
+				}
+				services = append(services, lightServerService)
+				fmt.Printf("Light server on (default). Protocol %s_%d version %d on TCP/UDP %s, the same port as full sync. Pass --lightserver=false to disable.\n",
+					light.LightProtoName, shard, light.LightScdoVersion, nCfg.P2PConfig.ListenAddr)
+			} else {
+				fmt.Println("Light server off (--lightserver=false). Phones cannot header-sync from this node.")
+			}
 			for _, service := range services {
 				if err := scdoNode.Register(service); err != nil {
 					fmt.Println(err.Error())
@@ -185,15 +217,18 @@ var startCmd = &cobra.Command{
 				fmt.Printf("got error when start node: %s\n", err)
 				return
 			}
+			if lightServer && scdoService.P2PServer() != nil && scdoService.P2PServer().SelfNode != nil {
+				fmt.Printf("Phone bootnode: %s\n", scdoService.P2PServer().SelfNode)
+				fmt.Println("If that host is 0.0.0.0, substitute this machine's LAN address. On the .50 test network that is 192.168.50.50.")
+			}
 
-			minerInfo := strings.ToLower(miner)
 			if minerInfo == "start" {
 				err = scdoService.Miner().Start()
 				if err != nil && err != miner2.ErrMinerIsRunning {
 					fmt.Println("failed to start the miner : ", err)
 					return
 				}
-			} else if minerInfo == "stop" {
+			} else if minerInfo == "" || minerInfo == "stop" {
 				scdoService.Miner().SetStopper(1)
 				scdoService.Miner().Stop()
 			} else {
@@ -213,9 +248,54 @@ var startCmd = &cobra.Command{
 			)
 		}
 
-		wg.Add(1)
-		wg.Wait()
+		// Block until SIGINT or SIGTERM, then flush recoveryPoint, nodes.json
+		// and blockList and close the databases. systemd's default stop is
+		// SIGTERM; without this the process dies before those files are written.
+		if err := waitForSignalAndStop(scdoNode, scdolog, shutdownTimeout); err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
 	},
+}
+
+const shutdownTimeout = 20 * time.Second
+
+// waitForSignalAndStop blocks until SIGINT or SIGTERM, then stops the node.
+// stop is given timeout to flush and close. The error is a timeout.
+func waitForSignalAndStop(n *node.Node, lg *log.ScdoLog, timeout time.Duration) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	sig := <-sigCh
+	msg := fmt.Sprintf("received %s, shutting down", sig)
+	fmt.Println(msg)
+	if lg != nil {
+		lg.Info(msg)
+	}
+	err := stopWithin(timeout, n.Stop)
+	if err != nil {
+		return err
+	}
+	fmt.Println("shutdown complete")
+	if lg != nil {
+		lg.Info("shutdown complete")
+	}
+	return nil
+}
+
+// stopWithin runs stop and returns an error if it is still running after timeout.
+func stopWithin(timeout time.Duration, stop func() error) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- stop()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("shutdown timed out after %s", timeout)
+	}
 }
 
 func init() {
@@ -224,12 +304,14 @@ func init() {
 	startCmd.Flags().StringVarP(&scdoNodeConfigFile, "config", "c", "", "scdo node config file (required)")
 	startCmd.MustMarkFlagRequired("config")
 
-	startCmd.Flags().StringVarP(&miner, "miner", "m", "start", "miner start or not, [start, stop]")
+	startCmd.Flags().StringVarP(&miner, "miner", "m", "stop", "miner start or not, [start, stop]. Default is stop (sync only)")
+	startCmd.Flags().StringVar(&dataDirFlag, "datadir", "", "data directory. Absolute paths are used as-is; relative paths are placed under $HOME/.scdo. Overrides basic.dataDir")
 	startCmd.Flags().BoolVarP(&metricsEnableFlag, "metrics", "t", false, "start metrics")
 	startCmd.Flags().StringVarP(&accountsConfig, "accounts", "", "", "init accounts info")
 	startCmd.Flags().StringVarP(&poolAccountsConfig, "poolaccounts", "", "", "init pool accounts")
 	startCmd.Flags().IntVarP(&threads, "threads", "", 1, "miner thread value")
 	startCmd.Flags().BoolVarP(&lightNode, "light", "l", false, "whether start with light mode")
+	startCmd.Flags().BoolVar(&lightServer, "lightserver", true, "serve phone light clients (lightScdo_<shard> version 1) on this node's TCP port. On by default")
 	startCmd.Flags().Uint64VarP(&pprofPort, "port", "", 0, "which port pprof http server listen to")
 	startCmd.Flags().IntVarP(&startHeight, "startheight", "", -1, "the block height to start from")
 	startCmd.Flags().IntVarP(&maxConns, "maxConns", "", 0, "node max connections")

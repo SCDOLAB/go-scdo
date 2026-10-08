@@ -1,9 +1,12 @@
 package discovery
 
 import (
+	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/orcaman/concurrent-map"
@@ -147,4 +150,38 @@ func Test_UDP_LoadNodes(t *testing.T) {
 
 	u.loadNodes("nonexistentfolder")
 	assert.Equal(t, len(u.bootstrapNodes), 0)
+}
+
+func Test_BlockList_FsyncOnlyOnShutdown(t *testing.T) {
+	dir, err := ioutil.TempDir("", "blocklist-fsync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	u := &udp{
+		blockList: cmap.New(),
+		persist:   new(sync.Mutex),
+		nodeDir:   dir,
+		log:       log.GetLogger("discovery"),
+	}
+	u.blockList.Set("1.2.3.4", int64(1))
+
+	before := atomic.LoadInt64(&discoveryFsyncs)
+	if err := u.writeBlockList(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.writeBlockList(false); err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadInt64(&discoveryFsyncs) != before {
+		t.Fatal("periodic blockList.json save fsynced")
+	}
+	if _, err := os.Stat(filepath.Join(dir, blockListBackupFile+".tmp")); err == nil {
+		t.Fatal("blockList.json.tmp was left behind")
+	}
+	u.FlushBlockList()
+	if got := atomic.LoadInt64(&discoveryFsyncs); got != before+1 {
+		t.Fatalf("shutdown blockList.json fsynced %d times, want 1", got-before)
+	}
 }

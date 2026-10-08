@@ -10,6 +10,7 @@ import (
 	"math/big"
 	rand2 "math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
@@ -55,7 +56,7 @@ func CodeToStr(code uint16) string {
 
 var (
 	// MaxBlockFetch amount of blocks to be fetched per retrieval request
-	MaxBlockFetch = 10
+	MaxBlockFetch = 32
 	// MaxHeaderFetch amount of block headers to be fetched per retrieval request
 	MaxHeaderFetch = 256
 
@@ -93,11 +94,14 @@ type Downloader struct {
 	syncStatus int
 	tm         *taskMgr
 
-	scdo      ScdoBackend
-	chain     *core.Blockchain
-	sessionWG sync.WaitGroup
-	log       *log.ScdoLog
-	lock      sync.RWMutex
+	scdo        ScdoBackend
+	chain       *core.Blockchain
+	sessionWG   sync.WaitGroup
+	acceptPeers bool
+	activeWG    *sync.WaitGroup
+	log         *log.ScdoLog
+	lock        sync.RWMutex
+	writeNS     int64 // smoothed nanoseconds spent in the last block writes
 }
 
 // BlockHeadersMsgBody represents a message struct for BlockHeadersMsg
@@ -211,7 +215,7 @@ func (d *Downloader) Synchronise(id string, head common.Hash) error {
 	return err
 }
 
-//td *big.Int, localTD *big.Int
+// td *big.Int, localTD *big.Int
 func (d *Downloader) doSynchronise(conn *peerConn, head common.Hash) (err error) {
 	d.log.Debug("Downloader.doSynchronise start, masterID: %s", d.masterPeer)
 	event.BlockDownloaderEventManager.Fire(event.DownloaderStartEvent)
@@ -238,32 +242,27 @@ func (d *Downloader) doSynchronise(conn *peerConn, head common.Hash) (err error)
 		return err
 	}
 
+	localHeight := d.chain.CurrentBlock().Header.Height
+	d.log.Info("syncing shard chain: local height %d, peer target %d. SCDO Classic starts at fork genesis height %d (full sync of blocks after the fork, not a snapshot)", localHeight, height, common.ScdoForkHeight)
 	d.log.Debug("Downloader.doSynchronise start task manager from height=%d, target height=%d master=%s", ancestor, height, d.masterPeer)
-	tm := newTaskMgr(d, d.masterPeer, conn, ancestor+1, height, 0, nil, nil)
+	tm := newTaskMgr(d, d.masterPeer, conn, ancestor+1, height, localHeight, nil, nil)
 	d.tm = tm
 
-	bMasterStarted := false
 	d.lock.Lock()
 	d.syncStatus = statusFetching
-
-	//d.sessionWG.Add(1)
+	d.acceptPeers = true
 	sessionWG := new(sync.WaitGroup)
-	sessionWG.Add(1)
-	if conn.peerID == d.masterPeer {
-		d.log.Debug("Downloader.doSynchronise set bMasterStarted = true masterid=%s", d.masterPeer)
-		bMasterStarted = true
+	d.activeWG = sessionWG
+	for _, pc := range d.peers {
+		sessionWG.Add(1)
+		go d.peerDownload(pc, tm, sessionWG)
 	}
-	go d.peerDownload(conn, tm, sessionWG)
-	//}
 	d.lock.Unlock()
 
-	if !bMasterStarted {
-		// if master not starts, need cancel.
-		d.log.Debug("Downloader.doSynchronise bMasterStarted = %t. cancel. masterid=%s", bMasterStarted, d.masterPeer)
-		d.Cancel()
-	} else {
-		d.log.Debug("Downloader.doSynchronise bMasterStarted = %t.  not cancel. masterid=%s", bMasterStarted, d.masterPeer)
-	}
+	sessionWG.Wait()
+	d.lock.Lock()
+	d.acceptPeers = false
+	d.lock.Unlock()
 	sessionWG.Wait()
 
 	d.lock.Lock()
@@ -339,8 +338,12 @@ func (d *Downloader) findCommonAncestorHeight(conn *peerConn, height uint64) (ui
 		cmpCount += uint64(len(headers))
 
 		// Is ancenstor found
-		if found, cmpHeight, err := d.isAncenstorFound(headers); found {
-			return cmpHeight, err
+		found, cmpHeight, err := d.isAncenstorFound(headers)
+		if err != nil {
+			return 0, err
+		}
+		if found {
+			return cmpHeight, nil
 		}
 	}
 }
@@ -404,7 +407,7 @@ func (d *Downloader) isAncenstorFound(headers []*types.BlockHeader) (bool, uint6
 		cmpHeight := headers[i].Height
 		localHash, err := d.chain.GetStore().GetBlockHash(cmpHeight)
 		if err != nil {
-			return true, 0, err
+			return false, 0, err
 		}
 
 		if localHash == headers[i].Hash() {
@@ -423,10 +426,10 @@ func (d *Downloader) RegisterPeer(peerID string, peer Peer) {
 	newConn := newPeerConn(peer, peerID, d.log)
 	d.peers[peerID] = newConn
 
-	//if d.syncStatus == statusFetching {
-	//	d.sessionWG.Add(1)
-	//	go d.peerDownload(newConn, d.tm)
-	//}
+	if d.acceptPeers && d.tm != nil && d.activeWG != nil {
+		d.activeWG.Add(1)
+		go d.peerDownload(newConn, d.tm, d.activeWG)
+	}
 }
 
 // UnRegisterPeer remove peer from download routine
@@ -553,7 +556,10 @@ outLoop:
 		for {
 			select {
 			case <-d.cancelCh:
-				conn.peer.DisconnectPeer("peerDownload anormaly")
+				// A finished sync cancels helper peers. Do not drop them for that.
+				if !tm.isDone() {
+					conn.peer.DisconnectPeer("peerDownload anormaly")
+				}
 				break outLoop
 			case <-conn.quitCh:
 				break outLoop
@@ -572,7 +578,9 @@ outLoop:
 }
 
 // processBlocks writes blocks to the blockchain.
-func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block, conn *peerConn) {
+// waiting is true when a cross-shard debt needs a source-shard header or more
+// confirmations on that shard. The task manager leaves those blocks queued and retries.
+func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block, conn *peerConn) (waiting bool) {
 	if len(headInfos) > 0 {
 		d.log.Info(" [%d] blocks will be processed into local database", len(headInfos))
 	}
@@ -580,17 +588,26 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 		// add it for all received block messages
 		d.log.Info("got block message and save it. height=%d, hash=%s, time=%d", h.block.Header.Height, h.block.HeaderHash.Hex(), time.Now().UnixNano())
 		// writeblock
-		txPool := d.scdo.TxPool().Pool
+		var txPool *core.Pool
+		if pool := d.scdo.TxPool(); pool != nil {
+			txPool = pool.Pool
+		}
+		started := time.Now()
 		err := d.chain.WriteBlock(h.block, txPool)
+		d.noteBlockWrite(time.Since(started))
 
 		if err != nil && !errors.IsOrContains(err, core.ErrBlockAlreadyExists) {
+			if isShardDataNotReady(err) {
+				d.log.Debug("queue block height=%d until the source shard is ready: %s", h.block.Header.Height, err)
+				return true
+			}
 			d.log.Error("failed to write block err=%s", err)
 			// recover local blocks if localTotalDifficulty is larger than the synchronized total difficulty
 			// if writeblock fails in the middle (the whole process not successfully completed), then we need to consider write back our localblocks
 			// if localblock totaldifficult is larger than the break point's one. It means this sync attempt should be abonded
 			// get local block
 
-			if errors.IsOrContains(err, consensus.ErrBlockNonceInvalid) || errors.IsOrContains(err, consensus.ErrBlockDifficultInvalid) {
+			if conn != nil && (errors.IsOrContains(err, consensus.ErrBlockNonceInvalid) || errors.IsOrContains(err, consensus.ErrBlockDifficultInvalid)) {
 				conn.peer.DisconnectPeer("peerDownload anormaly")
 			}
 			d.Cancel()
@@ -599,6 +616,40 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 
 		h.status = taskStatusProcessed
 	}
+	return false
+}
+
+// waitingBlocks is how many headers may sit ahead of the last written block.
+func (d *Downloader) waitingBlocks() uint64 {
+	if d == nil {
+		return maxBlocksWaiting
+	}
+	return waitingLimit(atomic.LoadInt64(&d.writeNS))
+}
+
+// noteBlockWrite keeps a smoothed write time so the header queue can shrink
+// when the disk cannot keep up with the download.
+func (d *Downloader) noteBlockWrite(elapsed time.Duration) {
+	sample := elapsed.Nanoseconds()
+	if sample < 0 {
+		sample = 0
+	}
+	prev := atomic.LoadInt64(&d.writeNS)
+	var next int64
+	if prev == 0 {
+		next = sample
+	} else {
+		next = (prev*3 + sample) / 4
+	}
+	atomic.StoreInt64(&d.writeNS, next)
+}
+
+// isShardDataNotReady reports whether a block write failed only because the
+// source shard has not caught up (missing header, no peer to ask, or fewer
+// than the required confirmations). Those blocks stay queued. A real
+// validation failure does not match.
+func isShardDataNotReady(err error) bool {
+	return errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations)
 }
 
 // reverse the chain back to the common ancestor of local node and peer

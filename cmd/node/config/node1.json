@@ -1,14 +1,14 @@
 {
     "basic": {
         "name": "SCDO Node1",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "dataDir": "Snode1",
         "address": "0.0.0.0:8027",
         "coinbase": "",
         "algorithm": "zpow"
     },
     "p2p": {
-        "privateKey": "P2P_PRIVATE_KEY",
+        "privateKey": "",
         "staticNodes": [
             "74.208.207.184:8057",
             "82.223.19.88:8057",

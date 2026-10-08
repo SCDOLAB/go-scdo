@@ -22,13 +22,14 @@ func Test_NodeSet(t *testing.T) {
 	p1 := getNode()
 	set.tryAdd(p1)
 
-	p2 := set.randSelect()
-	if p2 == nil {
+	srv := &Server{peerSet: NewPeerSet()}
+	selected := set.randSelect(srv)
+	if len(selected) == 0 {
 		t.Fatalf("should select one node.")
 	}
 
-	set.delete(p2)
-	if set.randSelect() != nil {
+	set.delete(selected[0])
+	if len(set.randSelect(srv)) != 0 {
 		t.Fatalf("should select no node.")
 	}
 }

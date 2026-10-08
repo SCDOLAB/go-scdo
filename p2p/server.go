@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"sort"
@@ -46,8 +47,11 @@ const (
 
 	// interval to select new node to connect from the free node list.
 	checkConnsNumInterval = 7 * time.Second
-	inboundConn           = 1
-	outboundConn          = 2
+
+	// seekShardInterval is the minimum gap between discovery queries for one shard.
+	seekShardInterval = 15 * time.Second
+	inboundConn       = 1
+	outboundConn      = 2
 	//minLocalShardConn     = 13
 	// In transferring handshake msg, length of extra data
 	extraDataLen = 24
@@ -123,7 +127,14 @@ type Server struct {
 	maxActiveConnections int
 
 	peerNumLock sync.Mutex // lock for num of peers per shard
+
+	seekMu   sync.Mutex
+	lastSeek []time.Time
+	nodeDir  string
 }
+
+// knownPeersPerShard is how many persisted peers of one shard are dialed at startup.
+const knownPeersPerShard = 8
 
 // NewServer initialize a server
 func NewServer(genesis core.GenesisInfo, config Config, protocols []Protocol) *Server {
@@ -155,10 +166,10 @@ func NewServer(genesis core.GenesisInfo, config Config, protocols []Protocol) *S
 		genesisHash:          hash,
 		maxConnections:       maxConnsPerShard * common.ShardCount,
 		maxActiveConnections: maxActiveConnsPerShard * common.ShardCount,
+		lastSeek:             make([]time.Time, common.ShardCount+1),
 	}
 }
 
-//
 func (srv *Server) GetUDP() *discovery.UDP { return srv.udp }
 
 // PeerCount return the count of peers
@@ -185,6 +196,7 @@ func (srv *Server) Start(nodeDir string, shard uint) (err error) {
 	srv.SelfNode = discovery.NewNodeWithAddr(*address, addr, shard)
 
 	srv.log.Info("Starting P2P Server, MyNodeID [%s]", srv.SelfNode)
+	srv.nodeDir = nodeDir
 	srv.kadDB, srv.udp = discovery.StartService(nodeDir, *address, addr, srv.Config.StaticNodes, shard)
 	srv.kadDB.SetHookForNewNode(srv.addNode)
 	srv.kadDB.SetHookForDeleteNode(srv.deleteNode)
@@ -228,7 +240,7 @@ loop:
 	}
 }
 
-//this function is triggered by udp when a new node is discovered
+// this function is triggered by udp when a new node is discovered
 func (srv *Server) addNode(node *discovery.Node) {
 	if err := node.ID.Validate(); err != nil {
 		srv.log.Info("invalid udp node address %v", node.ID)
@@ -367,7 +379,12 @@ func (srv *Server) deletePeerRand() {
 func (srv *Server) run() {
 	defer srv.loopWG.Done()
 	srv.log.Info("p2p start running...")
-	ticker := time.NewTicker(5 * checkConnsNumInterval)
+	srv.dialKnownPeersNow()
+	go srv.doSelectNodeToConnect()
+	// While a shard has no peer, look again every checkConnsNumInterval.
+	// The old 35s gap left a shard with nothing to sync for minutes after
+	// a restart. SeekShardPeers still refuses to flood UDP inside 15s.
+	ticker := time.NewTicker(checkConnsNumInterval)
 runloop:
 	for {
 
@@ -376,12 +393,19 @@ runloop:
 		case <-ticker.C:
 			//srv.log.Error("connect loop")
 			go srv.doSelectNodeToConnect()
-			if srv.nodeSet.ifNeedAddNodes(common.LocalShardNumber) {
-				continue
-			} else {
-				//if already well connected, rest a little bit to avoid works no big help
-				time.Sleep(60 * time.Second)
+			// A light client for another shard can sit at "no peer connected"
+			// while the local shard is full. Keep looking until every shard
+			// has someone to talk to. The local shard is first so its sync
+			// is not stuck behind the other three.
+			missing := preferShard(srv.nodeSet.shardsWithoutPeers(), srv.localShard())
+			for _, shard := range missing {
+				srv.SeekShardPeers(shard)
 			}
+			if len(srv.nodeSet.shardsWithoutPeers()) > 0 {
+				continue
+			}
+			//if already well connected, rest a little bit to avoid works no big help
+			time.Sleep(60 * time.Second)
 			goto runloop
 		case <-srv.quit:
 			srv.log.Debug("server got quit signal, run cleanup logic")
@@ -396,6 +420,104 @@ runloop:
 			peer.Disconnect(discServerQuit)
 		}
 	}
+}
+
+// localShard is the shard this server was started with.
+func (srv *Server) localShard() uint {
+	if srv != nil && srv.SelfNode != nil && srv.SelfNode.Shard > 0 {
+		return srv.SelfNode.Shard
+	}
+	return common.LocalShardNumber
+}
+
+// dialKnownPeersNow opens TCP to persisted peers of every shard at startup.
+// Waiting for the UDP ping cycle left the node with no peers for several minutes.
+func (srv *Server) dialKnownPeersNow() {
+	if srv == nil || srv.kadDB == nil {
+		return
+	}
+	chosen := groupDialList(srv.kadDB.GetCopy(), knownPeersPerShard, srv.localShard())
+	for _, node := range chosen {
+		srv.nodeSet.tryAdd(node)
+		go srv.connectNode(node)
+	}
+	if len(chosen) > 0 {
+		srv.log.Info("dialing %d known peers", len(chosen))
+	}
+}
+
+// groupDialList picks up to perShard nodes of each shard.
+// prefer's nodes are returned first, and twice as many of them, so a
+// restart dials the shard this process is syncing before the others.
+func groupDialList(nodes map[common.Hash]*discovery.Node, perShard int, prefer uint) []*discovery.Node {
+	buckets := make([][]*discovery.Node, common.ShardCount+1)
+	for _, node := range nodes {
+		if node == nil || node.Shard == 0 || node.Shard > uint(common.ShardCount) {
+			continue
+		}
+		limit := perShard
+		if node.Shard == prefer {
+			limit = perShard * 2
+		}
+		if len(buckets[node.Shard]) >= limit {
+			continue
+		}
+		buckets[node.Shard] = append(buckets[node.Shard], node)
+	}
+	out := make([]*discovery.Node, 0)
+	if prefer > 0 && prefer <= uint(common.ShardCount) {
+		out = append(out, buckets[prefer]...)
+	}
+	for shard := uint(1); shard <= uint(common.ShardCount); shard++ {
+		if shard == prefer {
+			continue
+		}
+		out = append(out, buckets[shard]...)
+	}
+	return out
+}
+
+// preferShard moves prefer to the front of shards, leaving the rest in order.
+func preferShard(shards []uint, prefer uint) []uint {
+	if prefer == 0 || len(shards) < 2 {
+		return shards
+	}
+	out := make([]uint, 0, len(shards))
+	rest := make([]uint, 0, len(shards))
+	for _, shard := range shards {
+		if shard == prefer {
+			out = append(out, shard)
+			continue
+		}
+		rest = append(rest, shard)
+	}
+	return append(out, rest...)
+}
+
+// SeekShardPeers dials known nodes for shard and asks discovery for more.
+// Calls closer than seekShardInterval are ignored so a syncing light client
+// does not flood UDP.
+func (srv *Server) SeekShardPeers(shard uint) {
+	if srv == nil || shard == 0 || shard > uint(common.ShardCount) {
+		return
+	}
+	srv.seekMu.Lock()
+	if srv.lastSeek != nil && time.Since(srv.lastSeek[shard]) < seekShardInterval {
+		srv.seekMu.Unlock()
+		return
+	}
+	if srv.lastSeek != nil {
+		srv.lastSeek[shard] = time.Now()
+	}
+	srv.seekMu.Unlock()
+
+	for _, node := range srv.nodeSet.unconnected(shard, 3) {
+		go srv.connectNode(node)
+	}
+	if srv.udp != nil {
+		srv.udp.SeekShard(shard)
+	}
+	srv.log.Info("looking for peers on shard %d", shard)
 }
 
 // doSelectNodeToConnect selects one free node from nodeMap to connect
@@ -429,7 +551,7 @@ func (srv *Server) doSelectNodeToConnect() {
 	}
 }
 
-//no call for this function any more
+// no call for this function any more
 func (srv *Server) doSelectLocalNodeToConnect() {
 	//for _, node := range srv.StaticNodes {
 	//	if node.ID.IsEmpty() || srv.checkPeerExist(node.ID) {
@@ -551,7 +673,7 @@ func (srv *Server) setupConn(fd net.Conn, flags int, dialDest *discovery.Node) (
 	sort.Sort(capsByNameAndVersion(caps))
 	recvMsg, _, err := srv.doHandShake(caps, peer, flags, dialDest)
 	if err != nil {
-		srv.log.Debug("failed to do handshake with peer %s, err info %s", dialDest, err)
+		srv.log.Warn("failed to do handshake with peer %s, err info %s", dialDest, err)
 		peer.close()
 		if peer.Node != nil {
 			srv.deleteNode(peer.Node)
@@ -560,7 +682,7 @@ func (srv *Server) setupConn(fd net.Conn, flags int, dialDest *discovery.Node) (
 	}
 	if recvMsg == nil {
 		srv.log.Error("handshake recvMsg is nil. %s -> %s", fd.LocalAddr(), fd.RemoteAddr())
-		return  errors.New("recvMsg is nil")
+		return errors.New("recvMsg is nil")
 	}
 	srv.log.Debug("handshake succeed. %s -> %s", fd.LocalAddr(), fd.RemoteAddr())
 	peerNodeID := recvMsg.NodeID
@@ -619,23 +741,26 @@ func (srv *Server) SetMaxActiveConnections(maxActiveConns int) {
 	srv.maxActiveConnections = maxActiveConns
 }
 
-func (srv *Server) peerIsValidate(recvMsg *ProtoHandShake) ([]Cap, bool) {
+func (srv *Server) peerIsValidate(recvMsg *ProtoHandShake) ([]Cap, error) {
 	// if recvMsg is nil, need to check, otherwise will panic due to nil pointer
-	if recvMsg.Params == nil {
-		return nil, false
+	if recvMsg == nil || recvMsg.Params == nil {
+		return nil, errors.New("handshake has no genesis")
 	}
 	// validate hash of genesisHash without shard
 	if !bytes.Equal(srv.genesisHash.Bytes(), recvMsg.Params) {
-		return nil, false
+		return nil, errors.New("genesis mismatch")
 	}
 
 	if srv.Config.NetworkID != recvMsg.NetworkID {
-		return nil, false
+		return nil, fmt.Errorf("network id mismatch: local %s, remote %s", srv.Config.NetworkID, recvMsg.NetworkID)
 	}
 
+	localCaps := make([]Cap, 0, len(srv.Protocols))
 	localCapSet := set.New()
 	for _, proto := range srv.Protocols {
-		localCapSet.Add(proto.cap())
+		cap := proto.cap()
+		localCaps = append(localCaps, cap)
+		localCapSet.Add(cap)
 	}
 
 	var capNameList []Cap
@@ -646,10 +771,38 @@ func (srv *Server) peerIsValidate(recvMsg *ProtoHandShake) ([]Cap, bool) {
 	}
 
 	if len(capNameList) == 0 {
-		return nil, false
+		return nil, fmt.Errorf("protocol mismatch: remote caps %s, local caps %s. A phone speaks lightScdo_<shard>/1 and needs a full node with the light server on (the default, same TCP port as full sync). Public Classic nodes speak only %s/%d and have no light server", formatCaps(recvMsg.Caps), formatCaps(localCaps), common.ScdoProtoName, common.ScdoVersion)
 	}
 
-	return capNameList, true
+	return capNameList, nil
+}
+
+func formatCaps(caps []Cap) string {
+	if len(caps) == 0 {
+		return "(none)"
+	}
+	parts := make([]string, len(caps))
+	for i, cap := range caps {
+		parts[i] = cap.String()
+	}
+	return strings.Join(parts, ",")
+}
+
+// explainHandshakeRead turns a dropped TCP connection into the reason a phone
+// can log. The remote node never sends its own error: it closes, and Read
+// returns EOF.
+func explainHandshakeRead(caps []Cap, peer string, err error) error {
+	if err == nil || !handshakeClosed(err) {
+		return err
+	}
+	if peer == "" {
+		peer = "unknown"
+	}
+	return fmt.Errorf("peer %s closed the connection during handshake before any reply (%s). This node offered %s. Public Classic nodes on ports 8057, 8058, 8059 and 8056 speak only %s/%d and have no light server, so a phone offering lightScdo_<shard>/1 gets EOF instead of a version error. Use a full node built from this tree; --lightserver is on by default and serves lightScdo_<shard>/1 on that node's TCP port", peer, err.Error(), formatCaps(caps), common.ScdoProtoName, common.ScdoVersion)
+}
+
+func handshakeClosed(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed)
 }
 
 func (srv *Server) getProtocolsByCaps(capList []Cap) (proList []Protocol) {
@@ -690,7 +843,7 @@ func (srv *Server) doHandShake(caps []Cap, peer *Peer, flags int, dialDest *disc
 
 		recvWrapMsg, err := peer.rw.ReadMsg()
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, explainHandshakeRead(caps, dialLabel(dialDest), err)
 		}
 
 		recvMsg, renounceCnt, err = srv.unPackWrapHSMsg(recvWrapMsg)
@@ -702,9 +855,9 @@ func (srv *Server) doHandShake(caps []Cap, peer *Peer, flags int, dialDest *disc
 			return nil, 0, errors.New("client nounceCnt is changed")
 		}
 
-		capList, bValid := srv.peerIsValidate(recvMsg)
-		if !bValid {
-			return nil, 0, errors.New("node is not consistent with groups")
+		capList, verr := srv.peerIsValidate(recvMsg)
+		if verr != nil {
+			return nil, 0, verr
 		}
 
 		sort.Sort(capsByNameAndVersion(capList))
@@ -722,9 +875,15 @@ func (srv *Server) doHandShake(caps []Cap, peer *Peer, flags int, dialDest *disc
 			return nil, 0, err
 		}
 
-		capList, bValid := srv.peerIsValidate(recvMsg)
-		if !bValid {
-			return nil, 0, errors.New("node is not consistent with groups")
+		capList, verr := srv.peerIsValidate(recvMsg)
+		if verr != nil {
+			// Reply with our caps, then fail. A matching wire peer can then
+			// log the protocol mismatch. A node that only hangs up still
+			// looks like EOF to the dialer, which explainHandshakeRead names.
+			if wrapMsg, werr := srv.packWrapHSMsg(handshakeMsg, recvMsg.NodeID[0:], nounceCnt); werr == nil {
+				_ = peer.rw.WriteMsg(wrapMsg)
+			}
+			return nil, 0, verr
 		}
 
 		sort.Sort(capsByNameAndVersion(capList))
@@ -740,6 +899,13 @@ func (srv *Server) doHandShake(caps []Cap, peer *Peer, flags int, dialDest *disc
 		}
 	}
 	return
+}
+
+func dialLabel(n *discovery.Node) string {
+	if n == nil {
+		return ""
+	}
+	return n.String()
 }
 
 // packWrapHSMsg compose the wrapped send msg.
@@ -835,6 +1001,13 @@ func (srv *Server) Stop() {
 
 	if !srv.running {
 		return
+	}
+	srv.log.Info("shutting down p2p, saving nodes.json and blockList.json")
+	if srv.kadDB != nil && srv.nodeDir != "" {
+		srv.kadDB.SaveNodesDurable(srv.nodeDir)
+	}
+	if srv.udp != nil {
+		srv.udp.FlushBlockList()
 	}
 	srv.running = false
 

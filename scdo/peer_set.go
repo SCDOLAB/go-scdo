@@ -50,10 +50,10 @@ func (p *peerSet) bestPeer(shard uint) *peer {
 
 func (p *peerSet) bestPeers(shard uint, localTD *big.Int) []*peer {
 
-	var bestPeers [3]*peer
+	var bestPeers [8]*peer
 	peers := p.getPeerByShard(shard)
 
-	NumOfBestPeers := 3
+	NumOfBestPeers := 8
 	if len(peers) < NumOfBestPeers {
 		NumOfBestPeers = len(peers)
 	}

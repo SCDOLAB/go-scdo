@@ -166,6 +166,34 @@ func (store *cachedStore) PutBlock(block *types.Block, td *big.Int, isHead bool)
 	return err
 }
 
+// PutBlockBundle writes receipts, the block and dirty accounts atomically when the
+// underlying store supports it, and updates the same caches as PutBlock.
+func (store *cachedStore) PutBlockBundle(block *types.Block, td *big.Int, isHead bool, receipts []*types.Receipt, accounts []common.Address) error {
+	type bundleWriter interface {
+		PutBlockBundle(block *types.Block, td *big.Int, isHead bool, receipts []*types.Receipt, accounts []common.Address) error
+	}
+	if raw, ok := store.raw.(bundleWriter); ok {
+		err := raw.PutBlockBundle(block, td, isHead, receipts, accounts)
+		if err == nil {
+			store.headerCache.Add(block.HeaderHash, block.Header)
+			store.tdCache.Add(block.HeaderHash, td)
+			store.blockCache.Add(block.HeaderHash, block)
+			if isHead {
+				store.hashCache.Add(block.Header.Height, block.HeaderHash)
+			}
+		}
+		return err
+	}
+
+	if err := store.PutReceipts(block.HeaderHash, receipts); err != nil {
+		return err
+	}
+	if err := store.PutBlock(block, td, isHead); err != nil {
+		return err
+	}
+	return store.PutDirtyAccounts(block.HeaderHash, accounts)
+}
+
 // RecoverHeightToBlockMap rebuilds the Height-to-block map
 func (store *cachedStore) RecoverHeightToBlockMap(block *types.Block) error {
 	err := store.raw.RecoverHeightToBlockMap(block)

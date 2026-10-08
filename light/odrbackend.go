@@ -14,12 +14,14 @@ import (
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/common/errors"
 	"github.com/scdoproject/go-scdo/core/store"
+	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/log"
 	"github.com/scdoproject/go-scdo/p2p"
 )
 
 var (
-	errNoMorePeers   = errors.New("No peers found")
+	// ErrNoMorePeers means this shard's light client has nobody to ask yet.
+	ErrNoMorePeers   = errors.New("No peers found")
 	errServiceQuited = errors.New("Service has quited")
 )
 
@@ -92,7 +94,7 @@ func (o *odrBackend) handleResponse(msg *p2p.Message) {
 func (o *odrBackend) getReqInfo(filter peerFilter) (uint32, chan odrResponse, []*peer, error) {
 	peerL := o.peers.choosePeers(filter)
 	if len(peerL) == 0 {
-		return 0, nil, nil, errNoMorePeers
+		return 0, nil, nil, ErrNoMorePeers
 	}
 
 	reqID := rand2.Uint32()
@@ -117,6 +119,11 @@ func (o *odrBackend) retrieve(request odrRequest) (odrResponse, error) {
 func (o *odrBackend) retrieveWithFilter(request odrRequest, filter peerFilter) (odrResponse, error) {
 	reqID, ch, peerL, err := o.getReqInfo(filter)
 	if err != nil {
+		// No peer on the source shard is the same wait as a header that has
+		// not been synced yet. Callers that write a block leave it queued.
+		if err == ErrNoMorePeers {
+			return nil, errors.NewStackedError(types.ErrHeaderNotReady, ErrNoMorePeers.Error())
+		}
 		return nil, err
 	}
 	defer func() {
@@ -146,7 +153,7 @@ func (o *odrBackend) retrieveWithFilter(request odrRequest, filter peerFilter) (
 		}
 
 		if err := resp.validate(request, o.bcStore); err != nil {
-			return nil, errors.NewStackedError(err, "failed to valdiate ODR response")
+			return nil, errors.NewStackedError(err, "failed to validate ODR response")
 		}
 
 		return resp, nil

@@ -8,19 +8,27 @@ package cmd
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"math/big"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 
 	"github.com/scdoproject/go-scdo/cmd/util"
 	"github.com/scdoproject/go-scdo/common"
+	"github.com/scdoproject/go-scdo/common/hexutil"
 	"github.com/scdoproject/go-scdo/core"
 	"github.com/scdoproject/go-scdo/crypto"
 	"github.com/scdoproject/go-scdo/log/comm"
 	"github.com/scdoproject/go-scdo/node"
 	"github.com/scdoproject/go-scdo/p2p"
+)
+
+const (
+	p2pKeyPlaceholder = "P2P_PRIVATE_KEY"
+	p2pKeyFileName    = "p2p.key"
 )
 
 // GetConfigFromFile unmarshals the config from the given file
@@ -61,9 +69,21 @@ func LoadConfigFromFile(configFile string, accounts string, poolAccounts string)
 	}
 
 	config := CopyConfig(cmdConfig)
+	if dataDirFlag != "" {
+		config.BasicConfig.DataDir = dataDirFlag
+	}
+	rawDataDir := config.BasicConfig.DataDir
+	config.BasicConfig.DataDir = common.ResolveDataDir(rawDataDir)
+	logDirName := rawDataDir
+	if logDirName == "" {
+		logDirName = "scdo"
+	}
+	if filepath.IsAbs(logDirName) {
+		logDirName = filepath.Base(logDirName)
+	}
 	convertIPCServerPath(cmdConfig, config)
 
-	config.P2PConfig, err = GetP2pConfig(cmdConfig)
+	config.P2PConfig, err = GetP2pConfig(cmdConfig, config.BasicConfig.DataDir)
 	if err != nil {
 		return config, err
 	}
@@ -90,19 +110,35 @@ func LoadConfigFromFile(configFile string, accounts string, poolAccounts string)
 	config.ScdoConfig.GenesisConfig = cmdConfig.GenesisConfig
 	comm.LogConfiguration.PrintLog = config.LogConfig.PrintLog
 	comm.LogConfiguration.IsDebug = config.LogConfig.IsDebug
-	comm.LogConfiguration.DataDir = config.BasicConfig.DataDir
-	config.BasicConfig.DataDir = filepath.Join(common.GetDefaultDataFolder(), config.BasicConfig.DataDir)
+	comm.LogConfiguration.DataDir = logDirName
 	return config, nil
 }
 
-// convertIPCServerPath convert the config to the real path
+// convertIPCServerPath places a relative IPC name inside the resolved data directory.
+// An absolute path is kept. Windows named pipes stay under \\.\pipe\.
 func convertIPCServerPath(cmdConfig *util.Config, config *node.Config) {
-	if cmdConfig.Ipcconfig.PipeName == "" {
-		config.IpcConfig.PipeName = common.GetDefaultIPCPath()
-	} else if runtime.GOOS == "windows" {
-		config.IpcConfig.PipeName = common.WindowsPipeDir + cmdConfig.Ipcconfig.PipeName
+	name := cmdConfig.Ipcconfig.PipeName
+	dataDir := config.BasicConfig.DataDir
+	if name == "" {
+		if runtime.GOOS == "windows" {
+			config.IpcConfig.PipeName = common.WindowsPipeDir + "scdo.ipc"
+		} else {
+			config.IpcConfig.PipeName = filepath.Join(dataDir, "scdo.ipc")
+		}
+		return
+	}
+	if runtime.GOOS == "windows" {
+		if strings.HasPrefix(name, common.WindowsPipeDir) || filepath.IsAbs(name) {
+			config.IpcConfig.PipeName = name
+		} else {
+			config.IpcConfig.PipeName = common.WindowsPipeDir + name
+		}
+		return
+	}
+	if filepath.IsAbs(name) {
+		config.IpcConfig.PipeName = name
 	} else {
-		config.IpcConfig.PipeName = filepath.Join(common.GetDefaultDataFolder(), cmdConfig.Ipcconfig.PipeName)
+		config.IpcConfig.PipeName = filepath.Join(dataDir, name)
 	}
 }
 
@@ -120,15 +156,58 @@ func CopyConfig(cmdConfig *util.Config) *node.Config {
 	return config
 }
 
-// GetP2pConfig get P2PConfig from the given config
-func GetP2pConfig(cmdConfig *util.Config) (p2p.Config, error) {
-	if cmdConfig.P2PConfig.PrivateKey == nil {
-		key, err := crypto.LoadECDSAFromString(cmdConfig.P2PConfig.SubPrivateKey) // GetP2pConfigPrivateKey get privateKey from the given config
+func p2pKeyUnset(key string) bool {
+	key = strings.TrimSpace(key)
+	return key == "" || key == p2pKeyPlaceholder
+}
+
+// GetP2pConfig loads the node p2p key. An empty value or the template placeholder
+// P2P_PRIVATE_KEY generates a unique key on first start and stores it in dataDir/p2p.key.
+func GetP2pConfig(cmdConfig *util.Config, dataDir string) (p2p.Config, error) {
+	if cmdConfig.P2PConfig.PrivateKey != nil {
+		return cmdConfig.P2PConfig, nil
+	}
+
+	keyStr := strings.TrimSpace(cmdConfig.P2PConfig.SubPrivateKey)
+	if !p2pKeyUnset(keyStr) {
+		key, err := crypto.LoadECDSAFromString(keyStr)
 		if err != nil {
 			return cmdConfig.P2PConfig, err
 		}
 		cmdConfig.P2PConfig.PrivateKey = key
+		return cmdConfig.P2PConfig, nil
 	}
+
+	if dataDir == "" {
+		return cmdConfig.P2PConfig, errors.New("data directory is required to store the p2p key")
+	}
+	keyPath := filepath.Join(dataDir, p2pKeyFileName)
+	if common.FileOrFolderExists(keyPath) {
+		buff, err := ioutil.ReadFile(keyPath)
+		if err != nil {
+			return cmdConfig.P2PConfig, err
+		}
+		key, err := crypto.LoadECDSAFromString(strings.TrimSpace(string(buff)))
+		if err != nil {
+			return cmdConfig.P2PConfig, fmt.Errorf("failed to load p2p key %s: %s", keyPath, err)
+		}
+		cmdConfig.P2PConfig.PrivateKey = key
+		return cmdConfig.P2PConfig, nil
+	}
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		return cmdConfig.P2PConfig, err
+	}
+	encoded := hexutil.BytesToHex(crypto.FromECDSA(key))
+	if err = common.SaveFile(keyPath, []byte(encoded)); err != nil {
+		return cmdConfig.P2PConfig, err
+	}
+	if err = os.Chmod(keyPath, 0600); err != nil {
+		return cmdConfig.P2PConfig, err
+	}
+	cmdConfig.P2PConfig.PrivateKey = key
+	fmt.Printf("generated a new p2p node key at %s\n", keyPath)
 	return cmdConfig.P2PConfig, nil
 }
 

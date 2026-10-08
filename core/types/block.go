@@ -20,6 +20,14 @@ var (
 	// ErrBlockHashMismatch is returned when the block hash does not match the header hash.
 	ErrBlockHashMismatch = errors.New("block header hash mismatch")
 
+	// ErrHeaderNotReady means a cross-shard proof needs a source-shard header that
+	// this node has not synced yet. Callers should wait and retry.
+	ErrHeaderNotReady = errors.New("source shard header not available yet")
+
+	// ErrNotEnoughConfirmations means the source shard has the debt tx but fewer
+	// than ConfirmedBlockNumber blocks after it. Callers should wait and retry.
+	ErrNotEnoughConfirmations = errors.New("source shard block is not confirmed yet")
+
 	// ErrBlockTxsHashMismatch is returned when the block transactions hash does not match
 	// the transaction root hash in the header.
 	ErrBlockTxsHashMismatch = errors.New("block transactions root hash mismatch")

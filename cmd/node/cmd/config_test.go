@@ -1,56 +1,80 @@
 package cmd
 
 import (
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/scdoproject/go-scdo/node"
+	"github.com/scdoproject/go-scdo/common"
 	"github.com/stretchr/testify/assert"
 )
 
-func getConfig(t *testing.T) *node.Config {
-	configFileName := "/testConfig/nodeConfigTest.json"
-	currentProjectPath, err := os.Getwd()
-	assert.Equal(t, err, nil, "1")
-	configFilePath := filepath.Join(currentProjectPath, configFileName)
-	accountFilePath := filepath.Join(currentProjectPath, "/testConfig/accounts.json")
+func writeTestConfig(t *testing.T, dir, dataDir, ipcName, privateKey string) string {
+	t.Helper()
+	body := []byte(`{
+  "basic": {
+    "name": "scdo node2",
+    "version": "2.0.0",
+    "dataDir": "` + dataDir + `",
+    "address": "127.0.0.1:55028",
+    "coinbase": "",
+    "algorithm": "zpow"
+  },
+  "p2p": {
+    "privateKey": "` + privateKey + `",
+    "staticNodes": [],
+    "address": "0.0.0.0:39008",
+    "networkID": "scdo"
+  },
+  "log": {"isDebug": false, "printLog": true},
+  "httpServer": {"address": "127.0.0.1:65027", "crossorigins": ["*"], "whiteHost": ["*"]},
+  "ipcconfig": {"name": "` + ipcName + `"},
+  "genesis": {"difficult": 22, "shard": 1, "timestamp": 1596942480}
+}`)
+	path := filepath.Join(dir, "node.json")
+	if err := ioutil.WriteFile(path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
 
-	config, err := LoadConfigFromFile(configFilePath, accountFilePath)
+func TestDataDirHomeAndIPC(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDirFlag = ""
+
+	cfgPath := writeTestConfig(t, t.TempDir(), "Snode1", "scdo1.ipc", "P2P_PRIVATE_KEY")
+	cfg, err := LoadConfigFromFile(cfgPath, "", "")
 	assert.Nil(t, err)
+	wantData := filepath.Join(home, ".scdo", "Snode1")
+	assert.Equal(t, wantData, cfg.BasicConfig.DataDir)
+	assert.Equal(t, filepath.Join(wantData, "scdo1.ipc"), cfg.IpcConfig.PipeName)
+	assert.NotNil(t, cfg.P2PConfig.PrivateKey)
+	keyFile := filepath.Join(wantData, "p2p.key")
+	assert.True(t, common.FileOrFolderExists(keyFile))
 
-	return config
+	info, err := os.Stat(keyFile)
+	assert.Nil(t, err)
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+
+	again, err := LoadConfigFromFile(cfgPath, "", "")
+	assert.Nil(t, err)
+	assert.Equal(t, cfg.P2PConfig.PrivateKey.D, again.P2PConfig.PrivateKey.D)
 }
 
-func Test_LoadConfigFromFile(t *testing.T) {
-	config := getConfig(t)
+func TestAbsoluteDataDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	abs := t.TempDir()
+	dataDirFlag = abs
+	defer func() { dataDirFlag = "" }()
 
-	assert.Equal(t, config.BasicConfig.Name, "scdo node2", "3")
-	assert.Equal(t, config.BasicConfig.Version, "1.0", "4")
-	assert.Equal(t, config.BasicConfig.RPCAddr, "0.0.0.0:55028", "5")
-	assert.Equal(t, config.BasicConfig.Coinbase, "0x954e4e062eb4bb2dcd93becf4f4e9b1d2d69f131", "6")
-
-	assert.Equal(t, config.HTTPServer.HTTPCors[0], "*", "6")
-	assert.Equal(t, config.HTTPServer.HTTPCors[0], "*", "7")
-	assert.Equal(t, config.HTTPServer.HTTPAddr, "127.0.0.1:65027", "8")
-
-	assert.Equal(t, config.P2PConfig.ListenAddr, "0.0.0.0:39008", "9")
-	assert.Equal(t, config.P2PConfig.NetworkID, "scdo", "10")
-	assert.Equal(t, len(config.P2PConfig.StaticNodes), 2, "10")
-	assert.Equal(t, config.P2PConfig.StaticNodes[0].UDPPort, 39007, "11")
-	assert.Equal(t, len(config.P2PConfig.StaticNodes[0].IP), 16, "12")
-	assert.Equal(t, config.P2PConfig.StaticNodes[0].TCPPort, 0, "13")
-
-	assert.Equal(t, len(config.ScdoConfig.GenesisConfig.Accounts), 2, "14")
-	assert.Equal(t, config.ScdoConfig.GenesisConfig.Difficult, int64(22), "15")
-	assert.Equal(t, config.ScdoConfig.GenesisConfig.ShardNumber, uint(1), "16")
-}
-
-func Test_CopyConfig(t *testing.T) {
-	config := getConfig(t)
-	copied := config.Clone()
-
-	assert.Equal(t, config.ScdoConfig.GenesisConfig.ShardNumber, uint(1))
-	copied.ScdoConfig.GenesisConfig.ShardNumber = uint(2)
-	assert.Equal(t, copied.ScdoConfig.GenesisConfig.ShardNumber, uint(2))
+	cfgPath := writeTestConfig(t, t.TempDir(), "Snode1", "", "")
+	cfg, err := LoadConfigFromFile(cfgPath, "", "")
+	assert.Nil(t, err)
+	assert.Equal(t, abs, cfg.BasicConfig.DataDir)
+	assert.Equal(t, filepath.Join(abs, "scdo.ipc"), cfg.IpcConfig.PipeName)
+	assert.False(t, common.FileOrFolderExists(filepath.Join(home, ".scdo", "Snode1", "p2p.key")))
+	assert.True(t, common.FileOrFolderExists(filepath.Join(abs, "p2p.key")))
 }

@@ -1,6 +1,5 @@
 
 # go-scdo
-[![Build Status](https://travis-ci.org/scdo/go-scdo.svg?branch=master)](https://travis-ci.org/scdo/go-scdo)
 
 |        Features        |      Descriptions                                                                              |
 |:-----------------------|------------------------------------------------------------------------------------------------|
@@ -26,7 +25,7 @@ Prebuilt binaries for running a node without a Go toolchain:
 | Operating system | Download |
 |---|---|
 | Linux x86_64 | <https://scdoscan.io/downloads/>: [`scdo-node-linux-amd64`](https://scdoscan.io/downloads/scdo-node-linux-amd64), [`scdo-client-linux-amd64`](https://scdoscan.io/downloads/scdo-client-linux-amd64), [`SHA256SUMS`](https://scdoscan.io/downloads/SHA256SUMS) |
-| Linux / macOS / Windows (older releases) | <https://github.com/scdoproject/go-scdo/releases> |
+| Linux / macOS / Windows (older releases) | <https://github.com/SCDOLAB/go-scdo/releases> |
 
 Verify what you download before running it:
 
@@ -63,39 +62,50 @@ The sample configs in `cmd/node/config/node1-4.json` list the public P2P nodes
 | 3 | 8059 | same hosts |
 | 4 | 8056 | same hosts |
 
-Before starting a node with one of these configs, replace `P2P_PRIVATE_KEY` with a fresh
-node key from `client key --shard N` (a node-only key, not your wallet key) and set
-`coinbase` to your own address.
+The sample configs leave `privateKey` empty. On first start the node writes a unique
+p2p key to `<dataDir>/p2p.key` (mode 0600). You can still set `privateKey` yourself.
+Create your wallet (coinbase) with `node key --shard N` — that key is not the p2p key.
+The command warns that the key controls the account and prints it. `node key --shard N --out wallet.key` writes it to a mode-0600 file instead.
+Coinbase may be empty while the node only syncs. Put the address in `basic.coinbase` before `-m start`.
 
 # Or Download & Build the source
 
-- Building the SCDO project requires a Go compiler (version 1.12.7 ONLY at this moment), Git and a C compiler.
+This tree is **Scdo_V2.0.0**. A public V1.0.0 binary from 2021 is not this code.
+Building needs a current Go toolchain (1.22 or newer; modules, `go build -mod=vendor`), Git and a C compiler (for libsecp256k1). GPU mining is optional: the default build does not link `libgoGpuDet.so`, so `node -v` and sync work without it. Rebuild with `-tags gpu` and place `libgoGpuDet.so` next to the binary if you mine on a GPU.
 
-- Clone the go-scdo repository to the GOPATH directory:
-
-```
-go get -u -v github.com/scdoproject/go-scdo/...
-```
-
-- Once successfully cloned source code:
-
-```
-cd GOPATH/src/github.com/scdoproject/go-scdo/
+```bash
+git clone https://github.com/SCDOLAB/go-scdo.git
+cd go-scdo
+make node client
+./build/node -v
 ```
 
-- Linux & Mac amd64
+Windows (from a shell with `gcc` on `PATH`, for example MinGW):
 
-```
-make all
-```
-
-- Windows amd64
-
-```
+```bat
 buildall.bat
 ```
 
+Tagged releases `v*` (including `v2.0.0`) build Linux and Windows `node` and `client` binaries in GitHub Actions and attach them to the release. Pushing the tag is what publishes those assets.
+
 # Run SCDO
+
+SCDO Classic is a fork coin. A fresh node starts at fork genesis height 2979594. That height is the chain start, not a snapshot and not a bug. The node then full-syncs later blocks and logs current height, peer target, blocks/min and ETA.
+
+First run:
+
+```bash
+./build/node key --shard 1
+# warns on stderr, then prints Account and private key. Save the private key.
+# Or keep the key off the terminal:
+#   ./build/node key --shard 1 --out wallet.key
+./build/node start -c cmd/node/config/node1.json
+```
+
+`node start` only syncs, and `basic.coinbase` may be empty for that. Add `-m start --threads N` to mine; mining requires a coinbase. `scripts/mine.sh` already passes `-m start`.
+
+Data directory: a relative `dataDir` is created under `$HOME/.scdo` (`%USERPROFILE%\.scdo` on Windows). An absolute `dataDir`, or `--datadir`, is used as-is. The IPC socket is created inside that directory so two nodes do not share one socket.
+
 A simple version SCDO mining tutorial: [SCDO Mining Tutorial (English)](https://scdo-project.gitbook.io/scdo-wiki/en/mining), [SCDO Mining Tutorial (Chinese)](https://scdo-project.gitbook.io/scdo-wiki/zhong-wen/wa-kuang).
 
 For running a node, please refer to [Get Started](https://scdo-project.gitbook.io/scdo-wiki/developer/go-scdo/gettingstarted).
@@ -122,4 +132,4 @@ Here are some guidelines before you start:
 
 # License
 
-[go-scdo/LICENSE](https://github.com/scdoproject/go-scdo/blob/master/LICENSE)
+[go-scdo/LICENSE](https://github.com/SCDOLAB/go-scdo/blob/master/LICENSE)

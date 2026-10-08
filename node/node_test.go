@@ -141,4 +141,9 @@ func Test_ServiceStart(t *testing.T) {
 	if err := stack.Stop(); err != nil {
 		t.Fatalf("failed to stop service stack: %v", err)
 	}
+
+	// empty coinbase is valid for sync; mining is refused separately
+	stack.config.ScdoConfig.Coinbase = common.Address{}
+	err = stack.checkConfig()
+	assert.Equal(t, nil, err)
 }

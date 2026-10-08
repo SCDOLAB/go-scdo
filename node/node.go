@@ -166,8 +166,8 @@ func (n *Node) checkConfig() error {
 				"coinbase shard:%d, specific shard number:%d", coinbaseShard, specificShard)
 		}
 	} else {
-		n.log.Error("coinbase can not be empty, please check coinbase setup in config file")
-		return fmt.Errorf("failed to start node")
+		// Sync does not spend or receive rewards. Mining refuses to start until a coinbase is set.
+		n.log.Info("coinbase is empty; syncing without mining. Set basic.coinbase before starting the miner")
 	}
 
 	return nil

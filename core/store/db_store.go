@@ -42,18 +42,20 @@ type blockchainDatabase struct {
 
 // NewBlockchainDatabase returns a blockchainDatabase instance.
 // There are following mappings in database:
-//   1) keyPrefixHash + height => hash
-//   2) keyHeadBlockHash => HEAD hash
-//   3) keyPrefixHeader + hash => header
-//   4) keyPrefixTD + hash => total difficulty (td for short)
-//   5) keyPrefixBody + hash => block body (transactions)
-//   6) keyPrefixReceipts + hash => block receipts
-//   7) keyPrefixTxIndex + txHash => txIndex
+//  1. keyPrefixHash + height => hash
+//  2. keyHeadBlockHash => HEAD hash
+//  3. keyPrefixHeader + hash => header
+//  4. keyPrefixTD + hash => total difficulty (td for short)
+//  5. keyPrefixBody + hash => block body (transactions)
+//  6. keyPrefixReceipts + hash => block receipts
+//  7. keyPrefixTxIndex + txHash => txIndex
 func NewBlockchainDatabase(db database.Database) BlockchainStore {
 	return &blockchainDatabase{db}
 }
 
-func heightToHashKey(height uint64) []byte      { return append(keyPrefixHash, encodeBlockHeight(height)...) }
+func heightToHashKey(height uint64) []byte {
+	return append(keyPrefixHash, encodeBlockHeight(height)...)
+}
 func hashToHeaderKey(hash []byte) []byte        { return append(keyPrefixHeader, hash...) }
 func hashToTDKey(hash []byte) []byte            { return append(keyPrefixTD, hash...) }
 func hashToBodyKey(hash []byte) []byte          { return append(keyPrefixBody, hash...) }
@@ -151,10 +153,10 @@ func (store *blockchainDatabase) HasBlock(hash common.Hash) (bool, error) {
 // and total difficulty into the blockchain database.
 // isHead indicates if the given header is the HEAD block header
 func (store *blockchainDatabase) PutBlockHeader(hash common.Hash, header *types.BlockHeader, td *big.Int, isHead bool) error {
-	return store.putBlockInternal(hash, header, nil, td, isHead)
+	return store.putBlockInternal(hash, header, nil, td, isHead, nil)
 }
 
-func (store *blockchainDatabase) putBlockInternal(hash common.Hash, header *types.BlockHeader, body *blockBody, td *big.Int, isHead bool) error {
+func (store *blockchainDatabase) putBlockInternal(hash common.Hash, header *types.BlockHeader, body *blockBody, td *big.Int, isHead bool, extra func(batch database.Batch)) error {
 	if header == nil {
 		panic("header is nil")
 	}
@@ -198,6 +200,10 @@ func (store *blockchainDatabase) putBlockInternal(hash common.Hash, header *type
 		// update height to hash map in canonical chain and HEAD block hash
 		batch.Put(heightToHashKey(header.Height), hashBytes)
 		batch.Put(keyHeadBlockHash, hashBytes)
+	}
+
+	if extra != nil {
+		extra(batch)
 	}
 
 	return batch.Commit()
@@ -252,7 +258,27 @@ func (store *blockchainDatabase) PutBlock(block *types.Block, td *big.Int, isHea
 		panic("block is nil")
 	}
 
-	return store.putBlockInternal(block.HeaderHash, block.Header, &blockBody{block.Transactions, block.Debts}, td, isHead)
+	return store.putBlockInternal(block.HeaderHash, block.Header, &blockBody{block.Transactions, block.Debts}, td, isHead, nil)
+}
+
+// PutBlockBundle writes receipts, the block and dirty accounts in one leveldb batch.
+func (store *blockchainDatabase) PutBlockBundle(block *types.Block, td *big.Int, isHead bool, receipts []*types.Receipt, accounts []common.Address) error {
+	if block == nil {
+		panic("block is nil")
+	}
+	receiptBytes, err := common.Serialize(receipts)
+	if err != nil {
+		return err
+	}
+	accountBytes, err := common.Serialize(accounts)
+	if err != nil {
+		return err
+	}
+	hashBytes := block.HeaderHash.Bytes()
+	return store.putBlockInternal(block.HeaderHash, block.Header, &blockBody{block.Transactions, block.Debts}, td, isHead, func(batch database.Batch) {
+		batch.Put(hashToReceiptsKey(hashBytes), receiptBytes)
+		batch.Put(hashToDirtyAccountsKey(hashBytes), accountBytes)
+	})
 }
 
 // GetBlock gets the block with the specified hash in the blockchain database

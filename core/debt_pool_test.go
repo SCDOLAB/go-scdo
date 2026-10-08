@@ -28,12 +28,12 @@ func Test_DebtPool(t *testing.T) {
 		common.LocalShardNumber = common.UndefinedShardNumber
 	}()
 
-	err := bc.WriteBlock(b1)
+	err := bc.WriteBlock(b1, nil)
 	if err != nil {
 		panic(err)
 	}
 
-	err = bc.WriteBlock(b2)
+	err = bc.WriteBlock(b2, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -48,7 +48,7 @@ func Test_DebtPool(t *testing.T) {
 	// test remove
 	// make b2 be in the block index
 	b3 := newTestBlockWithDebt(bc, b2.HeaderHash, 2, 0, true)
-	bc.WriteBlock(b3)
+	bc.WriteBlock(b3, nil)
 
 	common.LocalShardNumber = 2
 	defer func() {

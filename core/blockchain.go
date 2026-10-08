@@ -89,6 +89,11 @@ type Blockchain struct {
 	debtVerifier types.DebtVerifier
 
 	lastBlockTime time.Time // last sucessful written block time.
+
+	// indexFile records the last height whose height-to-hash map was checked.
+	indexFile     string
+	indexVerified uint64
+	indexMu       sync.Mutex
 }
 
 // NewBlockchain returns an initialized blockchain with the given store and account state DB.
@@ -152,9 +157,37 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 		return nil, errors.NewStackedErrorf(err, "failed to get HEAD block by hash %v", currentHeaderHash)
 	}
 	bc.currentBlock.Store(currentBlock)
+	bc.log.Info("SCDO Classic chain starts at fork genesis height %d (full history after the fork, not a snapshot). current head height %d", genesisBlockHeight, currentBlock.Header.Height)
 
-	// recover height-to-block mapping
-	bc.recoverHeightIndices()
+	// recover height-to-block mapping. A clean checkpoint skips heights that
+	// were already checked. This does not skip block verification on sync.
+	bc.indexFile = indexCheckpointPath(recoveryPointFile)
+	cp := loadIndexCheckpoint(bc.indexFile)
+	floor := indexScanFloor(cp, currentBlock.Header.Height)
+	// A crash from here on is an unclean shutdown, including a crash during
+	// this scan. The previous clean height is what this scan trusts.
+	if bc.indexFile != "" && cp.Clean {
+		bc.indexMu.Lock()
+		bc.indexVerified = cp.VerifiedHeight
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: cp.VerifiedHeight, Clean: false})
+		bc.indexMu.Unlock()
+	}
+	if bc.indexFile == "" {
+		bc.log.Info("checking blockchain database from %d down to fork height %d", currentBlock.Header.Height, floor)
+	} else if floor == uint64(common.SecondForkHeight) {
+		bc.log.Info("height index checkpoint missing or last shutdown was not clean; checking blockchain database from %d down to fork height %d", currentBlock.Header.Height, floor)
+	} else if floor >= currentBlock.Header.Height {
+		bc.log.Info("height index checkpoint %d is clean; skipping the height-index scan", floor)
+	} else {
+		bc.log.Info("height index checkpoint %d is clean; checking blockchain database from %d down to %d", floor, currentBlock.Header.Height, floor)
+	}
+	bc.recoverHeightIndices(floor)
+	if bc.indexFile != "" {
+		bc.indexMu.Lock()
+		bc.indexVerified = currentBlock.Header.Height
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: bc.indexVerified, Clean: false})
+		bc.indexMu.Unlock()
+	}
 
 	td, err := bcStore.GetBlockTotalDifficulty(currentHeaderHash)
 	if err != nil {
@@ -166,6 +199,22 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 	bc.blockLeaves.Add(blockIndex)
 
 	return bc, nil
+}
+
+// FlushRecovery writes recoveryPoint.json and fsyncs it.
+// Import keeps the marker in memory on every block and replaces the file at
+// most every recoveryFlushInterval, without an fsync. Node shutdown calls this
+// so the last marker is durable before the databases close.
+func (bc *Blockchain) FlushRecovery() {
+	if bc == nil {
+		return
+	}
+	bc.log.Info("flushing recoveryPoint and height-index checkpoint")
+	bc.markIndexClean()
+	if bc.rp == nil {
+		return
+	}
+	bc.rp.flush()
 }
 
 // AccountDB returns the account state database in blockchain.
@@ -376,18 +425,25 @@ func (bc *Blockchain) doWriteBlock(block *types.Block, pool *Pool) error {
 		return errors.NewStackedErrorf(err, "failed to set recovery point before put block into store, isNewHead = %v", isHead)
 	}
 
-	if err = bc.bcStore.PutReceipts(block.HeaderHash, receipts); err != nil {
-		return errors.NewStackedErrorf(err, "failed to save receipts into store, blockHash = %v, receipts count = %v", block.HeaderHash, len(receipts))
-	}
+	dirtyAccounts := blockStatedb.GetDirtyAccounts()
+	if bundle, ok := bc.bcStore.(blockBundleWriter); ok {
+		if err = bundle.PutBlockBundle(block, currentTd, isHead, receipts, dirtyAccounts); err != nil {
+			return errors.NewStackedErrorf(err, "failed to save block bundle into store, blockHash = %v, newTD = %v, isNewHead = %v", block.HeaderHash, currentTd, isHead)
+		}
+	} else {
+		if err = bc.bcStore.PutReceipts(block.HeaderHash, receipts); err != nil {
+			return errors.NewStackedErrorf(err, "failed to save receipts into store, blockHash = %v, receipts count = %v", block.HeaderHash, len(receipts))
+		}
 
-	if err = bc.bcStore.PutBlock(block, currentTd, isHead); err != nil {
-		return errors.NewStackedErrorf(err, "failed to save block into store, blockHash = %v, newTD = %v, isNewHead = %v", block.HeaderHash, currentTd, isHead)
+		if err = bc.bcStore.PutBlock(block, currentTd, isHead); err != nil {
+			return errors.NewStackedErrorf(err, "failed to save block into store, blockHash = %v, newTD = %v, isNewHead = %v", block.HeaderHash, currentTd, isHead)
+		}
+
+		if err = bc.bcStore.PutDirtyAccounts(block.HeaderHash, dirtyAccounts); err != nil {
+			return errors.NewStackedErrorf(err, "failed to save dirty accounts into store, blockHash = %v, dirty accounts count = %v", block.HeaderHash, len(dirtyAccounts))
+		}
 	}
 	auditor.Audit("succeed to save block into store, newHead = %v", isHead)
-
-	if err = bc.bcStore.PutDirtyAccounts(block.HeaderHash, blockStatedb.GetDirtyAccounts()); err != nil {
-		return errors.NewStackedErrorf(err, "failed to save dirty accounts into store, blockHash = %v, dirty accounts count = %v", block.HeaderHash, len(blockStatedb.GetDirtyAccounts()))
-	}
 	bc.rp.onPutBlockEnd()
 
 	// If the new block has larger TD, the canonical chain will be changed.
@@ -427,6 +483,9 @@ func (bc *Blockchain) doWriteBlock(block *types.Block, pool *Pool) error {
 	}
 
 	bc.lastBlockTime = time.Now()
+	if isHead {
+		bc.noteIndexVerified(block.Header.Height)
+	}
 
 	return nil
 }
@@ -720,23 +779,45 @@ func deleteCanonicalBlock(bcStore store.BlockchainStore, height uint64) (bool, e
 	return deleted, nil
 }
 
+// blockBundleWriter writes receipts, the block and dirty accounts in one chain-db commit.
+type blockBundleWriter interface {
+	PutBlockBundle(block *types.Block, td *big.Int, isHead bool, receipts []*types.Receipt, accounts []common.Address) error
+}
+
 // OverwriteStaleBlocks overwrites the stale canonical height-to-hash mappings.
 func OverwriteStaleBlocks(bcStore store.BlockchainStore, staleHash common.Hash, rp *recoveryPoint) error {
 	var overwritten bool
 	var err error
 
-	// When recover the blockchain, the stale block hash my be already overwritten before program crash.
+	// The pre-fork Seele parent is not stored. A walk that reaches it (including a
+	// recovery file written before this fix) stops successfully.
+	if staleHash.IsEmpty() || isPreForkParent(bcStore, staleHash) {
+		if rp != nil {
+			rp.onOverwriteStaleBlocks(common.EmptyHash)
+		}
+		return nil
+	}
+
+	// When recover the blockchain, the stale block hash may be already overwritten before program crash.
+	// The first result is still followed one step so a partially recovered walk can continue.
+	// A canonical fork-genesis block returns an empty previous hash so the walk does not
+	// request the unstored Seele parent.
+	input := staleHash
 	if _, staleHash, err = overwriteSingleStaleBlock(bcStore, staleHash); err != nil {
-		return errors.NewStackedErrorf(err, "failed to overwrite single stale block, hash = %v", staleHash)
+		return errors.NewStackedErrorf(err, "failed to overwrite single stale block, hash = %v", input)
 	}
 
 	for !staleHash.Equal(common.EmptyHash) {
+		if isPreForkParent(bcStore, staleHash) {
+			break
+		}
 		if rp != nil {
 			rp.onOverwriteStaleBlocks(staleHash)
 		}
 
+		input = staleHash
 		if overwritten, staleHash, err = overwriteSingleStaleBlock(bcStore, staleHash); err != nil {
-			return errors.NewStackedErrorf(err, "failed to overwrite single stale block, hash = %v", staleHash)
+			return errors.NewStackedErrorf(err, "failed to overwrite single stale block, hash = %v", input)
 		}
 
 		if !overwritten {
@@ -751,6 +832,22 @@ func OverwriteStaleBlocks(bcStore store.BlockchainStore, staleHash common.Hash, 
 	return nil
 }
 
+// isPreForkParent reports whether hash is the unstored Seele parent of the fork genesis block.
+func isPreForkParent(bcStore store.BlockchainStore, hash common.Hash) bool {
+	if hash.IsEmpty() {
+		return false
+	}
+	genesisHash, err := bcStore.GetBlockHash(genesisBlockHeight)
+	if err != nil {
+		return false
+	}
+	header, err := bcStore.GetBlockHeader(genesisHash)
+	if err != nil || header.PreviousBlockHash.IsEmpty() {
+		return false
+	}
+	return hash.Equal(header.PreviousBlockHash)
+}
+
 // overwriteSingleStaleBlock overwrites a single stale canonical height-to-hash mapping.
 func overwriteSingleStaleBlock(bcStore store.BlockchainStore, hash common.Hash) (overwritten bool, preBlockHash common.Hash, err error) {
 	header, err := bcStore.GetBlockHeader(hash)
@@ -761,6 +858,12 @@ func overwriteSingleStaleBlock(bcStore store.BlockchainStore, hash common.Hash) 
 	canonicalHash, err := bcStore.GetBlockHash(header.Height)
 	if err == nil {
 		if hash.Equal(canonicalHash) {
+			// The fork genesis previous hash is a Seele block that is not in this
+			// chain. Stop the walk here instead of looking it up and reporting
+			// the empty hash that GetBlockHeader failure used to return.
+			if header.Height <= genesisBlockHeight {
+				return false, common.EmptyHash, nil
+			}
 			return false, header.PreviousBlockHash, nil
 		}
 
@@ -817,9 +920,8 @@ func (bc *Blockchain) GetHeadRollbackEventManager() *event.EventManager {
 }
 
 // recoverHeightIndices examines the previous blockchain data to make sure
-// no data is missing
-func (bc *Blockchain) recoverHeightIndices() {
-	bc.log.Info("checking blockchain database...")
+// no data is missing. floor is the last height already known to be indexed.
+func (bc *Blockchain) recoverHeightIndices(floor uint64) {
 	curBlock := bc.CurrentBlock()
 	curHeight := curBlock.Header.Height
 	chainHeight := curHeight
@@ -827,7 +929,7 @@ func (bc *Blockchain) recoverHeightIndices() {
 	numGetBlockByHeight := 0
 	numGetBlockByHash := 0
 	numIrrecoverable := 0
-	for curHeight > common.SecondForkHeight {
+	for curHeight > floor {
 		bc.log.Debug("checking blockchain database, height: %d", curHeight)
 		if curBlock, err := bc.bcStore.GetBlockByHeight(curHeight); err != nil {
 			bc.log.Error("height: %d, can't get block by height.", curHeight)

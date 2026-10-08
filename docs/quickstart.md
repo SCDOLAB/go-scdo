@@ -14,7 +14,10 @@ Live shard heights and average block times: <https://scdoscan.io>.
 Mining runs on a PC or server (Windows / Linux / macOS), not on a phone. **There is currently
 no mining pool or stratum server**: you run your own full node, it syncs the chain of your
 shard, then mines. Block rewards go directly to your address. The first sync downloads the
-whole shard history (more than 6 million blocks, roughly 25 GB of disk) and can take many hours.
+whole shard history after the fork genesis. SCDO Classic starts at height 2979594
+(that is the chain start, not a snapshot). From there the node downloads later
+blocks (roughly 25 GB) and can take many hours. Logs show local height, peer
+target, blocks/min and ETA.
 
 Node software:
 
@@ -32,8 +35,9 @@ curl -fsSL https://scdoscan.io/mine.sh -o mine.sh && bash mine.sh
 
 Linux x86_64, no root needed. It downloads `scdo-node` + `scdo-client` from
 `scdoscan.io/downloads` (checksum-verified), asks for your address, creates a node key for
-your shard with `client key --shard N`, writes `node.json` with the public seed nodes and
-starts the node + miner. The script is also in this repository: [`scripts/mine.sh`](../scripts/mine.sh).
+your shard with `node key --shard N` (or `client key --shard N`), writes `node.json`
+with the public seed nodes and starts the node + miner. The script is also in this
+repository: [`scripts/mine.sh`](../scripts/mine.sh).
 
 Windows: use the one-click miner package (`start-miner.bat`). Or set things up by hand below.
 
@@ -42,7 +46,8 @@ Windows: use the one-click miner package (`start-miner.bat`). Or set things up b
 ### 1. Your SCDO address
 
 The prefix decides your shard (`1S01` = shard 1, `2S02` = shard 2, `3S03` = shard 3,
-`4S04` = shard 4). No address yet? Run `client key --shard 1` and keep the private key safe.
+`4S04` = shard 4). No address yet? Run `node key --shard 1` (or `client key --shard 1`).
+The command warns that this private key controls the account. Add `--out wallet.key` to write it to a mode-0600 file instead of the terminal.
 
 ### 2. Save this as `node.json`
 
@@ -52,14 +57,14 @@ Example for shard 1 (set `coinbase` to your address and `genesis.shard` to your 
 {
   "basic": {
     "name": "SCDO Miner",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "dataDir": "scdo-data",
     "address": "0.0.0.0:8027",
     "coinbase": "1S01YOUR_ADDRESS_38_HEX_CHARS",
     "algorithm": "zpow"
   },
   "p2p": {
-    "privateKey": "P2P_PRIVATE_KEY",
+    "privateKey": "",
     "staticNodes": [
       "74.208.207.184:8057", "82.223.19.88:8057", "74.208.136.152:8057", "217.160.65.210:8057",
       "74.208.207.184:8058", "82.223.19.88:8058", "74.208.136.152:8058", "217.160.65.210:8058",
@@ -79,8 +84,9 @@ Example for shard 1 (set `coinbase` to your address and `genesis.shard` to your 
 }
 ```
 
-Replace `P2P_PRIVATE_KEY` with the private key printed by `client key --shard 1`
-(use a separate key just for the node, not your wallet key).
+Leave `privateKey` empty. The node generates a unique p2p key on first start and
+saves it in the data directory as `p2p.key`. That key is only for the network
+identity. Your wallet key comes from `node key --shard N`.
 
 Public P2P seed nodes (TCP + UDP), one port per shard:
 
@@ -93,8 +99,15 @@ Public P2P seed nodes (TCP + UDP), one port per shard:
 
 ### 3. Start the node + miner
 
+`node start` syncs only, and `coinbase` may be empty for that. Mining is opt-in with `-m start` and needs a coinbase.
+
+Data files go to `$HOME/.scdo/<dataDir>` unless `dataDir` is absolute or you pass
+`--datadir`. `$HOME` / `%USERPROFILE%` is honored.
+
 ```bash
-# Linux / macOS
+# Linux / macOS — sync
+./node start -c node.json
+# then mine
 ./node start -c node.json -m start --threads 4
 # Windows
 node.exe start -c node.json -m start --threads 4

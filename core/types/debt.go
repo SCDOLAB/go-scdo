@@ -102,6 +102,14 @@ func (d *Debt) Validate(verifier DebtVerifier, isPool bool, targetShard uint) (r
 			return
 		}
 
+		// The source shard is behind or has no peer yet. The debt is still
+		// valid; callers must keep it and retry, the same as the downloader.
+		if err != nil && (errors.IsOrContains(err, ErrHeaderNotReady) || errors.IsOrContains(err, ErrNotEnoughConfirmations)) {
+			recoverable = true
+			retErr = errors.NewStackedError(err, ErrMsgVerifierFailed)
+			return
+		}
+
 		if err != nil || !confirmed {
 			if (isPool && !packed) || !isPool {
 				retErr = errors.NewStackedError(err, ErrMsgVerifierFailed)

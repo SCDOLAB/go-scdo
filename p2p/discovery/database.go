@@ -7,10 +7,10 @@ package discovery
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
@@ -26,21 +26,37 @@ type Database struct {
 	m              map[common.Hash]*Node
 	log            *log.ScdoLog
 	mutex          sync.RWMutex
+	persist        sync.Mutex
+	lastNodes      time.Time
 	addNodeHook    NodeHook
 	deleteNodeHook NodeHook
 }
 
 const (
-	// NodesBackupInterval is the nodes info of backup interval time
-	NodesBackupInterval = time.Minute * 20
+	// minDiskSnapshotInterval is the fastest nodes.json or blockList.json may
+	// be replaced. A shorter timer is clamped. Neither file is fsynced on this
+	// timer; clean shutdown fsyncs each once.
+	minDiskSnapshotInterval = 10 * time.Second
+
+	// NodesBackupInterval is how often known peers are written to disk.
+	// A restart dials this file immediately, so it has to stay current.
+	// It must not be shorter than minDiskSnapshotInterval.
+	NodesBackupInterval = time.Minute
 
 	// NodesBackupFileName is the nodes info of backup file name
 	NodesBackupFileName = "nodes.json"
 )
 
+// discoveryFsyncs counts fsyncs of nodes.json and blockList.json.
+var discoveryFsyncs int64
+
 // StartSaveNodes will save to a file and open a timer to backup the nodes info
 func (db *Database) StartSaveNodes(nodeDir string, done chan struct{}) {
-	ticker := time.NewTicker(NodesBackupInterval)
+	interval := NodesBackupInterval
+	if interval < minDiskSnapshotInterval {
+		interval = minDiskSnapshotInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -53,20 +69,35 @@ func (db *Database) StartSaveNodes(nodeDir string, done chan struct{}) {
 	}
 }
 
-// SaveNodes dump nodes info into disk file
+// SaveNodes dumps known peers. The timer calls this without an fsync.
 func (db *Database) SaveNodes(nodeDir string) {
-	db.mutex.RLock()
-	defer db.mutex.RUnlock()
-	if db.m == nil {
+	db.writeNodes(nodeDir, false)
+}
+
+// SaveNodesDurable dumps known peers and fsyncs the file. Clean shutdown only.
+func (db *Database) SaveNodesDurable(nodeDir string) {
+	db.writeNodes(nodeDir, true)
+}
+
+func (db *Database) writeNodes(nodeDir string, durable bool) {
+	if db == nil || nodeDir == "" {
 		return
 	}
-	fileFullPath := filepath.Join(nodeDir, NodesBackupFileName)
-
-	nodeStr := make([]string, len(db.m))
-	i := 0
+	db.mutex.RLock()
+	if db.m == nil {
+		db.mutex.RUnlock()
+		return
+	}
+	nodeStr := make([]string, 0, len(db.m))
 	for _, v := range db.m {
-		nodeStr[i] = v.String()
-		i++
+		nodeStr = append(nodeStr, v.String())
+	}
+	db.mutex.RUnlock()
+
+	db.persist.Lock()
+	defer db.persist.Unlock()
+	if !durable && !db.lastNodes.IsZero() && time.Since(db.lastNodes) < minDiskSnapshotInterval {
+		return
 	}
 
 	nodeByte, err := json.MarshalIndent(nodeStr, "", "\t")
@@ -75,20 +106,48 @@ func (db *Database) SaveNodes(nodeDir string) {
 		return
 	}
 
-	if !common.FileOrFolderExists(fileFullPath) {
-		if err := os.MkdirAll(nodeDir, os.ModePerm); err != nil {
-			db.log.Error("filePath:[%s], failed to create folder, [%s]", nodeDir, err.Error())
-			return
-		}
-	}
-
-	db.log.Info("backups nodes. node length %d", len(db.m))
-	if err = ioutil.WriteFile(fileFullPath, nodeByte, 0666); err != nil {
+	fileFullPath := filepath.Join(nodeDir, NodesBackupFileName)
+	if err = replaceFile(fileFullPath, nodeByte, durable); err != nil {
 		db.log.Error("nodes info backup failed, for:[%s]", err.Error())
 		return
 	}
-
+	db.lastNodes = time.Now()
+	db.log.Info("backups nodes. node length %d", len(nodeStr))
 	db.log.Debug("nodes:%s info backup success\n", string(nodeByte))
+}
+
+// replaceFile writes path via a temp file and rename. durable fsyncs the
+// temp file before the rename. The periodic path leaves durable false.
+func replaceFile(path string, data []byte, durable bool) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil && durable {
+		err = f.Sync()
+		if err == nil {
+			atomic.AddInt64(&discoveryFsyncs, 1)
+		}
+	}
+	cerr := f.Close()
+	if err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err = os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // NewDatabase new database

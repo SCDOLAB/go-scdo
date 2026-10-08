@@ -6,12 +6,15 @@
 package light
 
 import (
+	"strings"
+
 	"github.com/scdoproject/go-scdo/api"
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/common/errors"
 	"github.com/scdoproject/go-scdo/core/store"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/trie"
+	leveldbErrors "github.com/syndtr/goleveldb/leveldb/errors"
 )
 
 // OdrProvableResponse represents all provable ODR response.
@@ -31,11 +34,17 @@ func (response *OdrProvableResponse) proveHeader(bcStore store.BlockchainStore) 
 
 	header, err := bcStore.GetBlockHeader(response.BlockIndex.BlockHash)
 	if err != nil {
+		if isStoreNotFound(err) {
+			return nil, classifyMissingHeader(bcStore, response.BlockIndex.BlockHeight, response.BlockIndex.BlockHash)
+		}
 		return nil, errors.NewStackedErrorf(err, "failed to get block header by hash %v", response.BlockIndex.BlockHash)
 	}
 
 	canonicalHash, err := bcStore.GetBlockHash(response.BlockIndex.BlockHeight)
 	if err != nil {
+		if isStoreNotFound(err) {
+			return nil, errors.NewStackedError(types.ErrHeaderNotReady, "source shard height is not in the canonical chain yet")
+		}
 		return nil, errors.NewStackedErrorf(err, "failed to get block hash by height %v", response.BlockIndex.BlockHeight)
 	}
 
@@ -44,6 +53,32 @@ func (response *OdrProvableResponse) proveHeader(bcStore store.BlockchainStore) 
 	}
 
 	return header, nil
+}
+
+// classifyMissingHeader distinguishes a header the light client has not synced yet
+// from a canonical hash that does not match the proof.
+func classifyMissingHeader(bcStore store.BlockchainStore, height uint64, blockHash common.Hash) error {
+	canonicalHash, err := bcStore.GetBlockHash(height)
+	if err != nil {
+		if isStoreNotFound(err) {
+			return errors.NewStackedErrorf(types.ErrHeaderNotReady, "source shard header %v at height %d is not synced yet", blockHash, height)
+		}
+		return errors.NewStackedErrorf(err, "failed to get block hash by height %v", height)
+	}
+	if !canonicalHash.Equal(blockHash) {
+		return types.ErrBlockHashMismatch
+	}
+	return errors.NewStackedErrorf(types.ErrHeaderNotReady, "source shard header %v at height %d is not stored yet", blockHash, height)
+}
+
+func isStoreNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == leveldbErrors.ErrNotFound || errors.IsOrContains(err, leveldbErrors.ErrNotFound) {
+		return true
+	}
+	return strings.Contains(err.Error(), "leveldb: not found")
 }
 
 // proveMerkleTrie proves the merkle trie in the response with specified root and key.
