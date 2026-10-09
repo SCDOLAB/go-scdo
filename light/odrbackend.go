@@ -6,8 +6,8 @@
 package light
 
 import (
-	"fmt"
 	rand2 "math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,8 +86,15 @@ func (o *odrBackend) handleResponse(msg *p2p.Message) {
 	defer o.lock.Unlock()
 
 	if reqCh, ok := o.requestMap[response.getRequestID()]; ok {
-		delete(o.requestMap, response.getRequestID())
-		reqCh <- response
+		// Keep the request until retrieve finishes. The first peer is often a
+		// shard that has not stored this tx yet; a later peer must still be able
+		// to answer. The channel is buffered to the peer count, so this send
+		// does not block while o.lock is held.
+		select {
+		case reqCh <- response:
+		default:
+			o.log.Debug("drop ODR response, request buffer full, reqID=%d", response.getRequestID())
+		}
 	}
 }
 
@@ -101,7 +108,7 @@ func (o *odrBackend) getReqInfo(filter peerFilter) (uint32, chan odrResponse, []
 	}
 
 	reqID := rand2.Uint32()
-	ch := make(chan odrResponse)
+	ch := make(chan odrResponse, len(peerL))
 
 	o.lock.Lock()
 	if o.requestMap[reqID] != nil {
@@ -149,23 +156,60 @@ func (o *odrBackend) retrieveWithFilter(request odrRequest, filter peerFilter) (
 	timeout := time.NewTimer(msgWaitTimeout)
 	defer timeout.Stop()
 
-	select {
-	case resp := <-ch:
-		if err := resp.getError(); err != nil {
-			return nil, errors.NewStackedError(err, "failed to handle ODR request on server side")
-		}
-
-		if err := resp.validate(request, o.bcStore); err != nil {
-			return nil, errors.NewStackedError(err, "failed to validate ODR response")
-		}
-
-		return resp, nil
-	case <-o.quitCh:
-		return nil, errServiceQuited
-	case <-timeout.C:
-
-		return nil, fmt.Errorf("wait for msg reqid=%d timeout", reqID)
+	resp, err := o.collectResponses(ch, len(peerL), reqID, timeout)
+	if err != nil {
+		return nil, err
 	}
+	if err = resp.validate(request, o.bcStore); err != nil {
+		return nil, errors.NewStackedError(err, "failed to validate ODR response")
+	}
+	return resp, nil
+}
+
+// collectResponses waits until a peer returns the object, every peer reports
+// that it does not have the object, or the request times out.
+// A "leveldb: not found" answer is that peer missing the tx, not an invalid
+// debt. The next peer is given a chance to answer. When nobody has it, the
+// error is ErrHeaderNotReady so block sync leaves the block queued.
+func (o *odrBackend) collectResponses(ch chan odrResponse, nPeers int, reqID uint32, timeout *time.Timer) (odrResponse, error) {
+	if nPeers < 1 {
+		nPeers = 1
+	}
+	var lastMiss error
+	got := 0
+	for {
+		select {
+		case resp := <-ch:
+			if resp == nil {
+				continue
+			}
+			got++
+			if err := resp.getError(); err != nil {
+				if odrPeerMiss(err) && got < nPeers {
+					lastMiss = err
+					continue
+				}
+				if odrPeerMiss(err) {
+					return nil, errors.NewStackedError(types.ErrHeaderNotReady, err.Error())
+				}
+				return nil, errors.NewStackedError(err, "failed to handle ODR request on server side")
+			}
+			return resp, nil
+		case <-o.quitCh:
+			return nil, errServiceQuited
+		case <-timeout.C:
+			if lastMiss != nil {
+				return nil, errors.NewStackedErrorf(types.ErrHeaderNotReady, "source shard data is not on the peers that answered (%s); wait for msg reqid=%d timeout", lastMiss.Error(), reqID)
+			}
+			return nil, errors.NewStackedErrorf(types.ErrHeaderNotReady, "wait for msg reqid=%d timeout", reqID)
+		}
+	}
+}
+
+// odrPeerMiss is true when the answering node has no tx/receipt/debt for the
+// hash. That node may still be syncing. It is not a failed proof.
+func odrPeerMiss(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "leveldb: not found")
 }
 
 // deliver hands a response to the ODR loop. After close it returns

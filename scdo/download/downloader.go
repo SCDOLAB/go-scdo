@@ -888,9 +888,15 @@ func (d *Downloader) noteBlockWrite(elapsed time.Duration) {
 func (d *Downloader) noteShardWait(err error) {
 	reason := "source-shard-header"
 	var need, have uint64
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
 	if errors.IsOrContains(err, types.ErrNotEnoughConfirmations) {
 		reason = "source-shard-confirmations"
-		need, have = confirmationCounts(err.Error())
+		need, have = confirmationCounts(msg)
+	} else if strings.Contains(msg, "failed to get tx") || strings.Contains(msg, "wait for msg reqid=") {
+		reason = "source-shard-tx"
 	}
 	d.lock.Lock()
 	d.waitReason = reason
@@ -919,6 +925,8 @@ func (d *Downloader) WaitDetail() string {
 		return "source shard confirmations are not ready; waiting, not rejecting the block"
 	case "source-shard-header":
 		return "source shard header is not synced yet; waiting, not rejecting the block"
+	case "source-shard-tx":
+		return "source shard transaction is not available from peers yet; waiting, not rejecting the block"
 	default:
 		return ""
 	}
@@ -937,11 +945,11 @@ func confirmationCounts(msg string) (need, have uint64) {
 }
 
 // isShardDataNotReady reports whether a block write failed only because the
-// source shard has not caught up (missing header, no peer to ask, or fewer
-// than the required confirmations). Those blocks stay queued. A real
-// validation failure does not match.
+// source shard has not caught up (missing header, no peer to ask, a peer that
+// has not stored the tx yet, an ODR timeout, or fewer than the required
+// confirmations). Those blocks stay queued. A real validation failure does not match.
 func isShardDataNotReady(err error) bool {
-	return errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations)
+	return types.ShardDataNotReady(err)
 }
 
 // reverse the chain back to the common ancestor of local node and peer

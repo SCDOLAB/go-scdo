@@ -8,6 +8,7 @@ package types
 import (
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/common/errors"
@@ -66,6 +67,27 @@ func DebtMerkleRootHash(debts []*Debt) common.Hash {
 	return debtTrie.Hash()
 }
 
+// ShardDataNotReady reports a cross-shard lookup that should be retried.
+// A missing source header, a peer that has not stored the transaction yet
+// (ODR "leveldb: not found"), an ODR timeout, or too few confirmations all
+// match. A hash or proof mismatch does not, so an invalid debt is still rejected.
+func ShardDataNotReady(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.IsOrContains(err, ErrHeaderNotReady) || errors.IsOrContains(err, ErrNotEnoughConfirmations) {
+		return true
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "leveldb: not found") && (strings.Contains(msg, "failed to get tx") || strings.Contains(msg, "failed to get debt") || strings.Contains(msg, "failed to get receipt")) {
+		return true
+	}
+	if strings.Contains(msg, "failed to get tx") && strings.Contains(msg, "wait for msg reqid=") && strings.Contains(msg, "timeout") {
+		return true
+	}
+	return false
+}
+
 // Validate validate debt with verifier
 // If verifier is nil, will skip it.
 // If isPool is true, we don't return error when the error is recoverable
@@ -102,9 +124,10 @@ func (d *Debt) Validate(verifier DebtVerifier, isPool bool, targetShard uint) (r
 			return
 		}
 
-		// The source shard is behind or has no peer yet. The debt is still
-		// valid; callers must keep it and retry, the same as the downloader.
-		if err != nil && (errors.IsOrContains(err, ErrHeaderNotReady) || errors.IsOrContains(err, ErrNotEnoughConfirmations)) {
+		// The source shard is behind, a peer has not stored the tx yet, or the
+		// ODR request timed out. The debt is still unverified; callers must
+		// keep it and retry. A hash or proof mismatch does not match.
+		if err != nil && ShardDataNotReady(err) {
 			recoverable = true
 			retErr = errors.NewStackedError(err, ErrMsgVerifierFailed)
 			return

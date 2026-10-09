@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
-	"github.com/scdoproject/go-scdo/common/errors"
 	"github.com/scdoproject/go-scdo/core/state"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/event"
@@ -93,7 +92,7 @@ func (dp *DebtPool) loopCheckingDebt() {
 			if err != nil {
 				// A source header that is not synced yet is the queued-retry
 				// path. Log it at debug so a syncing node is not flooded.
-				if errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations) {
+				if debtSourceNotReady(err) {
 					dp.log.Debug("debts waiting on source shard: %s", err)
 				} else {
 					dp.log.Warn("multiple threads checking error: %s", err)
@@ -186,7 +185,7 @@ func (dp *DebtPool) DoMulCheckingDebtHandler(d *types.Debt) error {
 // debtSourceNotReady reports a cross-shard check that should be retried.
 // The debt stays in the pool. A real validation failure does not match.
 func debtSourceNotReady(err error) bool {
-	return errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations)
+	return types.ShardDataNotReady(err)
 }
 
 // DoCheckingDebt is a legecy rountine

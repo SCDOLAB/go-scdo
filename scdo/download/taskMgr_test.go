@@ -279,6 +279,19 @@ func TestIsShardDataNotReady(t *testing.T) {
 	noPeers := errors.NewStackedError(types.ErrHeaderNotReady, "No peers found")
 	assert.Equal(t, true, isShardDataNotReady(errors.NewStackedError(noPeers, "failed to get tx")))
 	assert.Equal(t, false, isShardDataNotReady(errors.New("invalid parent hash")))
+	peerMiss := errors.New("failed to apply block txs ===> failed to batch validate debt ===> failed to validate debt via verifier ===> failed to get tx 0xd9cc ===> failed to handle ODR request on server side ===> failed to get tx by hash 0xd9cc ===> leveldb: not found")
+	assert.Equal(t, true, isShardDataNotReady(peerMiss))
+	assert.Equal(t, true, isShardDataNotReady(errors.New("failed to get tx 0x72ba ===> wait for msg reqid=70714341 timeout")))
+	assert.Equal(t, false, isShardDataNotReady(errors.New("failed to get block header ===> leveldb: not found")))
+	assert.Equal(t, false, isShardDataNotReady(errors.New("failed to handle ODR request on server side ===> failed to prove merkle trie")))
+}
+
+func TestTxMissWaitsInsteadOfRejecting(t *testing.T) {
+	d := &Downloader{}
+	d.noteShardWait(errors.New("failed to get tx 0xd9cc ===> leveldb: not found"))
+	if d.WaitDetail() != "source shard transaction is not available from peers yet; waiting, not rejecting the block" {
+		t.Fatalf("detail=%s", d.WaitDetail())
+	}
 }
 
 func TestTaskMgrDoesNotPreallocateSyncRange(t *testing.T) {
