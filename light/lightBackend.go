@@ -88,6 +88,39 @@ func (l *LightBackend) GetReceiptByTxHash(hash common.Hash) (*types.Receipt, err
 	return result.Receipt, nil
 }
 
+func requestWithTx(txHash common.Hash) odrRequest {
+	return &odrTxByHashRequest{TxHash: txHash}
+}
+
+// verifiedSourceHeight is the source-shard header height this node has checked.
+func (l *LightBackend) verifiedSourceHeight() uint64 {
+	if l == nil || l.s == nil {
+		return 0
+	}
+	return l.s.CurrentHeight()
+}
+
+// sourceHeadAgrees is true when an announced peer head sits within gap of the
+// headers this node has already verified. The canonical height used later is
+// the local one.
+func sourceHeadAgrees(local, announced, gap uint64) bool {
+	if local == 0 || announced == 0 {
+		return false
+	}
+	if local > announced {
+		return local-announced <= gap
+	}
+	return announced-local <= gap
+}
+
+// caughtUpTxPeers is the source-shard light servers closest to the best head.
+func (l *LightBackend) caughtUpTxPeers() ([]*peer, uint64) {
+	if l == nil || l.s == nil || l.s.scdoProtocol == nil || l.s.scdoProtocol.peerSet == nil {
+		return nil, 0
+	}
+	return l.s.scdoProtocol.peerSet.caughtUpPeers(3, types.SourceTxAbsentGap)
+}
+
 // GetTransaction gets tx, block index and its debt by tx hash
 func (l *LightBackend) GetTransaction(pool api.PoolCore, bcStore store.BlockchainStore, txHash common.Hash) (*types.Transaction, *api.BlockIndex, error) {
 	if tx := l.s.txPool.GetTransaction(txHash); tx != nil {
@@ -97,7 +130,23 @@ func (l *LightBackend) GetTransaction(pool api.PoolCore, bcStore store.Blockchai
 	blockHash := l.s.txPool.GetBlockHash(txHash)
 
 	filter := peerFilter{blockHash: blockHash}
-	response, err := l.s.odrBackend.retrieveWithFilter(&odrTxByHashRequest{TxHash: txHash}, filter)
+	var response odrResponse
+	var err error
+	if peers, best := l.caughtUpTxPeers(); len(peers) > 0 {
+		response, err = l.s.odrBackend.retrieveFrom(requestWithTx(txHash), peers)
+		if err != nil && odrPeerMiss(err) {
+			// A miss is the canonical index only when these peers announce a head
+			// next to the source-shard headers this node has already verified.
+			// A sibling that is still syncing, or a peer announcing a head we
+			// have not verified, stays a retry.
+			local := l.verifiedSourceHeight()
+			if sourceHeadAgrees(local, best, types.SourceTxAbsentGap) {
+				err = errors.NewStackedError(errors.NewStackedErrorf(types.ErrSourceTxAbsent, "canonical height %d", local), err.Error())
+			}
+		}
+	} else {
+		response, err = l.s.odrBackend.retrieveWithFilter(&odrTxByHashRequest{TxHash: txHash}, filter)
+	}
 
 	if err != nil {
 		return nil, nil, err

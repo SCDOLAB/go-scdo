@@ -125,6 +125,23 @@ func (o *odrBackend) retrieve(request odrRequest) (odrResponse, error) {
 	return o.retrieveWithFilter(request, peerFilter{})
 }
 
+// retrieveFrom asks a specific set of peers. The caller picked them.
+func (o *odrBackend) retrieveFrom(request odrRequest, peerL []*peer) (odrResponse, error) {
+	if len(peerL) == 0 {
+		return nil, errors.NewStackedError(types.ErrHeaderNotReady, ErrNoMorePeers.Error())
+	}
+	reqID := rand2.Uint32()
+	ch := make(chan odrResponse, len(peerL))
+	o.lock.Lock()
+	if o.requestMap[reqID] != nil {
+		o.lock.Unlock()
+		return nil, errors.New("reqid conflict")
+	}
+	o.requestMap[reqID] = ch
+	o.lock.Unlock()
+	return o.finishRetrieve(request, reqID, ch, peerL)
+}
+
 // retrieve retrieves the requested ODR object from remote peer with specified peer filter.
 func (o *odrBackend) retrieveWithFilter(request odrRequest, filter peerFilter) (odrResponse, error) {
 	reqID, ch, peerL, err := o.getReqInfo(filter)
@@ -136,6 +153,10 @@ func (o *odrBackend) retrieveWithFilter(request odrRequest, filter peerFilter) (
 		}
 		return nil, err
 	}
+	return o.finishRetrieve(request, reqID, ch, peerL)
+}
+
+func (o *odrBackend) finishRetrieve(request odrRequest, reqID uint32, ch chan odrResponse, peerL []*peer) (odrResponse, error) {
 	defer func() {
 		o.lock.Lock()
 		delete(o.requestMap, reqID)
@@ -147,7 +168,7 @@ func (o *odrBackend) retrieveWithFilter(request odrRequest, filter peerFilter) (
 	code, payload := request.code(), common.SerializePanic(request)
 	for _, p := range peerL {
 		o.log.Debug("peer send request, code = %s, payloadSizeBytes = %v", codeToStr(code), len(payload))
-		if err = p2p.SendMessage(p.rw, code, payload); err != nil {
+		if err := p2p.SendMessage(p.rw, code, payload); err != nil {
 			o.log.Info("Failed to send message with peer %s", p.peerStrID)
 			return nil, errors.NewStackedErrorf(err, "failed to send P2P message")
 		}

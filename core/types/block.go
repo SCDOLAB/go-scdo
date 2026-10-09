@@ -28,6 +28,16 @@ var (
 	// than ConfirmedBlockNumber blocks after it. Callers should wait and retry.
 	ErrNotEnoughConfirmations = errors.New("source shard block is not confirmed yet")
 
+	// ErrSourceTxAbsent means a caught-up source-shard node has no index entry
+	// for the debt's transaction. The transaction is not on that canonical chain.
+	ErrSourceTxAbsent = errors.New("source transaction is not on the canonical source chain")
+
+	// SourceTxAbsentGap is how far a source-shard head must sit above the block
+	// being imported before a missing source tx is treated as absent from history.
+	// Cross-shard tips stay well inside this gap. A peer that is only a little
+	// ahead may simply not have stored the tx yet.
+	SourceTxAbsentGap = uint64(100000)
+
 	// ErrBlockTxsHashMismatch is returned when the block transactions hash does not match
 	// the transaction root hash in the header.
 	ErrBlockTxsHashMismatch = errors.New("block transactions root hash mismatch")

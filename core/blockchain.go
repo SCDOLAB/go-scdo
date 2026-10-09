@@ -8,6 +8,7 @@ package core
 import (
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -591,9 +592,8 @@ func (bc *Blockchain) applyTxs(block *types.Block, root common.Hash) (*state.Sta
 	}
 
 	//validate debts
-	err = types.BatchValidateDebtOnShard(block.Debts, bc.debtVerifier, bc.shardNumber())
-	if err != nil {
-		return nil, nil, errors.NewStackedError(err, "failed to batch validate debt")
+	if err = bc.validateDebts(block); err != nil {
+		return nil, nil, err
 	}
 
 	canonicalHeadBlock := bc.CurrentBlock()
@@ -622,6 +622,61 @@ func (bc *Blockchain) applyTxs(block *types.Block, root common.Hash) (*state.Sta
 	auditor.Audit("succeed to update stateDB for %v txs", len(block.Transactions))
 
 	return statedb, receipts, nil
+}
+
+// validateDebts checks each debt against the source shard. A miss from a
+// source node that is already far above this block is the canonical chain
+// not containing that tx. The block is still applied so its state root can
+// match. A peer that has not caught up stays a retry.
+func (bc *Blockchain) validateDebts(block *types.Block) error {
+	shard := bc.shardNumber()
+	for _, debt := range block.Debts {
+		_, err := debt.Validate(bc.debtVerifier, false, shard)
+		if err == nil {
+			continue
+		}
+		if acceptAbsentSourceTx(err, block.Header.Height) {
+			if bc.log != nil {
+				bc.log.Warn("block %d applies debt %s without its source tx; a caught-up source node does not have it", block.Header.Height, debt.Hash)
+			}
+			continue
+		}
+		return errors.NewStackedError(err, "failed to batch validate debt")
+	}
+	return nil
+}
+
+// acceptAbsentSourceTx is true when a caught-up source shard reported that the
+// tx is not indexed and that shard's head is more than SourceTxAbsentGap above
+// the block being imported.
+func acceptAbsentSourceTx(err error, blockHeight uint64) bool {
+	if err == nil || !errors.IsOrContains(err, types.ErrSourceTxAbsent) {
+		return false
+	}
+	height, ok := canonicalHeight(err.Error())
+	if !ok || height <= blockHeight {
+		return false
+	}
+	return height-blockHeight > types.SourceTxAbsentGap
+}
+
+func canonicalHeight(msg string) (uint64, bool) {
+	const key = "canonical height "
+	i := strings.LastIndex(msg, key)
+	if i < 0 {
+		return 0, false
+	}
+	var n uint64
+	for _, c := range msg[i+len(key):] {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + uint64(c-'0')
+	}
+	if n == 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // applyRewardAndRegularTxs processes the reward tx and regular txs(not debts)
