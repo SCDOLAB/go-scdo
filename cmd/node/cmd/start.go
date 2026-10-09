@@ -21,6 +21,7 @@ import (
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/consensus"
 	"github.com/scdoproject/go-scdo/consensus/factory"
+	"github.com/scdoproject/go-scdo/heartbeat"
 	"github.com/scdoproject/go-scdo/light"
 	"github.com/scdoproject/go-scdo/log"
 	"github.com/scdoproject/go-scdo/log/comm"
@@ -97,6 +98,12 @@ var startCmd = &cobra.Command{
 			fmt.Printf("log folder: %s\n", filepath.Join(log.LogFolder, comm.LogConfiguration.DataDir))
 		}
 
+		rewardAddress, rewardURL, err := resolveReward(cmd, nCfg)
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+
 		scdoNode, err := node.New(nCfg)
 		if err != nil {
 			fmt.Println(err.Error())
@@ -158,12 +165,24 @@ var startCmd = &cobra.Command{
 				fmt.Println(err.Error())
 				return
 			}
+			rewardService, err := newRewardService(nCfg, rewardAddress, rewardURL, heartbeat.KindLight, func() []heartbeat.Tip {
+				return lightRewardTips(clients)
+			})
+			if err != nil {
+				fmt.Println(err.Error())
+				return
+			}
+			if err = scdoNode.Register(rewardService); err != nil {
+				fmt.Println(err.Error())
+				return
+			}
 
 			err = scdoNode.Start()
 			if err != nil {
 				fmt.Printf("got error when start node: %s\n", err)
 				return
 			}
+			announceReward(rewardAddress, rewardURL)
 		} else {
 			// light client manager
 			manager, err := lightclients.NewLightClientManager(scdoNode.GetShardNumber(), ctx, nCfg, engine)
@@ -220,6 +239,17 @@ var startCmd = &cobra.Command{
 					return
 				}
 			}
+			rewardService, err := newRewardService(nCfg, rewardAddress, rewardURL, heartbeat.KindFull, func() []heartbeat.Tip {
+				return fullRewardTips(shard, scdoService, manager)
+			})
+			if err != nil {
+				fmt.Println(err.Error())
+				return
+			}
+			if err = scdoNode.Register(rewardService); err != nil {
+				fmt.Println(err.Error())
+				return
+			}
 
 			err = scdoNode.Start()
 			if maxConns > 0 {
@@ -232,6 +262,7 @@ var startCmd = &cobra.Command{
 				fmt.Printf("got error when start node: %s\n", err)
 				return
 			}
+			announceReward(rewardAddress, rewardURL)
 			if lightServer && scdoService.P2PServer() != nil && scdoService.P2PServer().SelfNode != nil {
 				fmt.Printf("Phone bootnode: %s\n", scdoService.P2PServer().SelfNode)
 				fmt.Println("If that host is 0.0.0.0, substitute this machine's LAN address. On the .50 test network that is 192.168.50.50.")
@@ -328,6 +359,8 @@ func init() {
 	startCmd.Flags().IntVarP(&threads, "threads", "", 1, "miner thread value")
 	startCmd.Flags().BoolVarP(&lightNode, "light", "l", false, "header-only sync of shards 1-4 from fork genesis, keeping the last 10000 headers per shard")
 	startCmd.Flags().BoolVar(&lightServer, "lightserver", true, "serve phone light clients (lightScdo_<shard> version 1) on this node's TCP port. On by default")
+	startCmd.Flags().StringVar(&rewardAddressFlag, "reward-address", "", "Shard0 EVM address that receives node rewards. Empty leaves the heartbeat off")
+	startCmd.Flags().StringVar(&rewardURLFlag, "reward-heartbeat-url", "", "reward heartbeat POST URL. Empty (the default) leaves the client off")
 	startCmd.Flags().Uint64VarP(&pprofPort, "port", "", 0, "which port pprof http server listen to")
 	startCmd.Flags().IntVarP(&startHeight, "startheight", "", -1, "the block height to start from")
 	startCmd.Flags().IntVarP(&maxConns, "maxConns", "", 0, "node max connections")

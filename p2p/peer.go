@@ -42,8 +42,10 @@ func NewPeer(conn *connection, log *log.ScdoLog, node *discovery.Node) *Peer {
 	closed := make(chan struct{})
 
 	return &Peer{
-		rw:            conn,
-		disconnection: make(chan string),
+		rw: conn,
+		// Buffer one reason so a second Disconnect during shutdown cannot
+		// block on this channel while peer.run is leaving the read loop.
+		disconnection: make(chan string, 1),
 		closed:        closed,
 		log:           log,
 		protocolErr:   make(chan error),
@@ -243,12 +245,18 @@ func (p *Peer) sendCtlMsg(msgCode uint16) error {
 
 // Disconnect terminates the peer connection with the given reason.
 // It returns immediately and does not wait until the connection is closed.
+// The send does not hold the peer lock: peer.run takes that lock to close
+// the socket, and a blocking send here deadlocks shutdown.
 func (p *Peer) Disconnect(reason string) {
 	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	if p.disconnection != nil {
-		p.disconnection <- reason
+	ch := p.disconnection
+	p.lock.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- reason:
+	default:
 	}
 }
 

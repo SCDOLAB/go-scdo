@@ -18,6 +18,29 @@ import (
 	"github.com/scdoproject/go-scdo/trie"
 )
 
+func TestRewardAddressStaysOffUntilURLIsSet(t *testing.T) {
+	t.Cleanup(func() {
+		_ = SetRewardAddress("")
+		_ = SetRewardHeartbeatURL("")
+	})
+	if err := SetRewardAddress("0x1111111111111111111111111111111111111111"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetRewardAddress("nope"); err == nil {
+		t.Fatal("accepted a bad address")
+	}
+	body := RewardStatus()
+	if !strings.Contains(body, `"enabled":false`) {
+		t.Fatalf("status %s", body)
+	}
+	if err := SetRewardHeartbeatURL("ftp://example.com/h"); err == nil {
+		t.Fatal("accepted a bad url")
+	}
+	if err := SetRewardHeartbeatURL(""); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCallsBeforeStart(t *testing.T) {
 	if !strings.Contains(Syncing(), "node is not started") {
 		t.Fatalf("syncing: %s", Syncing())

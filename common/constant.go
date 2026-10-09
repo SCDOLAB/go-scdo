@@ -37,8 +37,22 @@ const (
 	// CPUMetricsRefreshTime is the time of metrics monitor cpu
 	CPUMetricsRefreshTime = time.Second
 
-	// ConfirmedBlockNumber is the block number for confirmed a block, it should be more than 12 in product
+	// ConfirmedBlockNumber is the block number for confirmed a block, it should be more than 12 in product.
+	// 120 blocks is about 40 minutes at the ~20s target. Source-shard reorgs have removed
+	// transactions after a debt that referenced them was already accepted, so 120 is not final.
 	ConfirmedBlockNumber = 120
+
+	// DebtIrreversibleConfirmations is the depth required once DebtIrreversibleForkHeight
+	// is reached. 10_000 blocks is about 55 hours at the 20s target and about three days
+	// at the ~30s interval measured on the public chain (heights 3_000_000 to 3_100_000).
+	// That is the same window the header client already treats as covering ordinary reorgs.
+	DebtIrreversibleConfirmations = 10000
+
+	// DebtIrreversibleForkHeight is the first block that requires the deeper confirmation.
+	// Zero means the fork is not scheduled. Turning it on is a coordinated network upgrade:
+	// a node that requires 10_000 confirmations will not follow blocks the rest of the
+	// network packed after only 120.
+	DebtIrreversibleForkHeight uint64 = 0
 
 	ScdoForkHeight = 2979594
 

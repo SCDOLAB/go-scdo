@@ -50,4 +50,20 @@ func TestDebtPoolKeepsUnsyncedDebt(t *testing.T) {
 	err = invalid.DoMulCheckingDebtHandler(debt)
 	assert.NotNil(t, err)
 	assert.False(t, invalid.toConfirmedDebts.has(debt.Hash))
+
+	// The field failure: the ODR server has not stored the source tx. The debt
+	// stays queued. It is not marked valid and it is not dropped.
+	peerMiss := errors.New("failed to validate debt via verifier ===> failed to get tx 0xd9cc2ad7dff881a357a8fc46e36c2bc6d21e62bd80a9e12f8144a15db8c5816b ===> failed to handle ODR request on server side ===> failed to get tx by hash 0xd9cc2ad7dff881a357a8fc46e36c2bc6d21e62bd80a9e12f8144a15db8c5816b ===> leveldb: not found")
+	poolMiss := NewDebtPool(bc, types.NewTestVerifier(false, false, peerMiss))
+	assert.Nil(t, poolMiss.toConfirmedDebts.add(debt))
+	err = poolMiss.DoMulCheckingDebtHandler(debt)
+	assert.NotNil(t, err)
+	assert.True(t, poolMiss.toConfirmedDebts.has(debt.Hash))
+
+	timedOut := errors.New("failed to get tx 0x72ba09d19faa24ee0bf804b5fa74151fc9814fb3235e0a0eef41a7be776d5fd0 ===> wait for msg reqid=70714341 timeout")
+	poolTimeout := NewDebtPool(bc, types.NewTestVerifier(false, false, timedOut))
+	assert.Nil(t, poolTimeout.toConfirmedDebts.add(debt))
+	err = poolTimeout.DoMulCheckingDebtHandler(debt)
+	assert.NotNil(t, err)
+	assert.True(t, poolTimeout.toConfirmedDebts.has(debt.Hash))
 }

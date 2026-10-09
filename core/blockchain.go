@@ -99,6 +99,11 @@ type Blockchain struct {
 	indexFile     string
 	indexVerified uint64
 	indexMu       sync.Mutex
+	// indexClamped is the last time a rewind rewrote the checkpoint file.
+	// The in-memory height follows the head on every rewind. The file is
+	// rewritten at most once a second so a long reverse does not rename it
+	// on every block. Shutdown writes it immediately.
+	indexClamped time.Time
 }
 
 // NewBlockchain returns an initialized blockchain with the given store and account state DB.
@@ -175,9 +180,13 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 	// A crash from here on is an unclean shutdown, including a crash during
 	// this scan. The previous clean height is what this scan trusts.
 	if bc.indexFile != "" && cp.Clean {
+		verified := cp.VerifiedHeight
+		if verified > currentBlock.Header.Height {
+			verified = currentBlock.Header.Height
+		}
 		bc.indexMu.Lock()
-		bc.indexVerified = cp.VerifiedHeight
-		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: cp.VerifiedHeight, Clean: false})
+		bc.indexVerified = verified
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: verified, Clean: false})
 		bc.indexMu.Unlock()
 	}
 	if bc.indexFile == "" {
@@ -238,6 +247,12 @@ func (bc *Blockchain) CurrentBlock() *types.Block {
 // UpdateCurrentBlock updates the HEAD block of the blockchain.
 func (bc *Blockchain) UpdateCurrentBlock(block *types.Block) {
 	bc.currentBlock.Store(block)
+	if block == nil || block.Header == nil {
+		return
+	}
+	// A rewind moves the committed head backwards. The checkpoint must follow
+	// or the next restart trusts a height the canonical chain no longer has.
+	bc.noteHeadLower(block.Header.Height)
 }
 
 // AddBlockLeaves adds a new block leaf
@@ -576,9 +591,8 @@ func (bc *Blockchain) applyTxs(block *types.Block, root common.Hash) (*state.Sta
 	}
 
 	//validate debts
-	err = types.BatchValidateDebtOnShard(block.Debts, bc.debtVerifier, bc.shardNumber())
-	if err != nil {
-		return nil, nil, errors.NewStackedError(err, "failed to batch validate debt")
+	if err = bc.validateDebts(block); err != nil {
+		return nil, nil, err
 	}
 
 	canonicalHeadBlock := bc.CurrentBlock()
@@ -607,6 +621,33 @@ func (bc *Blockchain) applyTxs(block *types.Block, root common.Hash) (*state.Sta
 	auditor.Audit("succeed to update stateDB for %v txs", len(block.Transactions))
 
 	return statedb, receipts, nil
+}
+
+// validateDebts checks each debt against the source shard. A reviewed historical
+// debt whose source transaction is not on the canonical source chain is applied
+// without that proof so a new node can follow the public chain. The state root
+// is still checked. Every other debt keeps the strict proof, and a miss or a
+// timeout stays a retry instead of a rejected block.
+func (bc *Blockchain) validateDebts(block *types.Block) error {
+	shard := bc.shardNumber()
+	for _, debt := range block.Debts {
+		if debt == nil {
+			continue
+		}
+		if HistoricalAbsentDebt(shard, block.Header.Height, debt.Hash) {
+			if _, err := debt.Validate(nil, false, shard, block.Header.Height); err != nil {
+				return errors.NewStackedError(err, "failed to batch validate debt")
+			}
+			if bc.log != nil {
+				bc.log.Warn("block %d applies reviewed historical debt %s; its source transaction is not on the canonical source chain", block.Header.Height, debt.Hash)
+			}
+			continue
+		}
+		if _, err := debt.Validate(bc.debtVerifier, false, shard, block.Header.Height); err != nil {
+			return errors.NewStackedError(err, "failed to batch validate debt")
+		}
+	}
+	return nil
 }
 
 // applyRewardAndRegularTxs processes the reward tx and regular txs(not debts)

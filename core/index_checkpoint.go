@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/core/types"
@@ -67,12 +68,41 @@ func loadIndexCheckpoint(path string) indexCheckpoint {
 	return cp
 }
 
+// committedHeadHeight is the canonical block the chain has committed.
+// The checkpoint must not record anything above it.
+func (bc *Blockchain) committedHeadHeight() (uint64, bool) {
+	if bc == nil {
+		return 0, false
+	}
+	loaded := bc.currentBlock.Load()
+	if loaded == nil {
+		return 0, false
+	}
+	block, ok := loaded.(*types.Block)
+	if !ok || block == nil || block.Header == nil {
+		return 0, false
+	}
+	return block.Header.Height, true
+}
+
 func (bc *Blockchain) noteIndexVerified(height uint64) {
 	if bc == nil || bc.indexFile == "" || height == 0 {
 		return
 	}
+	if head, ok := bc.committedHeadHeight(); ok && height > head {
+		height = head
+	}
+	if height == 0 {
+		return
+	}
 	bc.indexMu.Lock()
 	defer bc.indexMu.Unlock()
+	if bc.indexVerified > height {
+		bc.indexVerified = height
+		bc.indexClamped = time.Now()
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: height, Clean: false})
+		return
+	}
 	if height <= bc.indexVerified {
 		return
 	}
@@ -83,22 +113,38 @@ func (bc *Blockchain) noteIndexVerified(height uint64) {
 	bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: height, Clean: false})
 }
 
+// noteHeadLower drops a checkpoint that a rewind left above the committed head.
+func (bc *Blockchain) noteHeadLower(head uint64) {
+	if bc == nil || bc.indexFile == "" || head == 0 {
+		return
+	}
+	bc.indexMu.Lock()
+	defer bc.indexMu.Unlock()
+	if bc.indexVerified <= head {
+		return
+	}
+	bc.indexVerified = head
+	// The file follows the head, but not on every block of a long reverse.
+	// markIndexClean writes the final head before the databases close.
+	if !bc.indexClamped.IsZero() && time.Since(bc.indexClamped) < time.Second {
+		return
+	}
+	bc.indexClamped = time.Now()
+	bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: head, Clean: false})
+}
+
 func (bc *Blockchain) markIndexClean() {
 	if bc == nil || bc.indexFile == "" {
 		return
 	}
 	height := bc.indexVerified
-	if loaded := bc.currentBlock.Load(); loaded != nil {
-		if block, ok := loaded.(*types.Block); ok && block != nil && block.Header != nil && block.Header.Height > height {
-			height = block.Header.Height
-		}
+	if head, ok := bc.committedHeadHeight(); ok {
+		height = head
 	}
 	bc.indexMu.Lock()
 	defer bc.indexMu.Unlock()
-	if height < bc.indexVerified {
-		height = bc.indexVerified
-	}
 	bc.indexVerified = height
+	bc.indexClamped = time.Now()
 	bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: height, Clean: true})
 }
 

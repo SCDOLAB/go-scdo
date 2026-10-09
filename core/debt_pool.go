@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
-	"github.com/scdoproject/go-scdo/common/errors"
 	"github.com/scdoproject/go-scdo/core/state"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/event"
@@ -93,7 +92,7 @@ func (dp *DebtPool) loopCheckingDebt() {
 			if err != nil {
 				// A source header that is not synced yet is the queued-retry
 				// path. Log it at debug so a syncing node is not flooded.
-				if errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations) {
+				if debtSourceNotReady(err) {
 					dp.log.Debug("debts waiting on source shard: %s", err)
 				} else {
 					dp.log.Warn("multiple threads checking error: %s", err)
@@ -159,9 +158,30 @@ func (dp *DebtPool) localShard() uint {
 	return common.LocalShardNumber
 }
 
+// packingHeight is the block that would include a debt taken from this pool.
+// The confirmation depth is chosen from that height. A chain that does not
+// expose its head keeps the pre-fork depth.
+func (dp *DebtPool) packingHeight() uint64 {
+	type headChain interface {
+		CurrentBlock() *types.Block
+	}
+	if dp == nil || dp.chain == nil {
+		return 0
+	}
+	hc, ok := dp.chain.(headChain)
+	if !ok || hc == nil {
+		return 0
+	}
+	block := hc.CurrentBlock()
+	if block == nil || block.Header == nil {
+		return 0
+	}
+	return block.Header.Height + 1
+}
+
 // DoMulCheckingDebtHandler DoMulCheckingDebt handler
 func (dp *DebtPool) DoMulCheckingDebtHandler(d *types.Debt) error {
-	recoverable, err := d.Validate(dp.verifier, false, dp.localShard())
+	recoverable, err := d.Validate(dp.verifier, false, dp.localShard(), dp.packingHeight())
 	if err != nil {
 		if recoverable || debtSourceNotReady(err) {
 			dp.log.Debug("check debt waiting on source shard: %s", err)
@@ -186,14 +206,14 @@ func (dp *DebtPool) DoMulCheckingDebtHandler(d *types.Debt) error {
 // debtSourceNotReady reports a cross-shard check that should be retried.
 // The debt stays in the pool. A real validation failure does not match.
 func debtSourceNotReady(err error) bool {
-	return errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations)
+	return types.ShardDataNotReady(err)
 }
 
 // DoCheckingDebt is a legecy rountine
 func (dp *DebtPool) DoCheckingDebt() {
 	tmp := dp.toConfirmedDebts.items()
 	for h, d := range tmp {
-		recoverable, err := d.Validate(dp.verifier, false, dp.localShard())
+		recoverable, err := d.Validate(dp.verifier, false, dp.localShard(), dp.packingHeight())
 		if err != nil {
 			if recoverable || debtSourceNotReady(err) {
 				dp.log.Debug("check debt waiting on source shard: %s", err)

@@ -99,7 +99,10 @@ type Downloader struct {
 	peers      map[string]*peerConn // peers map. peerID=>peer
 
 	syncStatus int
-	tm         *taskMgr
+	// stopped is set by Terminate. Cancel only ends the current session;
+	// a shutdown must also refuse the session that is about to start.
+	stopped bool
+	tm      *taskMgr
 
 	scdo        ScdoBackend
 	chain       *core.Blockchain
@@ -108,8 +111,8 @@ type Downloader struct {
 	activeWG    *sync.WaitGroup
 	log         *log.ScdoLog
 	lock        sync.RWMutex
-	writeNS int64 // smoothed nanoseconds spent in the last block writes
-	scores  map[string]*peerStat
+	writeNS     int64 // smoothed nanoseconds spent in the last block writes
+	scores      map[string]*peerStat
 
 	// Cross-shard dependency wait. Alephium keeps a block queued until its
 	// group dependencies exist; QuarkChain will not spend a cross-shard
@@ -281,6 +284,10 @@ func (d *Downloader) Synchronise(id string, head common.Hash) error {
 	// Make sure only one routine can pass at once
 	d.lock.Lock()
 
+	if d.stopped {
+		d.lock.Unlock()
+		return errReceivedQuitMsg
+	}
 	if d.syncStatus != statusNone {
 		d.lock.Unlock()
 		return ErrIsSynchronising
@@ -296,7 +303,12 @@ func (d *Downloader) Synchronise(id string, head common.Hash) error {
 		d.lock.Unlock()
 		return errPeerNotFound
 	}
+	// Count this session before releasing the lock. Terminate sets stopped
+	// under the same lock and then waits, so it cannot miss a session that
+	// is about to start, and it cannot return while this one is still running.
+	d.sessionWG.Add(1)
 	d.lock.Unlock()
+	defer d.sessionWG.Done()
 
 	err := d.doSynchronise(p, head)
 
@@ -416,6 +428,9 @@ func (d *Downloader) findCommonAncestorHeight(conn *peerConn, height uint64) (ui
 	var cmpCount uint64
 	maxFetchAncestry := getMaxFetchAncestry(top)
 	for {
+		if d.cancelled() {
+			return 0, errReceivedQuitMsg
+		}
 		localTop := top - uint64(cmpCount)
 
 		fetchCount := getFetchCount(maxFetchAncestry, cmpCount)
@@ -552,21 +567,80 @@ func (d *Downloader) DeliverMsg(peerID string, msg *p2p.Message) {
 func (d *Downloader) Cancel() {
 	d.lock.Lock()
 	defer d.lock.Unlock()
-	d.log.Debug("Downloader.Cancel called")
-	if d.cancelCh != nil {
-		select {
-		case <-d.cancelCh:
-		default:
-			close(d.cancelCh)
+	d.closeCancelLocked()
+}
+
+// Terminate ends the current session and refuses any session that starts later.
+// Shutdown calls this so a stuck sync cannot hold the process open.
+func (d *Downloader) Terminate() {
+	d.lock.Lock()
+	d.stopped = true
+	d.acceptPeers = false
+	d.closeCancelLocked()
+	peers := make([]*peerConn, 0, len(d.peers))
+	for _, p := range d.peers {
+		peers = append(peers, p)
+	}
+	tm := d.tm
+	d.lock.Unlock()
+	for _, p := range peers {
+		if p == nil {
+			continue
 		}
+		p.stopSession()
+		p.close()
+	}
+	if tm != nil {
+		tm.signalQuit()
+	}
+	d.sessionWG.Wait()
+}
+
+func (d *Downloader) closeCancelLocked() {
+	if d.log != nil {
+		d.log.Debug("Downloader.Cancel called")
+	}
+	if d.cancelCh == nil {
+		return
+	}
+	select {
+	case <-d.cancelCh:
+	default:
+		close(d.cancelCh)
 	}
 }
 
-// Terminate close Downloader, cannot called anymore.
-func (d *Downloader) Terminate() {
-	d.Cancel()
-	d.sessionWG.Wait()
-	// TODO release variables if needed
+// cancelled reports that the current session was asked to stop.
+func (d *Downloader) isStopped() bool {
+	if d == nil {
+		return false
+	}
+	d.lock.RLock()
+	stopped := d.stopped
+	d.lock.RUnlock()
+	return stopped
+}
+
+func (d *Downloader) cancelled() bool {
+	if d == nil {
+		return false
+	}
+	d.lock.RLock()
+	stopped := d.stopped
+	ch := d.cancelCh
+	d.lock.RUnlock()
+	if stopped {
+		return true
+	}
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 // peerDownload runs a header fetcher and a body fetcher for one peer.
@@ -738,10 +812,16 @@ func (d *Downloader) idlePeer(conn *peerConn, tm *taskMgr) error {
 // waiting is true when a cross-shard debt needs a source-shard header or more
 // confirmations on that shard. The task manager leaves those blocks queued and retries.
 func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, localHeight uint64, localTD *big.Int, localBlocks []*types.Block, conn *peerConn) (waiting bool) {
+	if d.cancelled() {
+		return false
+	}
 	if len(headInfos) > 0 {
 		d.log.Debug(" [%d] blocks will be processed into local database", len(headInfos))
 	}
 	for _, h := range headInfos {
+		if d.cancelled() {
+			return false
+		}
 		d.log.Debug("got block message and save it. height=%d, hash=%s", h.block.Header.Height, h.block.HeaderHash.Hex())
 		// writeblock
 		var txPool *core.Pool
@@ -808,9 +888,15 @@ func (d *Downloader) noteBlockWrite(elapsed time.Duration) {
 func (d *Downloader) noteShardWait(err error) {
 	reason := "source-shard-header"
 	var need, have uint64
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
 	if errors.IsOrContains(err, types.ErrNotEnoughConfirmations) {
 		reason = "source-shard-confirmations"
-		need, have = confirmationCounts(err.Error())
+		need, have = confirmationCounts(msg)
+	} else if strings.Contains(msg, "failed to get tx") || strings.Contains(msg, "wait for msg reqid=") {
+		reason = "source-shard-tx"
 	}
 	d.lock.Lock()
 	d.waitReason = reason
@@ -839,6 +925,8 @@ func (d *Downloader) WaitDetail() string {
 		return "source shard confirmations are not ready; waiting, not rejecting the block"
 	case "source-shard-header":
 		return "source shard header is not synced yet; waiting, not rejecting the block"
+	case "source-shard-tx":
+		return "source shard transaction is not available from peers yet; waiting, not rejecting the block"
 	default:
 		return ""
 	}
@@ -857,11 +945,11 @@ func confirmationCounts(msg string) (need, have uint64) {
 }
 
 // isShardDataNotReady reports whether a block write failed only because the
-// source shard has not caught up (missing header, no peer to ask, or fewer
-// than the required confirmations). Those blocks stay queued. A real
-// validation failure does not match.
+// source shard has not caught up (missing header, no peer to ask, a peer that
+// has not stored the tx yet, an ODR timeout, or fewer than the required
+// confirmations). Those blocks stay queued. A real validation failure does not match.
 func isShardDataNotReady(err error) bool {
-	return errors.IsOrContains(err, types.ErrHeaderNotReady) || errors.IsOrContains(err, types.ErrNotEnoughConfirmations)
+	return types.ShardDataNotReady(err)
 }
 
 // reverse the chain back to the common ancestor of local node and peer

@@ -56,7 +56,19 @@ func newPeerConn(p Peer, peerID string, log *log.ScdoLog) *peerConn {
 }
 
 func (p *peerConn) close() {
-	close(p.quitCh)
+	if p == nil {
+		return
+	}
+	p.lockForWaiting.Lock()
+	defer p.lockForWaiting.Unlock()
+	if p.quitCh == nil {
+		return
+	}
+	select {
+	case <-p.quitCh:
+	default:
+		close(p.quitCh)
+	}
 }
 
 // bindSession installs a stop channel for this download session.

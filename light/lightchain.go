@@ -109,6 +109,19 @@ func (lc *LightChain) CurrentHeader() *types.BlockHeader {
 	return lc.currentHeader
 }
 
+// Head returns the canonical header height and hash.
+func (lc *LightChain) Head() (height uint64, hash common.Hash, ok bool) {
+	if lc == nil {
+		return 0, common.EmptyHash, false
+	}
+	lc.mutex.RLock()
+	defer lc.mutex.RUnlock()
+	if lc.currentHeader == nil {
+		return 0, common.EmptyHash, false
+	}
+	return lc.currentHeader.Height, lc.currentHeader.Hash(), true
+}
+
 // GetStore get underlying store
 func (lc *LightChain) GetStore() store.BlockchainStore {
 	return lc.bcStore

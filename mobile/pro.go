@@ -11,6 +11,7 @@ import (
 
 	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/consensus/factory"
+	"github.com/scdoproject/go-scdo/heartbeat"
 	"github.com/scdoproject/go-scdo/light"
 	"github.com/scdoproject/go-scdo/log"
 	"github.com/scdoproject/go-scdo/node"
@@ -55,18 +56,24 @@ func startLite(dataDir string, shards []uint) (*session, error) {
 	if err = n.Register(service); err != nil {
 		return nil, err
 	}
-	if err = n.Start(); err != nil {
-		n.Stop()
-		return nil, err
-	}
-	return &session{
+	sess := &session{
 		mode:    ModeLite,
 		shards:  append([]uint(nil), shards...),
 		dataDir: dataDir,
 		nodes:   []*node.Node{n},
 		api:     api,
 		samples: map[uint]heightSample{},
-	}, nil
+	}
+	reward, err := registerReward(n, dataDir, heartbeat.KindLight, sess.rewardTips)
+	if err != nil {
+		return nil, err
+	}
+	sess.reward = reward
+	if err = n.Start(); err != nil {
+		n.Stop()
+		return nil, err
+	}
+	return sess, nil
 }
 
 func startPro(dataDir string, shards []uint) (*session, error) {
@@ -159,12 +166,19 @@ func startPro(dataDir string, shards []uint) (*session, error) {
 			full.Stop()
 			return fail(err)
 		}
+		if i == 0 {
+			reward, err := registerReward(n, dataDir, heartbeat.KindFull, sess.rewardTips)
+			if err != nil {
+				return fail(err)
+			}
+			sess.reward = reward
+		}
 		if err = n.Start(); err != nil {
 			started = append(started, n)
 			return fail(err)
 		}
 		started = append(started, n)
-		sess.full[shard] = full
+		sess.setFull(shard, full)
 	}
 	sess.nodes = started
 	return sess, nil

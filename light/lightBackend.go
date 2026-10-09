@@ -98,7 +98,6 @@ func (l *LightBackend) GetTransaction(pool api.PoolCore, bcStore store.Blockchai
 
 	filter := peerFilter{blockHash: blockHash}
 	response, err := l.s.odrBackend.retrieveWithFilter(&odrTxByHashRequest{TxHash: txHash}, filter)
-
 	if err != nil {
 		return nil, nil, err
 	}

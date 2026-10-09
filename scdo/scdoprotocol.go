@@ -79,8 +79,13 @@ type ScdoProtocol struct {
 	debtPool   *core.DebtPool
 	chain      *core.Blockchain
 
-	wg     sync.WaitGroup
-	quitCh chan struct{}
+	wg        sync.WaitGroup
+	handlerMu sync.Mutex
+	quitOnce  sync.Once
+	quitCh    chan struct{}
+	// syncCh stays open for the life of the protocol. Closing it panics a
+	// peer handler that is still delivering a head, and it also makes the
+	// syncer spin on the closed channel so it never cancels a stuck download.
 	syncCh chan struct{}
 	log    *log.ScdoLog
 
@@ -145,13 +150,68 @@ func (sp *ScdoProtocol) Start() {
 }
 
 // Stop stops protocol, called when scdoService quits.
+// The downloader is terminated first. A sync that has stopped making progress
+// otherwise sits in Synchronise, wg.Wait never returns, and the height-index
+// checkpoint is left clean=false because shutdown times out before the flush.
+// syncCh is left open so a peer handler cannot send on a closed channel.
 func (sp *ScdoProtocol) Stop() {
 	event.BlockMinedEventManager.RemoveListener(sp.handleNewMinedBlock)
 	event.TransactionInsertedEventManager.RemoveListener(sp.handleNewTx)
 	event.DebtsInsertedEventManager.RemoveListener(sp.handleNewDebt)
-	close(sp.quitCh)
-	close(sp.syncCh)
+	sp.handlerMu.Lock()
+	sp.quitOnce.Do(func() { close(sp.quitCh) })
+	sp.handlerMu.Unlock()
+	// Drop peer connections before waiting. A handler blocked in ReadMsg,
+	// or a head broadcast blocked in WriteMsg, otherwise sits past the
+	// stop budget and the height-index checkpoint stays clean=false.
+	sp.disconnectPeers()
+	if sp.downloader != nil {
+		sp.downloader.Terminate()
+	}
 	sp.wg.Wait()
+}
+
+func (sp *ScdoProtocol) disconnectPeers() {
+	if sp == nil || sp.peerSet == nil {
+		return
+	}
+	for _, p := range sp.peerSet.getAllPeers() {
+		if p != nil && p.Peer != nil {
+			p.Disconnect("shutdown")
+		}
+	}
+}
+
+// trackSync runs fn on the wait group Stop waits for.
+// A call that loses the race with Stop does not start.
+func (sp *ScdoProtocol) trackSync(fn func()) {
+	sp.handlerMu.Lock()
+	select {
+	case <-sp.quitCh:
+		sp.handlerMu.Unlock()
+		return
+	default:
+	}
+	sp.wg.Add(1)
+	sp.handlerMu.Unlock()
+	go fn()
+}
+
+// requestSync wakes the syncer. The send never blocks and never touches a
+// closed channel, including after Stop.
+func (sp *ScdoProtocol) requestSync() {
+	if sp == nil || sp.syncCh == nil {
+		return
+	}
+	select {
+	case <-sp.quitCh:
+		return
+	default:
+	}
+	select {
+	case sp.syncCh <- struct{}{}:
+	default:
+	}
 }
 
 // syncer try to synchronise with remote peer
@@ -161,8 +221,16 @@ func (sp *ScdoProtocol) syncer() {
 	//sp.wg.Add(1)
 
 	forceSync := time.NewTicker(forceSyncInterval)
+	defer forceSync.Stop()
 	for {
 		select {
+		case <-sp.quitCh:
+			return
+		default:
+		}
+		select {
+		case <-sp.quitCh:
+			return
 		case <-sp.syncCh:
 			if !sp.downloader.IsSyncStatusNone() {
 				continue
@@ -174,8 +242,8 @@ func (sp *ScdoProtocol) syncer() {
 				sp.log.Error("broadcastChainHead GetBlockTotalDifficulty err. %s", err)
 				continue
 			}
-			sp.wg.Add(1)
-			go sp.synchronise(sp.peerSet.bestPeers(sp.localShard(), localTD))
+			peers := sp.peerSet.bestPeers(sp.localShard(), localTD)
+			sp.trackSync(func() { sp.synchronise(peers) })
 		case <-forceSync.C:
 			if !sp.downloader.IsSyncStatusNone() {
 				continue
@@ -187,16 +255,19 @@ func (sp *ScdoProtocol) syncer() {
 				sp.log.Error("broadcastChainHead GetBlockTotalDifficulty err. %s", err)
 				continue
 			}
-			sp.wg.Add(1)
-			go sp.synchronise(sp.peerSet.bestPeers(sp.localShard(), localTD))
-		case <-sp.quitCh:
-			return
+			peers := sp.peerSet.bestPeers(sp.localShard(), localTD)
+			sp.trackSync(func() { sp.synchronise(peers) })
 		}
 	}
 }
 
 func (sp *ScdoProtocol) synchronise(peers []*peer) {
 	defer sp.wg.Done()
+	select {
+	case <-sp.quitCh:
+		return
+	default:
+	}
 	if syncPaused() {
 		return
 	}
@@ -218,6 +289,11 @@ func (sp *ScdoProtocol) synchronise(peers []*peer) {
 	//}
 
 	for _, p := range peers {
+		select {
+		case <-sp.quitCh:
+			return
+		default:
+		}
 		pHead, _ := p.Head()
 
 		// if total difficulty is not smaller than remote peer td, then do not need synchronise.
@@ -241,6 +317,11 @@ func (sp *ScdoProtocol) synchronise(peers []*peer) {
 			continue
 		}
 
+		select {
+		case <-sp.quitCh:
+			return
+		default:
+		}
 		//broadcast chain head
 		sp.broadcastChainHead()
 
@@ -397,9 +478,11 @@ func (p *ScdoProtocol) handleNewBlock(e event.Event) {
 		return
 	}
 
-	// propagate confirmed block
-	if block.Header.Height > common.ConfirmedBlockNumber {
-		confirmedHeight := block.Header.Height - common.ConfirmedBlockNumber
+	// propagate confirmed block. The depth follows the block height so the
+	// irreversible fork, once scheduled, waits longer before a debt is sent.
+	confirmations := types.DebtConfirmationDepth(block.Header.Height)
+	if block.Header.Height > confirmations {
+		confirmedHeight := block.Header.Height - confirmations
 		confirmedBlock, err := p.chain.GetStore().GetBlockByHeight(confirmedHeight)
 
 		if err != nil {
@@ -449,6 +532,11 @@ func (p *ScdoProtocol) handleNewMinedBlock(e event.Event) {
 }
 
 func (p *ScdoProtocol) handleAddPeer(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) bool {
+	select {
+	case <-p.quitCh:
+		return false
+	default:
+	}
 	if p.peerSet.Find(p2pPeer.Node.ID) != nil {
 		p.log.Error("handleAddPeer called, but peer of this public-key has already existed, so need quit!")
 		return false
@@ -481,8 +569,25 @@ func (p *ScdoProtocol) handleAddPeer(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) bo
 
 	}
 	//go p.syncTransactions(newPeer)
-	go p.handleMsg(newPeer)
+	p.spawnHandler(newPeer)
 	return true
+}
+
+// spawnHandler runs a peer read loop that Stop waits for.
+// A handler started after Stop is refused so Wait cannot race with Add.
+func (p *ScdoProtocol) spawnHandler(peer *peer) {
+	p.handlerMu.Lock()
+	defer p.handlerMu.Unlock()
+	select {
+	case <-p.quitCh:
+		return
+	default:
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		p.handleMsg(peer)
+	}()
 }
 
 func (s *ScdoProtocol) handleGetPeer(address common.Address) interface{} {
@@ -857,7 +962,7 @@ handler:
 
 			p.log.Debug("Received statusChainHeadMsgCode. peer=%s, ip=%s, remoteTD=%d", peer.peerStrID, peer.Peer.RemoteAddr(), status.TD)
 			peer.SetHead(status.CurrentBlock, status.TD)
-			p.syncCh <- struct{}{}
+			p.requestSync()
 
 			// exit
 			memory.Print(p.log, "handleMsg statusChainHeadMsgCode exit", now, true)

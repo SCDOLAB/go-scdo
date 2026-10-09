@@ -582,6 +582,70 @@ func Test_isAncenstorFound_missingHashIsError(t *testing.T) {
 	assert.NotNil(t, err)
 }
 
+func TestCancelUnblocksPeerDownload(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	dl := newTestDownloader(db)
+	pc := newPeerConn(newTestPeer(), "peer", dl.log)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go dl.peerDownload(pc, dl.tm, &wg)
+	time.Sleep(50 * time.Millisecond)
+	dl.Cancel()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("peer download still running after Cancel")
+	}
+}
+
+func TestTerminateDuringHeaderWait(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	dl := newTestDownloader(db)
+	dl.RegisterPeer("stall", newTestPeer())
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_ = dl.Synchronise("stall", common.EmptyHash)
+	}()
+	<-started
+	time.Sleep(50 * time.Millisecond)
+
+	done := make(chan struct{})
+	begin := time.Now()
+	go func() {
+		dl.Terminate()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Terminate did not return while a header request was in flight")
+	}
+	if time.Since(begin) > 2*time.Second {
+		t.Fatal("Terminate took longer than 2s")
+	}
+	if err := dl.Synchronise("stall", common.EmptyHash); err != errReceivedQuitMsg {
+		t.Fatalf("Synchronise after Terminate: %v", err)
+	}
+}
+
+func TestTerminateRejectsNewSession(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	dl := newTestDownloader(db)
+	dl.Terminate()
+	dl.Terminate()
+	err := dl.Synchronise("missing", common.EmptyHash)
+	assert.Equal(t, errReceivedQuitMsg, err)
+}
+
 func Test_findCommonAncestorHeight_peerHeightZero(t *testing.T) {
 	db, dispose := leveldb.NewTestDatabase()
 	defer dispose()

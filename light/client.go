@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/scdoproject/go-scdo/api"
+	"github.com/scdoproject/go-scdo/common"
 	"github.com/scdoproject/go-scdo/consensus"
 	"github.com/scdoproject/go-scdo/core"
 	"github.com/scdoproject/go-scdo/core/store"
@@ -126,10 +127,19 @@ func (s *ServiceClient) Shard() uint { return s.shard }
 
 // CurrentHeight is the latest header height on this shard.
 func (s *ServiceClient) CurrentHeight() uint64 {
-	if s.chain == nil || s.chain.CurrentHeader() == nil {
+	height, _, ok := s.Head()
+	if !ok {
 		return 0
 	}
-	return s.chain.CurrentHeader().Height
+	return height
+}
+
+// Head is the canonical header this light client is serving.
+func (s *ServiceClient) Head() (height uint64, hash common.Hash, ok bool) {
+	if s == nil || s.chain == nil {
+		return 0, common.EmptyHash, false
+	}
+	return s.chain.Head()
 }
 
 // Protocols implements node.Service, returning all the currently configured

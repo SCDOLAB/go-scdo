@@ -414,8 +414,13 @@ runloop:
 			if len(srv.nodeSet.shardsWithoutPeers()) > 0 {
 				continue
 			}
-			//if already well connected, rest a little bit to avoid works no big help
-			time.Sleep(60 * time.Second)
+			// Already well connected. Rest, but wake immediately on shutdown.
+			// Sleep ignored srv.quit and held SIGTERM past the 20s stop budget.
+			select {
+			case <-srv.quit:
+				break runloop
+			case <-time.After(60 * time.Second):
+			}
 			goto runloop
 		case <-srv.quit:
 			srv.log.Debug("server got quit signal, run cleanup logic")

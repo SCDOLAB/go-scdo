@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/scdoproject/go-scdo/common"
+	"github.com/scdoproject/go-scdo/core/types"
 )
 
 func TestIndexScanFloor(t *testing.T) {
@@ -88,5 +89,40 @@ func TestIndexCheckpointRoundTrip(t *testing.T) {
 	os.Remove(path)
 	if loadIndexCheckpoint(path).Clean || loadIndexCheckpoint(path).VerifiedHeight != 0 {
 		t.Fatal("missing file should scan from the fork")
+	}
+}
+
+// Shard1 on a420ba8 wrote verifiedHeight 3943820 while the canonical head
+// stayed 3943308. 3943820 is one header batch (512) above that head and lands
+// on an 8192 checkpoint boundary.
+func TestCheckpointNeverExceedsCanonicalHead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, indexCheckpointFile)
+	bc := &Blockchain{indexFile: path, log: rpLog}
+	const head = uint64(3943308)
+	const ahead = uint64(3943820)
+	bc.currentBlock.Store(&types.Block{Header: &types.BlockHeader{Height: head}})
+
+	bc.noteIndexVerified(ahead)
+	got := loadIndexCheckpoint(path)
+	if got.VerifiedHeight > head {
+		t.Fatalf("noteIndexVerified wrote %d, committed head is %d", got.VerifiedHeight, head)
+	}
+	if got.VerifiedHeight != head {
+		t.Fatalf("noteIndexVerified wrote %d, want the committed head %d", got.VerifiedHeight, head)
+	}
+
+	bc.indexVerified = ahead
+	bc.UpdateCurrentBlock(&types.Block{Header: &types.BlockHeader{Height: head}})
+	got = loadIndexCheckpoint(path)
+	if got.VerifiedHeight > head {
+		t.Fatalf("after the head moved back, checkpoint is %d", got.VerifiedHeight)
+	}
+
+	bc.indexVerified = ahead
+	bc.markIndexClean()
+	got = loadIndexCheckpoint(path)
+	if !got.Clean || got.VerifiedHeight != head {
+		t.Fatalf("clean shutdown checkpoint %+v, committed head %d", got, head)
 	}
 }

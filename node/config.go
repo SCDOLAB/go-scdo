@@ -73,6 +73,14 @@ type BasicConfig struct {
 	// DbCache is the chain database block cache in megabytes.
 	// 0 uses the 64 MiB phone and HDD profile (bloom filter, 8 MiB tables, no per-table fsync).
 	DbCache int `json:"dbcache"`
+
+	// RewardAddress is the Shard0 EVM address that receives node rewards.
+	// Empty leaves the reward heartbeat off.
+	RewardAddress string `json:"rewardAddress"`
+
+	// RewardHeartbeatURL is the heartbeat POST endpoint.
+	// Empty (the default) leaves the client off.
+	RewardHeartbeatURL string `json:"rewardHeartbeatURL"`
 }
 
 // HTTPServer config for http server

@@ -143,6 +143,32 @@ func NewPublicAPI(clients []*ServiceClient) *PublicAPI {
 	return &PublicAPI{clients: clients}
 }
 
+// ShardHead is the header tip of one shard this process opened.
+type ShardHead struct {
+	Shard  uint
+	Height uint64
+	Hash   common.Hash
+}
+
+// Heads returns the header tip of every shard this process opened.
+func (api *PublicAPI) Heads() []ShardHead {
+	if api == nil {
+		return nil
+	}
+	out := make([]ShardHead, 0, len(api.clients))
+	for _, client := range api.clients {
+		if client == nil {
+			continue
+		}
+		height, hash, ok := client.Head()
+		if !ok {
+			continue
+		}
+		out = append(out, ShardHead{Shard: client.Shard(), Height: height, Hash: hash})
+	}
+	return out
+}
+
 // Syncing returns header progress for every shard this process opened.
 func (api *PublicAPI) Syncing() ([]ShardStatus, error) {
 	if api == nil {
