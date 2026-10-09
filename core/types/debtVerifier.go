@@ -18,7 +18,9 @@ type DebtVerifier interface {
 	// returns packed whether debt is packed
 	// returns confirmed whether debt is confirmed
 	// returns retErr error info
-	ValidateDebt(debt *Debt) (packed bool, confirmed bool, err error)
+	// blockHeight is the block that would contain the debt. The confirmation
+	// depth depends on it. Zero uses the pre-fork depth.
+	ValidateDebt(debt *Debt, blockHeight uint64) (packed bool, confirmed bool, err error)
 
 	// IfDebtPacked
 	// returns packed whether debt is packed
@@ -41,7 +43,7 @@ func NewTestVerifier(p bool, c bool, err error) *TestVerifier {
 	}
 }
 
-func (v *TestVerifier) ValidateDebt(debt *Debt) (packed bool, confirmed bool, err error) {
+func (v *TestVerifier) ValidateDebt(debt *Debt, blockHeight uint64) (packed bool, confirmed bool, err error) {
 	return v.packed, v.confirmed, v.err
 }
 
@@ -50,19 +52,19 @@ func (v *TestVerifier) IfDebtPacked(debt *Debt) (packed bool, confirmed bool, er
 }
 
 type TestVerifierWithFunc struct {
-	fun func(debt *Debt) (bool, bool, error)
+	fun func(debt *Debt, blockHeight uint64) (bool, bool, error)
 }
 
-func NewTestVerifierWithFunc(fun func(debt *Debt) (bool, bool, error)) *TestVerifierWithFunc {
+func NewTestVerifierWithFunc(fun func(debt *Debt, blockHeight uint64) (bool, bool, error)) *TestVerifierWithFunc {
 	return &TestVerifierWithFunc{
 		fun: fun,
 	}
 }
 
-func (v *TestVerifierWithFunc) ValidateDebt(debt *Debt) (packed bool, confirmed bool, err error) {
-	return v.fun(debt)
+func (v *TestVerifierWithFunc) ValidateDebt(debt *Debt, blockHeight uint64) (packed bool, confirmed bool, err error) {
+	return v.fun(debt, blockHeight)
 }
 
 func (v *TestVerifierWithFunc) IfDebtPacked(debt *Debt) (packed bool, confirmed bool, err error) {
-	return v.fun(debt)
+	return v.fun(debt, 0)
 }

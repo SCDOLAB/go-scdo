@@ -76,7 +76,7 @@ func Test_MinerPack(t *testing.T) {
 }
 
 func Test_MinerPackWithVerifier(t *testing.T) {
-	verifier := types.NewTestVerifierWithFunc(func(debt *types.Debt) (bool, bool, error) {
+	verifier := types.NewTestVerifierWithFunc(func(debt *types.Debt, blockHeight uint64) (bool, bool, error) {
 		a := debt.Hash.Big().Uint64()
 		if a%2 == 0 {
 			return true, true, nil
@@ -98,7 +98,7 @@ func minerPackWithVerifier(t *testing.T, verifier types.DebtVerifier) {
 	confirmedDebtCount := 0
 	for i := 0; i < totalDebtCount; i++ {
 		d := types.NewTestDebtWithTargetShard(types.TestGenesisShard)
-		_, c, _ := verifier.ValidateDebt(d)
+		_, c, _ := verifier.ValidateDebt(d, 0)
 		if c {
 			confirmedDebtCount++
 		}

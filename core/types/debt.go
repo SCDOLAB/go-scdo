@@ -91,7 +91,7 @@ func ShardDataNotReady(err error) bool {
 // Validate validate debt with verifier
 // If verifier is nil, will skip it.
 // If isPool is true, we don't return error when the error is recoverable
-func (d *Debt) Validate(verifier DebtVerifier, isPool bool, targetShard uint) (recoverable bool, retErr error) {
+func (d *Debt) Validate(verifier DebtVerifier, isPool bool, targetShard uint, blockHeight uint64) (recoverable bool, retErr error) {
 	if d.Data.From.Shard() == targetShard {
 		retErr = errWrongShardNumber
 		return
@@ -115,7 +115,7 @@ func (d *Debt) Validate(verifier DebtVerifier, isPool bool, targetShard uint) (r
 
 	// validate debt, skip validation when verifier is nil for test
 	if verifier != nil {
-		packed, confirmed, err := verifier.ValidateDebt(d)
+		packed, confirmed, err := verifier.ValidateDebt(d, blockHeight)
 		if packed {
 			recoverable = true
 		}
@@ -318,7 +318,7 @@ func BatchValidateDebtOnShard(debts []*Debt, verifier DebtVerifier, shard uint) 
 		shard = common.LocalShardNumber
 	}
 	return BatchValidate(func(index int) error {
-		_, err := debts[index].Validate(verifier, false, shard)
+		_, err := debts[index].Validate(verifier, false, shard, 0)
 		return err
 	}, len(debts))
 }

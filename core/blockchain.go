@@ -635,7 +635,7 @@ func (bc *Blockchain) validateDebts(block *types.Block) error {
 			continue
 		}
 		if HistoricalAbsentDebt(shard, block.Header.Height, debt.Hash) {
-			if _, err := debt.Validate(nil, false, shard); err != nil {
+			if _, err := debt.Validate(nil, false, shard, block.Header.Height); err != nil {
 				return errors.NewStackedError(err, "failed to batch validate debt")
 			}
 			if bc.log != nil {
@@ -643,7 +643,7 @@ func (bc *Blockchain) validateDebts(block *types.Block) error {
 			}
 			continue
 		}
-		if _, err := debt.Validate(bc.debtVerifier, false, shard); err != nil {
+		if _, err := debt.Validate(bc.debtVerifier, false, shard, block.Header.Height); err != nil {
 			return errors.NewStackedError(err, "failed to batch validate debt")
 		}
 	}

@@ -478,9 +478,11 @@ func (p *ScdoProtocol) handleNewBlock(e event.Event) {
 		return
 	}
 
-	// propagate confirmed block
-	if block.Header.Height > common.ConfirmedBlockNumber {
-		confirmedHeight := block.Header.Height - common.ConfirmedBlockNumber
+	// propagate confirmed block. The depth follows the block height so the
+	// irreversible fork, once scheduled, waits longer before a debt is sent.
+	confirmations := types.DebtConfirmationDepth(block.Header.Height)
+	if block.Header.Height > confirmations {
+		confirmedHeight := block.Header.Height - confirmations
 		confirmedBlock, err := p.chain.GetStore().GetBlockByHeight(confirmedHeight)
 
 		if err != nil {

@@ -158,9 +158,30 @@ func (dp *DebtPool) localShard() uint {
 	return common.LocalShardNumber
 }
 
+// packingHeight is the block that would include a debt taken from this pool.
+// The confirmation depth is chosen from that height. A chain that does not
+// expose its head keeps the pre-fork depth.
+func (dp *DebtPool) packingHeight() uint64 {
+	type headChain interface {
+		CurrentBlock() *types.Block
+	}
+	if dp == nil || dp.chain == nil {
+		return 0
+	}
+	hc, ok := dp.chain.(headChain)
+	if !ok || hc == nil {
+		return 0
+	}
+	block := hc.CurrentBlock()
+	if block == nil || block.Header == nil {
+		return 0
+	}
+	return block.Header.Height + 1
+}
+
 // DoMulCheckingDebtHandler DoMulCheckingDebt handler
 func (dp *DebtPool) DoMulCheckingDebtHandler(d *types.Debt) error {
-	recoverable, err := d.Validate(dp.verifier, false, dp.localShard())
+	recoverable, err := d.Validate(dp.verifier, false, dp.localShard(), dp.packingHeight())
 	if err != nil {
 		if recoverable || debtSourceNotReady(err) {
 			dp.log.Debug("check debt waiting on source shard: %s", err)
@@ -192,7 +213,7 @@ func debtSourceNotReady(err error) bool {
 func (dp *DebtPool) DoCheckingDebt() {
 	tmp := dp.toConfirmedDebts.items()
 	for h, d := range tmp {
-		recoverable, err := d.Validate(dp.verifier, false, dp.localShard())
+		recoverable, err := d.Validate(dp.verifier, false, dp.localShard(), dp.packingHeight())
 		if err != nil {
 			if recoverable || debtSourceNotReady(err) {
 				dp.log.Debug("check debt waiting on source shard: %s", err)

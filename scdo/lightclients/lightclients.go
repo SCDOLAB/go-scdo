@@ -80,16 +80,21 @@ func NewLightClientManager(targetShard uint, context context.Context, config *no
 // returns packed whether debt is packed
 // returns confirmed whether debt is confirmed
 // returns retErr error info
-func (manager *LightClientsManager) ValidateDebt(debt *types.Debt) (packed bool, confirmed bool, retErr error) {
+func (manager *LightClientsManager) ValidateDebt(debt *types.Debt, blockHeight uint64) (packed bool, confirmed bool, retErr error) {
 	fromShard := debt.Data.From.Shard()
 	if fromShard == 0 || fromShard == manager.localShard {
 		return false, false, errWrongShardDebt
 	}
 
-	// check cache first
+	// The pre-fork cache remembers a tx that once had 120 confirmations.
+	// After the irreversible fork a source reorg must be checked again, so
+	// that cache is not used for blocks under the deeper rule.
+	need := types.DebtConfirmationDepth(blockHeight)
 	cache := manager.confirmedTxs[fromShard]
-	if _, ok := cache.Get(debt.Data.TxHash); ok {
-		return true, true, nil
+	if need == common.ConfirmedBlockNumber {
+		if _, ok := cache.Get(debt.Data.TxHash); ok {
+			return true, true, nil
+		}
 	}
 
 	// comment out for test only
@@ -110,14 +115,17 @@ func (manager *LightClientsManager) ValidateDebt(debt *types.Debt) (packed bool,
 
 	header := backend.ChainBackend().CurrentHeader()
 	duration := header.Height - index.BlockHeight
-	if duration < common.ConfirmedBlockNumber {
+	if duration < need {
 		// Not a bad block: the source shard simply has not buried the tx yet.
 		// The inner sentinel lets the downloader queue the block and retry.
-		return true, false, errors.NewStackedErrorf(types.ErrNotEnoughConfirmations, "invalid debt because not enough confirmed block number, wanted is %d, actual is %d", common.ConfirmedBlockNumber, duration)
+		return true, false, errors.NewStackedErrorf(types.ErrNotEnoughConfirmations, "invalid debt because not enough confirmed block number, wanted is %d, actual is %d", need, duration)
 	}
 
-	// cache the confirmed tx
-	cache.Add(debt.Data.TxHash, true)
+	// Remember the tx only under the 120 rule. After the irreversible fork the
+	// next check must see the canonical source chain again.
+	if need == common.ConfirmedBlockNumber {
+		cache.Add(debt.Data.TxHash, true)
+	}
 
 	return true, true, nil
 }
@@ -186,7 +194,7 @@ func (manager *LightClientsManager) IfDebtPacked(debt *types.Debt) (packed bool,
 		return false, false, nil
 	}
 
-	_, err = result.Validate(nil, false, toShard)
+	_, err = result.Validate(nil, false, toShard, 0)
 	if err != nil {
 		return false, false, errors.NewStackedError(err, "failed to validate debt")
 	}
