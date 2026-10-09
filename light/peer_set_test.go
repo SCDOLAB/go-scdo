@@ -26,36 +26,6 @@ func getTestPeer(shard uint) *peer {
 	return peer
 }
 
-func TestSourceHeadAgreesWithVerifiedHeaders(t *testing.T) {
-	if !sourceHeadAgrees(9273661, 9273000, 100000) {
-		t.Fatal("a peer next to the verified shard2 header tip should count")
-	}
-	if sourceHeadAgrees(9273661, 4930667, 100000) {
-		t.Fatal("local shard2 at 4930667 is not the verified header tip")
-	}
-	if sourceHeadAgrees(0, 9273661, 100000) || sourceHeadAgrees(9273661, 0, 100000) {
-		t.Fatal("a missing height is not agreement")
-	}
-}
-
-func TestCaughtUpPeersIgnoresAShardStillSyncing(t *testing.T) {
-	set := newPeerSet()
-	behind := getTestPeer(2)
-	behind.headBlockNum = 4930667
-	tip := getTestPeer(2)
-	tip.headBlockNum = 9273661
-	set.Add(behind)
-	set.Add(tip)
-
-	peers, best := set.caughtUpPeers(3, 100000)
-	if best != 9273661 {
-		t.Fatalf("best=%d", best)
-	}
-	if len(peers) != 1 || peers[0] != tip {
-		t.Fatalf("caught-up peers = %v", peers)
-	}
-}
-
 func Test_PeerSet_Add(t *testing.T) {
 	set := newPeerSet()
 

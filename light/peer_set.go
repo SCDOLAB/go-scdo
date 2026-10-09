@@ -132,49 +132,6 @@ func (p *peerSet) Find(address common.Address) *peer {
 	return p.peerMap[address]
 }
 
-// caughtUpPeers returns up to limit peers whose announced head is within gap
-// of the best announced head, and that best head. A peer still syncing far
-// behind the best head is left out so its empty tx index is not treated as
-// the canonical chain.
-func (p *peerSet) caughtUpPeers(limit int, gap uint64) (out []*peer, best uint64) {
-	if p == nil {
-		return nil, 0
-	}
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	if limit < 1 {
-		limit = 1
-	}
-	for _, peer := range p.peerMap {
-		if peer != nil && peer.headBlockNum > best {
-			best = peer.headBlockNum
-		}
-	}
-	if best == 0 {
-		return nil, 0
-	}
-	cohort := make([]*peer, 0, len(p.peerMap))
-	for _, peer := range p.peerMap {
-		if peer == nil || peer.headBlockNum == 0 {
-			continue
-		}
-		if best-peer.headBlockNum <= gap {
-			cohort = append(cohort, peer)
-		}
-	}
-	for len(out) < limit && len(cohort) > 0 {
-		maxI := 0
-		for i := 1; i < len(cohort); i++ {
-			if cohort[i].headBlockNum > cohort[maxI].headBlockNum {
-				maxI = i
-			}
-		}
-		out = append(out, cohort[maxI])
-		cohort = append(cohort[:maxI], cohort[maxI+1:]...)
-	}
-	return out, best
-}
-
 // choosePeers choose peer based on filter blockhash, if filter is nil, then run like withouth filter
 func (p *peerSet) choosePeers(filter peerFilter) (choosePeers []*peer) {
 	p.lock.Lock()
