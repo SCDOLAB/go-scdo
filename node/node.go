@@ -203,9 +203,21 @@ func (n *Node) Stop() error {
 }
 
 func (n *Node) stopAllServices() {
+	// Write clean checkpoints before any service waits on peers or a
+	// database close. A SIGTERM that times out after this still leaves
+	// the height index clean, so the next start does not scan it.
+	n.prepareStop()
 	n.stopRPC()
 	n.stopRegisteredServices()
 	n.stopP2PServer()
+}
+
+func (n *Node) prepareStop() {
+	for _, service := range n.services {
+		if p, ok := service.(interface{ PrepareStop() }); ok {
+			p.PrepareStop()
+		}
+	}
 }
 
 func (n *Node) stopP2PServer() {

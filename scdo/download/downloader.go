@@ -344,11 +344,32 @@ func (d *Downloader) doSynchronise(conn *peerConn, head common.Hash) (err error)
 
 	ancestor, err := d.findCommonAncestorHeight(conn, height)
 	if err != nil {
-		conn.peer.DisconnectPeer("peerDownload anormaly")
+		// A peer that has not stored this slice is skipped inside the search.
+		// Disconnecting it made the next session retry the same tip forever.
+		if ancestorSearchFailed(err) && conn != nil && conn.peer != nil {
+			conn.peer.DisconnectPeer("peerDownload anormaly")
+		}
 		return err
 	}
 
 	localHeight := d.chain.CurrentBlock().Header.Height
+	// The local tip can be a losing fork whose winning sibling was never
+	// stored. Downloading head+1 then fails with "invalid parent hash"
+	// because that block's parent is the missing winner. Rewind to the
+	// common ancestor first so the window starts on the peer's chain.
+	// A node that is simply ahead of this peer (ancestor == peer height)
+	// keeps those blocks.
+	if ancestor < localHeight && ancestor < height {
+		d.log.Info("local head %d diverged from the peer; rewinding to common ancestor %d before download", localHeight, ancestor)
+		if _, _, _, err = d.reverseBCstore(ancestor); err != nil {
+			return err
+		}
+		if head := d.chain.CurrentBlock(); head != nil && head.Header != nil {
+			localHeight = head.Header.Height
+		} else {
+			localHeight = ancestor
+		}
+	}
 	d.log.Info("syncing shard chain: local height %d, peer target %d. SCDO Classic starts at fork genesis height %d (full sync of blocks after the fork, not a snapshot)", localHeight, height, common.ScdoForkHeight)
 	d.log.Debug("Downloader.doSynchronise start task manager from height=%d, target height=%d master=%s", ancestor, height, d.masterPeer)
 	tm := newTaskMgr(d, d.masterPeer, conn, ancestor+1, height, localHeight, nil, nil)
@@ -438,8 +459,10 @@ func (d *Downloader) findCommonAncestorHeight(conn *peerConn, height uint64) (ui
 			return 0, errMaxForkAncestor
 		}
 
-		// Get peer block headers
-		headers, err := d.getPeerBlockHeaders(conn, localTop, fetchCount)
+		// Get peer block headers. A peer that does not have this slice is
+		// skipped, the same way an ODR "leveldb: not found" skips to the
+		// next peer instead of aborting the request.
+		headers, err := d.getAncestorHeaders(conn, localTop, fetchCount)
 		if err != nil {
 			return 0, err
 		}
@@ -494,6 +517,103 @@ func getFetchCount(maxFetchAncestry, cmpCount uint64) uint64 {
 	return fetchCount
 }
 
+// ancestorPeerMiss is a peer that does not have the headers we asked for.
+// The next peer is asked. It is not a bad block and not a reason to disconnect.
+func ancestorPeerMiss(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == errInvalidAncestor {
+		return true
+	}
+	return strings.Contains(err.Error(), "leveldb: not found")
+}
+
+// ancestorSearchFailed is a protocol error, not a peer that simply lacks a block.
+func ancestorSearchFailed(err error) bool {
+	if err == nil || ancestorPeerMiss(err) || err == errMaxForkAncestor || err == errReceivedQuitMsg || err == errPeerQuit {
+		return false
+	}
+	return true
+}
+
+// parentHashMismatch is a block whose parent is not on the local chain.
+// VerifyHeader reports "invalid parent block hash" when that parent was
+// never stored. Retrying the same height cannot succeed until we rewind.
+func parentHashMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.IsOrContains(err, consensus.ErrBlockInvalidParentHash) {
+		return true
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "invalid parent hash") || strings.Contains(msg, "invalid parent block hash") {
+		return true
+	}
+	return strings.Contains(msg, "failed to get block header by hash") && strings.Contains(msg, "leveldb: not found")
+}
+
+// ancestorPeers lists the master peer first, then the other connected peers.
+func (d *Downloader) ancestorPeers(primary *peerConn) []*peerConn {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+	out := make([]*peerConn, 0, len(d.peers)+1)
+	seen := make(map[*peerConn]bool, len(d.peers)+1)
+	if primary != nil {
+		out = append(out, primary)
+		seen[primary] = true
+	}
+	for _, p := range d.peers {
+		if p == nil || seen[p] {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// getAncestorHeaders asks each peer until one returns headers. A miss
+// (empty reply or leveldb not found) tries the next peer.
+func (d *Downloader) getAncestorHeaders(primary *peerConn, localTop, fetchCount uint64) ([]*types.BlockHeader, error) {
+	var lastMiss error
+	asked := 0
+	for _, conn := range d.ancestorPeers(primary) {
+		if conn == nil || conn.peer == nil {
+			continue
+		}
+		asked++
+		headers, err := d.getPeerBlockHeaders(conn, localTop, fetchCount)
+		if err == nil && len(headers) > 0 {
+			return headers, nil
+		}
+		if err == errReceivedQuitMsg || err == errPeerQuit {
+			return nil, err
+		}
+		if err == nil {
+			err = errInvalidAncestor
+		}
+		if !ancestorPeerMiss(err) && ancestorSearchFailed(err) {
+			lastMiss = err
+			if d.log != nil {
+				d.log.Info("ancestor headers from peer %s at height %d failed (%s); trying the next peer", conn.peerID, localTop, err)
+			}
+			continue
+		}
+		lastMiss = err
+		if d.log != nil {
+			d.log.Info("ancestor headers missing from peer %s at height %d (%s); trying the next peer", conn.peerID, localTop, err)
+		}
+	}
+	if asked == 0 {
+		return nil, errPeerNotFound
+	}
+	if lastMiss == nil {
+		lastMiss = errInvalidAncestor
+	}
+	return nil, lastMiss
+}
+
 func (d *Downloader) getPeerBlockHeaders(conn *peerConn, localTop, fetchCount uint64) ([]*types.BlockHeader, error) {
 	magic := rand2.Uint32()
 	go conn.peer.RequestHeadersByHashOrNumber(magic, common.EmptyHash, localTop, int(fetchCount), true)
@@ -513,9 +633,18 @@ func (d *Downloader) getPeerBlockHeaders(conn *peerConn, localTop, fetchCount ui
 
 func (d *Downloader) isAncenstorFound(headers []*types.BlockHeader) (bool, uint64, error) {
 	for i := 0; i < len(headers); i++ {
+		if headers[i] == nil {
+			continue
+		}
 		cmpHeight := headers[i].Height
 		localHash, err := d.chain.GetStore().GetBlockHash(cmpHeight)
 		if err != nil {
+			// This height is not on the local canonical chain. Keep walking
+			// toward older headers. Aborting here logged a miss and retried
+			// the same tip instead of finding the common ancestor.
+			if ancestorPeerMiss(err) {
+				continue
+			}
 			return false, 0, err
 		}
 
@@ -839,7 +968,15 @@ func (d *Downloader) processBlocks(headInfos []*downloadInfo, ancestor uint64, l
 				return true
 			}
 			d.clearShardWait()
-			d.log.Error("failed to write block err=%s", err)
+			if parentHashMismatch(err) {
+				height := uint64(0)
+				if h.block != nil && h.block.Header != nil {
+					height = h.block.Header.Height
+				}
+				d.log.Error("parent hash mismatch at height %d (%s); cancelling this session so the next one rewinds to the common ancestor", height, err)
+			} else {
+				d.log.Error("failed to write block err=%s", err)
+			}
 			// recover local blocks if localTotalDifficulty is larger than the synchronized total difficulty
 			// if writeblock fails in the middle (the whole process not successfully completed), then we need to consider write back our localblocks
 			// if localblock totaldifficult is larger than the break point's one. It means this sync attempt should be abonded
@@ -990,8 +1127,14 @@ func (d *Downloader) reverseBCstore(ancestor uint64) (uint64, *big.Int, []*types
 		localBlocks = append([]*types.Block{block}, localBlocks...)
 
 		// reinject the block objects to the pool
-		d.scdo.TxPool().HandleChainReversed(block)
-		d.scdo.DebtPool().HandleChainReversed(block)
+		if d.scdo != nil {
+			if pool := d.scdo.TxPool(); pool != nil {
+				pool.HandleChainReversed(block)
+			}
+			if pool := d.scdo.DebtPool(); pool != nil {
+				pool.HandleChainReversed(block)
+			}
+		}
 
 		if err = bcStore.DeleteBlock(hash); err != nil {
 			return localHeight, localTD, localBlocks, errors.NewStackedErrorf(err, "failed to delete block %v", block.HeaderHash)

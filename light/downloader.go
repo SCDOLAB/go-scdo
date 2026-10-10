@@ -114,7 +114,18 @@ func (d *Downloader) doSynchronise(p *peer) {
 	started = true
 
 	ancestor, err := p.findAncestor()
+	if err == errAncestorBelowWindow {
+		d.log.Info("light chain hashes diverge and the common ancestor is below %d; requesting older headers", ancestor)
+		if reqErr := p.requestAncestorWindow(ancestor); reqErr != nil {
+			d.log.Info("light chain doSynchronise called, but ancestor not found")
+		}
+		return
+	}
 	if err != nil {
+		if err == errBlocksExist {
+			d.log.Debug("light chain already has the peer hash window")
+			return
+		}
 		d.log.Info("light chain doSynchronise called, but ancestor not found")
 		return
 	}

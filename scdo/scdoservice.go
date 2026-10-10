@@ -285,6 +285,20 @@ func (s *ScdoService) Start(srvr *p2p.Server) error {
 	return nil
 }
 
+// PrepareStop writes the clean height-index checkpoint before Stop waits
+// on downloaders and peer handlers. systemd's 20s SIGTERM budget used to
+// expire in that wait, leave clean:false, and the next start of Shard3/4
+// then spent about 33 minutes reading block bodies.
+func (s *ScdoService) PrepareStop() {
+	if s == nil || s.chain == nil {
+		return
+	}
+	if s.log != nil {
+		s.log.Info("writing a clean height-index checkpoint before shutdown waits on peers")
+	}
+	s.chain.FlushRecovery()
+}
+
 // Stop implements node.Service, terminating all internal goroutines.
 func (s *ScdoService) Stop() error {
 	//TODO

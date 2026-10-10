@@ -7,13 +7,14 @@ package downloader
 
 import (
 	"crypto/ecdsa"
+	"errors"
 	"math/big"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/scdoproject/go-scdo/common"
+	"github.com/scdoproject/go-scdo/consensus"
 	"github.com/scdoproject/go-scdo/core"
 	"github.com/scdoproject/go-scdo/core/types"
 	"github.com/scdoproject/go-scdo/crypto"
@@ -421,10 +422,11 @@ func Test_Downloader_IsAncenstorFound(t *testing.T) {
 
 	headers := newTestBlockHeaders()
 	found, cmpHeight, err := dl.isAncenstorFound(headers)
-	// A missing local hash is an error, not ancestor height 0.
+	// A missing local hash is not the ancestor. The search keeps walking
+	// instead of aborting, so a side fork can still find an older match.
 	assert.Equal(t, found, false)
 	assert.Equal(t, cmpHeight, uint64(0))
-	assert.Equal(t, strings.Contains(err.Error(), "leveldb: not found"), true)
+	assert.Equal(t, err, nil)
 
 	headers = nil
 	found, cmpHeight, err = dl.isAncenstorFound(headers)
@@ -571,7 +573,7 @@ func Test_Downloader_ProcessBlocks(t *testing.T) {
 	assert.Equal(t, headInfos[0].status, taskStatusWaitProcessing)
 }
 
-func Test_isAncenstorFound_missingHashIsError(t *testing.T) {
+func Test_isAncenstorFound_missingHashKeepsWalking(t *testing.T) {
 	db, dispose := leveldb.NewTestDatabase()
 	defer dispose()
 	dl := newTestDownloader(db)
@@ -579,7 +581,7 @@ func Test_isAncenstorFound_missingHashIsError(t *testing.T) {
 	found, height, err := dl.isAncenstorFound(headers)
 	assert.Equal(t, false, found)
 	assert.Equal(t, uint64(0), height)
-	assert.NotNil(t, err)
+	assert.Equal(t, nil, err)
 }
 
 func TestCancelUnblocksPeerDownload(t *testing.T) {
@@ -658,4 +660,87 @@ func Test_findCommonAncestorHeight_peerHeightZero(t *testing.T) {
 	ancestorHeight, err := dl.findCommonAncestorHeight(p, height)
 	assert.Equal(t, nil, err)
 	assert.Equal(t, uint64(0), ancestorHeight)
+}
+
+func TestAncestorSearchSkipsMissingHeight(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	dl := newTestDownloader(db)
+	genesis := dl.chain.CurrentBlock()
+	missing := &types.BlockHeader{
+		Height:            genesis.Header.Height + 2,
+		Difficulty:        big.NewInt(1),
+		CreateTimestamp:   big.NewInt(1),
+		PreviousBlockHash: common.StringToHash("missing-parent"),
+	}
+	found, height, err := dl.isAncenstorFound([]*types.BlockHeader{missing, genesis.Header})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || height != genesis.Header.Height {
+		t.Fatalf("found %v height %d, want genesis %d", found, height, genesis.Header.Height)
+	}
+}
+
+func TestParentHashMismatchIsTheUnstoredWinner(t *testing.T) {
+	if !parentHashMismatch(consensus.ErrBlockInvalidParentHash) {
+		t.Fatal("consensus parent-hash error must rewind")
+	}
+	if !parentHashMismatch(errors.New("failed to get block header by hash 0xe0be8222: leveldb: not found")) {
+		t.Fatal("missing parent header must rewind")
+	}
+	if parentHashMismatch(errors.New("failed to batch validate debt")) {
+		t.Fatal("a debt error is not a parent mismatch")
+	}
+	if !ancestorPeerMiss(errInvalidAncestor) || !ancestorPeerMiss(errors.New("leveldb: not found")) {
+		t.Fatal("a peer that lacks the header is a miss")
+	}
+	if ancestorPeerMiss(errReceivedQuitMsg) || ancestorSearchFailed(errInvalidAncestor) {
+		t.Fatal("a miss must not disconnect the peer")
+	}
+}
+
+func TestAncestorPeersAsksMasterFirst(t *testing.T) {
+	db, dispose := leveldb.NewTestDatabase()
+	defer dispose()
+	dl := newTestDownloader(db)
+	master := newPeerConn(newTestPeer(), "master", nil)
+	other := newPeerConn(newTestPeer(), "other", nil)
+	dl.peers["other"] = other
+	dl.peers["master"] = master
+	got := dl.ancestorPeers(master)
+	if len(got) != 2 || got[0] != master {
+		t.Fatalf("master was not asked first: %v", got)
+	}
+}
+
+func TestReverseDropsLosingHead(t *testing.T) {
+	bc := core.NewTestBlockchain()
+	dl := NewDownloader(bc, NewTestSeeleBackend())
+	genesis := bc.CurrentBlock()
+	losingHeader := &types.BlockHeader{
+		PreviousBlockHash: genesis.HeaderHash,
+		Height:            genesis.Header.Height + 1,
+		Difficulty:        big.NewInt(2),
+		CreateTimestamp:   big.NewInt(2),
+	}
+	losing := &types.Block{Header: losingHeader, HeaderHash: losingHeader.Hash()}
+	if err := bc.GetStore().PutBlock(losing, big.NewInt(3), true); err != nil {
+		t.Fatal(err)
+	}
+	bc.UpdateCurrentBlock(losing)
+
+	if _, _, _, err := dl.reverseBCstore(genesis.Header.Height); err != nil {
+		t.Fatal(err)
+	}
+	head := bc.CurrentBlock()
+	if head.Header.Height != genesis.Header.Height || head.HeaderHash != genesis.HeaderHash {
+		t.Fatalf("head %+v, want genesis %d %s", head.Header.Height, genesis.Header.Height, genesis.HeaderHash.Hex())
+	}
+	if _, err := bc.GetStore().GetBlockHash(losing.Header.Height); err == nil {
+		t.Fatal("losing height is still canonical")
+	}
+	if _, err := bc.GetStore().GetBlock(losing.HeaderHash); err == nil {
+		t.Fatal("losing block is still stored")
+	}
 }

@@ -27,12 +27,13 @@ const (
 )
 
 var (
-	errMsgNotMatch     = errors.New("message mismatch")
-	errNetworkNotMatch = errors.New("networkID mismatch")
-	errModeNotMatch    = errors.New("server/client mode mismatch")
-	errGenesisNotMatch = errors.New("genesis hash mismatch")
-	errBlockNotFound   = errors.New("block not found")
-	errBlocksExist     = errors.New("peer sync hashArray already exist locally")
+	errMsgNotMatch         = errors.New("message mismatch")
+	errNetworkNotMatch     = errors.New("networkID mismatch")
+	errModeNotMatch        = errors.New("server/client mode mismatch")
+	errGenesisNotMatch     = errors.New("genesis hash mismatch")
+	errBlockNotFound       = errors.New("block not found")
+	errBlocksExist         = errors.New("peer sync hashArray already exist locally")
+	errAncestorBelowWindow = errors.New("common ancestor is below the peer hash window")
 )
 
 // PeerInfo represents a short summary of a connected peer.
@@ -62,6 +63,9 @@ type peer struct {
 	anchorNum       uint64      // height where this hash sync started
 	anchorHash      common.Hash // hash at anchorNum, kept after the window slides
 	updatedAncestor uint64
+	// pendingAncestorBegin is the older height we asked for after the
+	// retained window sat entirely on a side fork. Stale batches are ignored.
+	pendingAncestorBegin uint64
 
 	lastAnnounceCodeTime int64
 	log                  *log.ScdoLog
@@ -147,10 +151,13 @@ func (p *peer) findAncestor() (uint64, error) {
 	}
 
 	chain := p.protocolManager.chain
+	sawDivergence := false
 	for idx := len(p.blockHashArr) - 1; idx >= 0; idx-- {
 		curNum, curHash := p.blockNumBegin+uint64(idx), p.blockHashArr[idx]
 		localBlock, err := chain.GetStore().GetBlockByHeight(curNum)
 		if err != nil {
+			// This height is not local yet. Keep walking. A miss is not a
+			// failed proof, same as an ODR peer that has not stored the tx.
 			continue
 		}
 		if idx == len(p.blockHashArr)-1 {
@@ -168,6 +175,7 @@ func (p *peer) findAncestor() (uint64, error) {
 			}
 			return curNum, nil
 		}
+		sawDivergence = true
 	}
 
 	// The retained window is the peer tip. During catch-up the local head is
@@ -186,7 +194,45 @@ func (p *peer) findAncestor() (uint64, error) {
 		}
 	}
 
+	// The window overlapped the local chain and every hash disagreed. The
+	// common ancestor is older than blockNumBegin. The caller asks for that
+	// older slice instead of retrying the tip.
+	if sawDivergence && p.blockNumBegin > uint64(common.ScdoForkHeight) {
+		return p.blockNumBegin, errAncestorBelowWindow
+	}
+
 	return 0, errBlockNotFound
+}
+
+// requestAncestorWindow drops the tip window and asks the peer for headers
+// ending at below. The next session can then see the common ancestor.
+func (p *peer) requestAncestorWindow(below uint64) error {
+	if p == nil {
+		return errBlockNotFound
+	}
+	begin := uint64(0)
+	batch := uint64(MaxBlockHashRequest)
+	if below > batch {
+		begin = below - batch
+	}
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.pendingAncestorBegin == begin && len(p.blockHashArr) == 0 {
+		return nil
+	}
+	p.blockHashArr = nil
+	p.hashIndex = make(map[common.Hash]uint64)
+	p.blockNumBegin = begin
+	p.anchorHash = common.Hash{}
+	p.anchorNum = begin
+	p.pendingAncestorBegin = begin
+	if p.curSyncMagic == 0 {
+		p.curSyncMagic = 1
+	}
+	if p.rw == nil {
+		return nil
+	}
+	return p.sendSyncHashRequest(p.curSyncMagic, begin)
 }
 
 func (p *peer) sendDownloadHeadersRequest(reqID uint32, begin uint64) error {
@@ -374,6 +420,11 @@ func (p *peer) handleSyncHash(msg *HeaderHashSync) error {
 	}
 
 	if len(p.blockHashArr) == 0 {
+		if p.pendingAncestorBegin != 0 && msg.BeginNum != p.pendingAncestorBegin {
+			p.log.Debug("ignore stale hash batch at %d; waiting for %d", msg.BeginNum, p.pendingAncestorBegin)
+			return nil
+		}
+		p.pendingAncestorBegin = 0
 		p.setHashWindow(msg.BeginNum, msg.HeaderArr)
 	} else {
 		idx := p.findIdxByHashLocked(msg.HeaderArr[0])

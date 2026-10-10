@@ -97,6 +97,9 @@ func (bc *Blockchain) noteIndexVerified(height uint64) {
 	}
 	bc.indexMu.Lock()
 	defer bc.indexMu.Unlock()
+	if bc.indexFrozen {
+		return
+	}
 	if bc.indexVerified > height {
 		bc.indexVerified = height
 		bc.indexClamped = time.Now()
@@ -124,6 +127,12 @@ func (bc *Blockchain) noteHeadLower(head uint64) {
 		return
 	}
 	bc.indexVerified = head
+	// Shutdown already called the index clean. Keep that flag if a rewind
+	// still moves the committed head before the process exits.
+	if bc.indexFrozen {
+		bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: head, Clean: true})
+		return
+	}
 	// The file follows the head, but not on every block of a long reverse.
 	// markIndexClean writes the final head before the databases close.
 	if !bc.indexClamped.IsZero() && time.Since(bc.indexClamped) < time.Second {
@@ -143,6 +152,7 @@ func (bc *Blockchain) markIndexClean() {
 	}
 	bc.indexMu.Lock()
 	defer bc.indexMu.Unlock()
+	bc.indexFrozen = true
 	bc.indexVerified = height
 	bc.indexClamped = time.Now()
 	bc.writeIndexCheckpointLocked(indexCheckpoint{VerifiedHeight: height, Clean: true})

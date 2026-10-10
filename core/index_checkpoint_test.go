@@ -126,3 +126,29 @@ func TestCheckpointNeverExceedsCanonicalHead(t *testing.T) {
 		t.Fatalf("clean shutdown checkpoint %+v, committed head %d", got, head)
 	}
 }
+
+func TestCleanCheckpointStaysCleanWhileShutdownWrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, indexCheckpointFile)
+	const head = uint64(9274822)
+	bc := &Blockchain{indexFile: path, log: rpLog}
+	bc.currentBlock.Store(&types.Block{Header: &types.BlockHeader{Height: head}})
+	bc.indexVerified = head - 100000
+	bc.markIndexClean()
+
+	bc.UpdateCurrentBlock(&types.Block{Header: &types.BlockHeader{Height: head - 10}})
+	got := loadIndexCheckpoint(path)
+	if !got.Clean || got.VerifiedHeight != head-10 {
+		t.Fatalf("rewind during shutdown checkpoint %+v", got)
+	}
+
+	bc.currentBlock.Store(&types.Block{Header: &types.BlockHeader{Height: head}})
+	bc.indexMu.Lock()
+	bc.indexVerified = 0
+	bc.indexMu.Unlock()
+	bc.noteIndexVerified(head + indexVerifyEvery)
+	got = loadIndexCheckpoint(path)
+	if !got.Clean || got.VerifiedHeight != head-10 {
+		t.Fatalf("later verification cleared the clean checkpoint: %+v", got)
+	}
+}

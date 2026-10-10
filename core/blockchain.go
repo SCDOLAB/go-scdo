@@ -99,6 +99,10 @@ type Blockchain struct {
 	indexFile     string
 	indexVerified uint64
 	indexMu       sync.Mutex
+	// indexFrozen is set when shutdown writes a clean checkpoint. Later
+	// block writes must not flip that file back to clean:false while Stop
+	// is still waiting on peers. A rewind still moves the height down.
+	indexFrozen bool
 	// indexClamped is the last time a rewind rewrote the checkpoint file.
 	// The in-memory height follows the head on every rewind. The file is
 	// rewritten at most once a second so a long reverse does not rename it
@@ -177,6 +181,7 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 	bc.indexFile = indexCheckpointPath(recoveryPointFile)
 	cp := loadIndexCheckpoint(bc.indexFile)
 	floor := indexScanFloor(cp, currentBlock.Header.Height)
+	stopAt, limited := heightIndexStop(currentBlock.Header.Height, floor)
 	// A crash from here on is an unclean shutdown, including a crash during
 	// this scan. The previous clean height is what this scan trusts.
 	if bc.indexFile != "" && cp.Clean {
@@ -191,10 +196,12 @@ func NewBlockchain(bcStore store.BlockchainStore, accountStateDB database.Databa
 	}
 	if bc.indexFile == "" {
 		bc.log.Info("checking blockchain database from %d down to fork height %d", currentBlock.Header.Height, floor)
-	} else if floor == uint64(common.SecondForkHeight) {
-		bc.log.Info("height index checkpoint missing or last shutdown was not clean; checking blockchain database from %d down to fork height %d", currentBlock.Header.Height, floor)
 	} else if floor >= currentBlock.Header.Height {
 		bc.log.Info("height index checkpoint %d is clean; skipping the height-index scan", floor)
+	} else if limited {
+		bc.log.Info("height index will be checked for the last %d blocks (%d down to %d) by hash, not by loading block bodies. Full floor is %d", recoverDepth, currentBlock.Header.Height, stopAt, floor)
+	} else if floor == uint64(common.SecondForkHeight) {
+		bc.log.Info("height index checkpoint missing or last shutdown was not clean; checking blockchain database from %d down to fork height %d", currentBlock.Header.Height, floor)
 	} else {
 		bc.log.Info("height index checkpoint %d is clean; checking blockchain database from %d down to %d", floor, currentBlock.Header.Height, floor)
 	}
@@ -989,6 +996,8 @@ func (bc *Blockchain) GetHeadRollbackEventManager() *event.EventManager {
 // recoverDepth is how many canonical blocks an unclean restart re-reads.
 // Index damage from a crash is near the head. Scanning back to fork height
 // (about 6.3M full blocks) is what made a Shard1 restart take hours.
+// The check reads the height-to-hash key and the header, not the block body.
+// Loading 20_000 full bodies is what made a Shard3/4 restart take about 33 minutes.
 const recoverDepth = 20000
 
 // heightIndexStop is where recoverHeightIndices stops on the first pass.
@@ -1009,6 +1018,16 @@ func heightIndexStop(head, floor uint64) (stopAt uint64, limited bool) {
 		}
 	}
 	return stopAt, false
+}
+
+// indexGapAt reports that the canonical height-to-hash key is missing.
+// A block body that is absent while the hash is present is not a gap.
+func indexGapAt(st store.BlockchainStore, height uint64) bool {
+	if st == nil {
+		return true
+	}
+	_, err := st.GetBlockHash(height)
+	return err != nil
 }
 
 // recoverHeightIndices examines the previous blockchain data to make sure
@@ -1034,10 +1053,11 @@ func (bc *Blockchain) recoverHeightIndices(floor uint64) {
 
 	for {
 		if curHeight <= stopAt {
-			// The window itself was readable. One read just below it catches
-			// a gap deeper than recoverDepth instead of skipping it.
+			// The window itself was readable. One hash read just below it
+			// catches a gap deeper than recoverDepth. A missing block body
+			// is not a gap: the height-to-hash key is the index.
 			if limited && stopAt > floor {
-				if _, err := bc.bcStore.GetBlockByHeight(stopAt); err != nil {
+				if indexGapAt(bc.bcStore, stopAt) {
 					bc.log.Info("height index gap at %d, below the last %d blocks; continuing down to %d", stopAt, recoverDepth, floor)
 					curHeight = stopAt
 					stopAt = floor
@@ -1050,14 +1070,16 @@ func (bc *Blockchain) recoverHeightIndices(floor uint64) {
 		}
 
 		bc.log.Debug("checking blockchain database, height: %d", curHeight)
-		if block, err := bc.bcStore.GetBlockByHeight(curHeight); err != nil {
+		hash, err := bc.bcStore.GetBlockHash(curHeight)
+		if err != nil {
 			bc.log.Error("height: %d, can't get block by height.", curHeight)
 			if limited {
 				bc.log.Info("height index gap at %d inside the last %d blocks; continuing down to %d", curHeight, recoverDepth, floor)
 				stopAt = floor
 				limited = false
 			}
-			if block, err = bc.bcStore.GetBlock(curHash); err != nil {
+			block, hashErr := bc.bcStore.GetBlock(curHash)
+			if hashErr != nil {
 				bc.log.Error("height: %d, can't get block by hash %v.", curHeight, curHash)
 				curHash = common.EmptyHash
 				numIrrecoverable++
@@ -1065,15 +1087,25 @@ func (bc *Blockchain) recoverHeightIndices(floor uint64) {
 				// get block by hash successfully
 				// recover the heightToBlock map
 				bc.log.Info("height: %d, try to recover block by hash %v.", curHeight, curHash)
-				if err := bc.bcStore.RecoverHeightToBlockMap(block); err != nil {
+				if err = bc.bcStore.RecoverHeightToBlockMap(block); err != nil {
 					bc.log.Error("height: %d, can't recover block by hash %v.", curHeight, curHash)
 				}
 				curHash = block.Header.PreviousBlockHash
 				numGetBlockByHash++
 			}
+		} else if header, herr := bc.bcStore.GetBlockHeader(hash); herr != nil {
+			bc.log.Error("height: %d, index hash %v has no header.", curHeight, hash)
+			if limited {
+				bc.log.Info("height index gap at %d inside the last %d blocks; continuing down to %d", curHeight, recoverDepth, floor)
+				stopAt = floor
+				limited = false
+			}
+			curHash = common.EmptyHash
+			numIrrecoverable++
 		} else {
-			// get block by height successfully
-			curHash = block.Header.PreviousBlockHash
+			// The height-to-hash key and the header are enough. The block
+			// body is not part of the index and is what made this loop slow.
+			curHash = header.PreviousBlockHash
 			numGetBlockByHeight++
 		}
 		curHeight--
